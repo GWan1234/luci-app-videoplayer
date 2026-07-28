@@ -18,8 +18,7 @@ LUCI_TITLE:=LuCI Video Player (local + remote)
 LUCI_DESCRIPTION:=HTML5 video player inside LuCI for local router storage and remote HTTP(S) media URLs.
 LUCI_DEPENDS:=+luci-base +uhttpd +jshn +coreutils-stat
 LUCI_PKGARCH:=all
-# Set this to the canonical repository URL before publishing the package.
-LUCI_URL:=
+LUCI_URL:=https://github.com/communism420/luci-app-videoplayer
 
 PKG_LICENSE:=GPL-2.0-or-later
 LUCI_MAINTAINER:=openwrt-video-player contributors
