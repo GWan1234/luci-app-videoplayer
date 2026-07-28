@@ -279,12 +279,12 @@ return view.extend({
 								E('option', {
 									value: 'router',
 									selected: renderMode === 'router' ? 'selected' : null
-								}, _('Router CPU rendering (experimental)'))
+								}, _('Router CPU rendering (experimental, browser fallback)'))
 							]),
 							E('div', {
 								id: 'vp-render-mode-desc',
 								class: 'cbi-value-description'
-							}, _('Local files only. Router mode uses FFmpeg to produce a silent low-frame-rate preview in this web page; it has no audio, pause, seeking, or timeline and may heavily load the router. Remote URLs always use browser decoding.')),
+							}, _('Local files only. Router mode uses FFmpeg to produce a silent low-frame-rate preview in this web page; it has no audio, pause, seeking, or timeline and may heavily load the router. If FFmpeg cannot start for a file, the player falls back to browser decoding. Remote URLs always use browser decoding.')),
 							E('div', {
 								id: 'vp-render-mode-status',
 								class: rendererAvailable === false
@@ -591,7 +591,7 @@ return view.extend({
 			E('div', { class: 'cbi-section-descr', style: 'margin-top:1em;' }, [
 				E('p', {}, [
 					E('strong', {}, _('Notes:')), ' ',
-					_('Prefer H.264 + AAC in MP4 for browser mode. Router CPU mode depends on the codecs enabled in the installed OpenWrt FFmpeg build and may not decode every file. Store media on USB if possible.')
+					_('Prefer H.264 + AAC in MP4 for browser mode. Router CPU mode can decode only codecs enabled in the installed OpenWrt FFmpeg build and automatically falls back to browser decoding when FFmpeg cannot start. Store media on USB if possible.')
 				])
 			])
 		]);
@@ -992,7 +992,7 @@ return view.extend({
 			);
 		}
 		else if (this._rendererAvailable === true && this._renderMode === 'router') {
-			statusEl.textContent = _('FFmpeg renderer is available. Expect high CPU usage and a silent low-frame-rate preview.');
+			statusEl.textContent = _('FFmpeg renderer is available. Expect high CPU usage and a silent low-frame-rate preview; startup failures fall back to browser decoding.');
 		}
 		else {
 			statusEl.textContent = '';
@@ -1393,7 +1393,7 @@ return view.extend({
 		this._setPlayerSurface('none');
 	},
 
-	_playInVideo: function (url, label, generation, kind) {
+	_playInVideo: function (url, label, generation, kind, startMuted) {
 		const self = this;
 		const video = document.getElementById('videoplayer-video');
 
@@ -1406,6 +1406,10 @@ return view.extend({
 		self._currentLabel = label || url;
 		self._setPlayerSurface('video');
 		video.src = url;
+		if (startMuted) {
+			video.muted = true;
+			self._syncMuteControl(video);
+		}
 		self._currentSrc = video.src || url;
 		self._setNowPlaying(_('Loading in browser: %s').format(self._currentLabel));
 
@@ -1575,9 +1579,12 @@ return view.extend({
 				);
 			}
 			if (state === 'error') {
+				const reason = String(res && res.reason || '').trim();
 				return self._finishCpuPlayback(
 					session,
-					_('Router CPU renderer failed for %s. The installed FFmpeg build may not support this video codec.').format(session.label),
+					reason
+						? _('Router CPU renderer failed for %s: %s').format(session.label, reason)
+						: _('Router CPU renderer failed for %s. The installed FFmpeg build may not support this video codec.').format(session.label),
 					true
 				);
 			}
@@ -1720,7 +1727,8 @@ return view.extend({
 	_playLocal: function (relPath, name) {
 		const self = this;
 		relPath = String(relPath || '').replace(/^\/+/, '');
-		const useRouter = self._renderMode === 'router' && self._canWriteSettings;
+		let useRouter = self._renderMode === 'router' && self._canWriteSettings;
+		let unavailableReason = '';
 
 		if (self._localResolvePending) {
 			notify(null, _('Another local video is still being prepared.'), 3000, 'warning');
@@ -1744,14 +1752,13 @@ return view.extend({
 			return Promise.resolve();
 		}
 		if (useRouter && self._rendererAvailable === false) {
-			notify(null, E('p', {},
-				_('Router CPU rendering is unavailable: %s').format(
-					(self._status && self._status.renderer_reason) ||
-					_('FFmpeg capability check failed'))),
-			7000, 'error');
-			return Promise.resolve();
+			unavailableReason = String(
+				(self._status && self._status.renderer_reason) ||
+				_('FFmpeg capability check failed')
+			);
+			useRouter = false;
 		}
-		if (self._renderMode === 'router' && !useRouter) {
+		if (self._renderMode === 'router' && !self._canWriteSettings) {
 			notify(null,
 				_('Router CPU rendering requires write permission. Using browser decoding for this account.'),
 				5000, 'warning');
@@ -1766,11 +1773,39 @@ return view.extend({
 		self._setNowPlaying(_('Preparing local video: %s').format(label));
 		self._localResolvePending = true;
 
-		const prepareLocal = useRouter
-			? callStartRenderer
-			: callResolve;
+		const fallbackToBrowser = function (routerError) {
+			routerError = String(routerError || _('Unknown router renderer error'));
+			if (generation !== self._playGeneration || !self._canBrowseLocal())
+				return { error: routerError };
 
-		return prepareLocal(relPath).then(function (res) {
+			return callResolve(relPath).then(function (fallback) {
+				fallback = fallback || {};
+				fallback.router_fallback_reason = routerError;
+				return fallback;
+			}, function (err) {
+				return {
+					error: errorText(err),
+					router_fallback_reason: routerError
+				};
+			});
+		};
+		const preparation = useRouter
+			? callStartRenderer(relPath).then(function (res) {
+				res = res || {};
+				if (!res.error)
+					return res;
+				return fallbackToBrowser(res.error);
+			}, function (err) {
+				return fallbackToBrowser(errorText(err));
+			})
+			: callResolve(relPath).then(function (res) {
+				res = res || {};
+				if (unavailableReason)
+					res.router_fallback_reason = unavailableReason;
+				return res;
+			});
+
+		return preparation.then(function (res) {
 			res = res || {};
 			if (generation !== self._playGeneration || !self._canBrowseLocal()) {
 				if (/^[0-9a-f]{32}$/.test(String(res.session_token || '')))
@@ -1779,13 +1814,17 @@ return view.extend({
 			}
 
 			if (res.error) {
+				const preparationError = res.router_fallback_reason
+					? _('Router CPU renderer failed: %s Browser fallback also failed: %s')
+						.format(res.router_fallback_reason, res.error)
+					: res.error;
 				self._currentKind = null;
 				self._currentRenderMode = null;
 				self._currentSrc = null;
 				self._setPlayerSurface('none');
 				self._setNowPlaying(_('Unable to prepare local video: %s').format(label));
 				notify(null, E('p', {},
-					_('Unable to resolve local video: %s').format(res.error)),
+					_('Unable to prepare local video: %s').format(preparationError)),
 				7000, 'error');
 				return;
 			}
@@ -1800,11 +1839,24 @@ return view.extend({
 				return;
 			}
 
+			if (res.router_fallback_reason) {
+				notify(null, E('p', {},
+					_('Router CPU renderer could not play %s: %s. Using browser decoding instead; fallback starts muted.')
+						.format(label, res.router_fallback_reason)),
+				9000, 'warning');
+			}
+
 			/* stream_url is an opaque, ACL-protected token URL; never rebuild it client-side. */
 			if (normalizeRenderMode(res.render_mode) === 'router' ||
 			    res.stream_type === 'jpeg-frames')
 				return self._playCpuFrames(res, label, generation);
-			return self._playInVideo(res.stream_url, label, generation, 'local');
+			return self._playInVideo(
+				res.stream_url,
+				label,
+				generation,
+				'local',
+				!!res.router_fallback_reason
+			);
 		}).catch(function (err) {
 			if (generation !== self._playGeneration)
 				return;
@@ -1815,7 +1867,7 @@ return view.extend({
 			self._setPlayerSurface('none');
 			self._setNowPlaying(_('Unable to prepare local video: %s').format(label));
 			notify(null, E('p', {},
-				_('Unable to resolve local video: %s').format(errorText(err))),
+				_('Unable to prepare local video: %s').format(errorText(err))),
 			7000, 'error');
 		}).finally(function () {
 			self._localResolvePending = false;

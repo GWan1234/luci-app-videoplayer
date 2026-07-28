@@ -23,6 +23,7 @@ STARTUP_TIMEOUT=15
 STOP_TIMEOUT=6
 MAX_PATH_LENGTH=4096
 MAX_FRAME_BYTES=4194304
+FFMPEG_LOG_MAX_BYTES=65536
 
 string_has_control() {
 	printf '%s' "$1" | grep -q '[[:cntrl:]]'
@@ -486,8 +487,62 @@ probe_renderer() {
 			printf 'ffmpeg has no scale filter\n'
 			return 1
 		}
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+format[[:space:]]' || {
+			printf 'ffmpeg has no format filter\n'
+			return 1
+		}
 	printf 'available\n'
 	return 0
+}
+
+ffmpeg_failure_reason() {
+	local log="$1" rc="$2"
+
+	if [ "$rc" -eq 137 ]; then
+		printf 'FFmpeg was killed; the router may be out of memory\n'
+		return
+	fi
+	if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+		printf 'FFmpeg could not be executed\n'
+		return
+	fi
+	if [ "$rc" -eq 0 ]; then
+		printf 'FFmpeg found no playable video frames\n'
+		return
+	fi
+	if ! safe_regular_file "$log" 600; then
+		printf 'FFmpeg pipeline failed before producing a frame\n'
+		return
+	fi
+
+	if grep -Eqi \
+		'decoder([^[:alnum:]]|.* )(not found|is not available)|no decoder found|unknown decoder|decoding requested.*no decoder' \
+		"$log"; then
+		printf 'Installed FFmpeg has no decoder for this video codec\n'
+	elif grep -Eqi \
+		'stream map .* matches no streams|does not contain any stream|no video stream' \
+		"$log"; then
+		printf 'The file contains no playable video stream\n'
+	elif grep -Eqi \
+		'cannot allocate memory|out of memory|not enough memory' \
+		"$log"; then
+		printf 'FFmpeg ran out of memory while decoding this video\n'
+	elif grep -Eqi \
+		'no space left on device|file too large' \
+		"$log"; then
+		printf 'Renderer temporary storage is full\n'
+	elif grep -Eqi \
+		'impossible to convert|invalid pixel format|error (re)?initializing filters|failed to inject frame|error while filtering|option .* not found' \
+		"$log"; then
+		printf 'FFmpeg could not convert decoded frames to JPEG\n'
+	elif grep -Eqi \
+		'moov atom not found|invalid data found|could not find codec parameters|error reading header' \
+		"$log"; then
+		printf 'FFmpeg rejected the video container or bitstream\n'
+	else
+		printf 'FFmpeg pipeline failed before producing a frame\n'
+	fi
 }
 
 process_start_time() {
@@ -508,6 +563,26 @@ process_is_running() {
 	kill -0 "$pid" 2>/dev/null || return 1
 	state="$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null)" || return 1
 	[ "$state" != "Z" ] && [ "$state" != "X" ]
+}
+
+process_is_direct_child() {
+	local pid="$1" parent
+
+	valid_decimal "$pid" 10 || return 1
+	parent="$(
+		awk '$1 == "PPid:" { print $2; exit }' \
+			"/proc/$pid/status" 2>/dev/null
+	)" || return 1
+	valid_decimal "$parent" 10 || return 1
+	[ "$parent" = "$$" ]
+}
+
+direct_child_matches() {
+	local pid="$1" start="$2" actual
+
+	process_is_direct_child "$pid" || return 1
+	actual="$(process_start_time "$pid" 2>/dev/null)" || return 1
+	[ "$actual" = "$start" ]
 }
 
 frame_is_fresh() {
@@ -819,9 +894,11 @@ worker_current() {
 }
 
 cmd_worker() {
-	local token="$1" dir frame now pid start ffmpeg_pid ffmpeg_start rc=1
+	local token="$1" dir frame log_pipe log_file log_pid="" log_start=""
+	local now pid start ffmpeg_pid ffmpeg_start candidate_pid rc=1
 	local frame_mtime="" last_frame_mtime="" last_frame_change=""
 	local running_written=0 stopping=0 failure_reason=""
+	local log_anchor_open=0 log_launching=0
 
 	valid_token "$token" || exit 2
 	ensure_lock_file "$WORKER_LOCK" || exit 1
@@ -836,7 +913,9 @@ cmd_worker() {
 	}
 	dir="$RUNTIME_DIR/s-$token"
 	frame="$dir/frame.jpg"
-	rm -f -- "$frame" "$frame.tmp" 2>/dev/null || :
+	log_pipe="$dir/ffmpeg-log.pipe"
+	log_file="$dir/ffmpeg.log"
+	rm -f -- "$frame" "$frame.tmp" "$log_pipe" "$log_file" 2>/dev/null || :
 	pid="$$"
 	start="$(process_start_time "$pid" 2>/dev/null)" || {
 		exec 3<&-
@@ -847,20 +926,83 @@ cmd_worker() {
 		exit 1
 	}
 
+	stop_direct_child_bounded() {
+		local child_pid="$1" child_start="${2:-}" attempts=0
+
+		if [ -z "$child_start" ]; then
+			process_is_direct_child "$child_pid" || {
+				wait "$child_pid" 2>/dev/null || :
+				return 0
+			}
+			child_start="$(process_start_time "$child_pid" 2>/dev/null)" || {
+				wait "$child_pid" 2>/dev/null || :
+				return 0
+			}
+		fi
+		direct_child_matches "$child_pid" "$child_start" || {
+			wait "$child_pid" 2>/dev/null || :
+			return 0
+		}
+
+		kill -TERM "$child_pid" 2>/dev/null || :
+		while direct_child_matches "$child_pid" "$child_start" &&
+		      process_is_running "$child_pid"; do
+			attempts=$((attempts + 1))
+			[ "$attempts" -lt "$STOP_TIMEOUT" ] || break
+			sleep 1
+		done
+		if direct_child_matches "$child_pid" "$child_start" &&
+		   process_is_running "$child_pid"; then
+			kill -KILL "$child_pid" 2>/dev/null || :
+		fi
+		if ! direct_child_matches "$child_pid" "$child_start" ||
+		   ! process_is_running "$child_pid"; then
+			wait "$child_pid" 2>/dev/null || :
+			return 0
+		fi
+		return 1
+	}
+
 	# Invoked indirectly by the signal trap below.
 	# shellcheck disable=SC2317
 	stop_child() {
 		stopping=1
-		if [ -n "${ffmpeg_pid:-}" ]; then
-			if [ -n "${ffmpeg_start:-}" ]; then
-				stop_ffmpeg_bounded "$ffmpeg_pid" "$ffmpeg_start" "$token"
-			else
-				kill -TERM "$ffmpeg_pid" 2>/dev/null || :
-			fi
-			if ! process_is_running "$ffmpeg_pid"; then
-				wait "$ffmpeg_pid" 2>/dev/null || :
+		# Recover the logger PID if the trap lands after its asynchronous
+		# launch updates $! but before log_pid is assigned.
+		if [ -z "${log_pid:-}" ] && [ "${log_launching:-0}" -eq 1 ]; then
+			candidate_pid=$!
+			if valid_decimal "$candidate_pid" 10 &&
+			   process_is_direct_child "$candidate_pid"; then
+				log_pid="$candidate_pid"
+				log_start="$(
+					process_start_time "$log_pid" 2>/dev/null
+				)" || log_start=""
 			fi
 		fi
+		# A trap may run in the tiny interval after the asynchronous launch
+		# updates $! but before ffmpeg_pid is assigned.
+		if [ -z "${ffmpeg_pid:-}" ] && [ -n "${log_pid:-}" ]; then
+			candidate_pid=$!
+			if valid_decimal "$candidate_pid" 10 &&
+			   [ "$candidate_pid" != "$log_pid" ]; then
+				ffmpeg_pid="$candidate_pid"
+				ffmpeg_start="$(
+					process_start_time "$ffmpeg_pid" 2>/dev/null
+				)" || ffmpeg_start=""
+			fi
+		fi
+		if [ -n "${ffmpeg_pid:-}" ]; then
+			stop_direct_child_bounded \
+				"$ffmpeg_pid" "${ffmpeg_start:-}" || :
+		fi
+		if [ "${log_anchor_open:-0}" -eq 1 ]; then
+			exec 7>&-
+			log_anchor_open=0
+		fi
+		if [ -n "${log_pid:-}" ]; then
+			stop_direct_child_bounded "$log_pid" "${log_start:-}" || :
+		fi
+		rm -f -- "$log_pipe" "$log_file" 2>/dev/null || :
 		if worker_current "$token" 2>/dev/null; then
 			write_status "$token" stopped "Renderer stopped" 2>/dev/null || :
 		fi
@@ -869,6 +1011,40 @@ cmd_worker() {
 	trap stop_child HUP INT TERM
 
 	umask 077
+	mkfifo "$log_pipe" || {
+		write_status "$token" error "Cannot initialize FFmpeg diagnostics" 2>/dev/null || :
+		exec 3<&-
+		exit 1
+	}
+	exec 7<> "$log_pipe" || {
+		rm -f -- "$log_pipe" 2>/dev/null || :
+		write_status "$token" error "Cannot open FFmpeg diagnostics" 2>/dev/null || :
+		exec 3<&-
+		exit 1
+	}
+	log_anchor_open=1
+	# Drain the complete diagnostic stream while retaining at most 64 KiB.
+	# A persistent reader prevents recoverable FFmpeg errors from causing
+	# SIGPIPE, and a single awk process can be terminated safely by the trap.
+	log_launching=1
+	LC_ALL=C awk -v max_bytes="$FFMPEG_LOG_MAX_BYTES" '
+		BEGIN {
+			written = 0
+		}
+		{
+			if (written >= max_bytes)
+				next
+			text = $0 ORS
+			remaining = max_bytes - written
+			if (length(text) > remaining)
+				text = substr(text, 1, remaining)
+			printf "%s", text
+			written += length(text)
+		}
+	' < "$log_pipe" > "$log_file" 2>/dev/null 3<&- 7>&- 8<&- &
+	log_pid=$!
+	log_launching=0
+	log_start="$(process_start_time "$log_pid" 2>/dev/null)" || log_start=""
 	nice -n 10 ffmpeg \
 		-y \
 		-hide_banner \
@@ -878,6 +1054,8 @@ cmd_worker() {
 		-re \
 		-protocol_whitelist file,pipe \
 		-threads 1 \
+		-fflags +genpts \
+		-err_detect ignore_err \
 		-i /proc/self/fd/3 \
 		-map 0:V:0 \
 		-an \
@@ -885,23 +1063,23 @@ cmd_worker() {
 		-dn \
 		-map_metadata -1 \
 		-filter_threads 1 \
-		-vf "fps=3,scale=640:360:force_original_aspect_ratio=decrease:flags=fast_bilinear" \
+		-vf "fps=3,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 		-threads 1 \
 		-c:v mjpeg \
 		-q:v 8 \
 		-f image2 \
 		-update 1 \
 		-atomic_writing 1 \
-		"$frame" 8<&- </dev/null >/dev/null 2>/dev/null &
+		"$frame" 8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
 	ffmpeg_pid=$!
+	exec 7>&-
+	log_anchor_open=0
 	ffmpeg_start="$(process_start_time "$ffmpeg_pid" 2>/dev/null)" || ffmpeg_start=""
 	if [ -z "$ffmpeg_start" ] ||
 	   ! write_worker_identity "$token" "$ffmpeg_pid" "$ffmpeg_start" ffmpeg; then
-		if [ -n "$ffmpeg_start" ]; then
-			stop_ffmpeg_bounded "$ffmpeg_pid" "$ffmpeg_start" "$token"
-		else
-			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
-		fi
+		stop_direct_child_bounded "$ffmpeg_pid" "$ffmpeg_start" || :
+		stop_direct_child_bounded "$log_pid" "$log_start" || :
+		rm -f -- "$log_pipe" "$log_file" 2>/dev/null || :
 		write_status "$token" error "Cannot track FFmpeg process" 2>/dev/null || :
 		exec 3<&-
 		exit 1
@@ -960,16 +1138,24 @@ cmd_worker() {
 	done
 
 	if [ "$stopping" -eq 1 ] || [ -n "$failure_reason" ]; then
-		stop_ffmpeg_bounded "$ffmpeg_pid" "$ffmpeg_start" "$token"
+		stop_direct_child_bounded "$ffmpeg_pid" "$ffmpeg_start" || :
 	fi
 	if process_is_running "$ffmpeg_pid"; then
 		rc=1
+		stop_direct_child_bounded "$log_pid" "$log_start" || :
 	else
 		wait "$ffmpeg_pid" 2>/dev/null
 		rc=$?
+		wait "$log_pid" 2>/dev/null || :
+	fi
+	if [ "$stopping" -eq 0 ] &&
+	   [ -z "$failure_reason" ] &&
+	   { [ "$rc" -ne 0 ] || [ "$running_written" -eq 0 ]; }; then
+		failure_reason="$(ffmpeg_failure_reason "$log_file" "$rc")"
 	fi
 	ffmpeg_pid=""
 	rm -f -- "$dir/ffmpeg" 2>/dev/null || :
+	rm -f -- "$log_pipe" "$log_file" 2>/dev/null || :
 	exec 3<&-
 
 	if worker_current "$token" 2>/dev/null; then
@@ -980,7 +1166,7 @@ cmd_worker() {
 		elif [ "$rc" -eq 0 ] && [ "$running_written" -eq 1 ]; then
 			write_status "$token" ended "End of video" 2>/dev/null || :
 		else
-			write_status "$token" error "FFmpeg could not decode this video" 2>/dev/null || :
+			write_status "$token" error "FFmpeg pipeline failed" 2>/dev/null || :
 		fi
 	fi
 	exit 0
@@ -1171,6 +1357,17 @@ cmd_status() {
 	printf '%s\n' "$SESSION_STATUS"
 }
 
+cmd_reason() {
+	local token="$1"
+
+	valid_token "$token" || return 1
+	load_current || return 0
+	[ "$CURRENT_TOKEN" = "$token" ] || return 0
+	load_status "$token" || return 0
+	[ "$SESSION_STATUS" = "error" ] || return 0
+	printf '%s\n' "$SESSION_REASON"
+}
+
 http_error() {
 	local status="$1" message="$2"
 
@@ -1344,6 +1541,10 @@ case "${1:-}" in
 	status)
 		[ "$#" -eq 2 ] || exit 2
 		cmd_status "$2"
+		;;
+	reason)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_reason "$2"
 		;;
 	worker)
 		[ "$#" -eq 2 ] || exit 2

@@ -183,6 +183,9 @@ if command -v ffmpeg >/dev/null 2>&1; then
 	printf '%s\n' "$ffmpeg_filters" |
 		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+scale[[:space:]]' ||
 		missing "an ffmpeg build with the scale filter"
+	printf '%s\n' "$ffmpeg_filters" |
+		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+format[[:space:]]' ||
+		missing "an ffmpeg build with the format filter"
 fi
 
 if command -v stat >/dev/null 2>&1; then

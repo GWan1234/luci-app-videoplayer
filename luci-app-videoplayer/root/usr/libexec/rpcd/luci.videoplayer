@@ -307,6 +307,15 @@ valid_token() {
 	return 0
 }
 
+generate_random_token() {
+	local token
+
+	token="$(hexdump -v -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)" ||
+		return 1
+	valid_token "$token" || return 1
+	printf '%s\n' "$token"
+}
+
 ensure_token_lock() {
 	local canonical metadata owner
 
@@ -469,9 +478,7 @@ create_token() {
 		rm -f -- "$token_tmp" || exit 1
 		while [ "$attempts" -lt "$TOKEN_CREATE_ATTEMPTS" ]; do
 			attempts=$((attempts + 1))
-			token="$(hexdump -v -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)" ||
-				exit 1
-			valid_token "$token" || continue
+			token="$(generate_random_token)" || exit 1
 			bucket="$(printf '%.3s' "$token")"
 			[ "${#bucket}" -eq "$TOKEN_BUCKET_HEX" ] || continue
 			token_file="$TOKEN_DIR/t-$bucket"
@@ -917,16 +924,18 @@ cmd_resolve() {
 		return
 	}
 
-	token="$(create_token "$path")" || {
-		json_error "cannot create stream token"
-		return
-	}
-
 	name="${path##*/}"
 	mime="$(mime_for "$path")"
 	render_mode="$requested_mode"
 
 	if [ "$render_mode" = "router" ]; then
+		# CPU sessions use the renderer's own token namespace. Creating a
+		# six-hour browser-stream token here would leak a bucket on every
+		# successful or failed renderer start.
+		token="$(generate_random_token)" || {
+			json_error "cannot create renderer token"
+			return
+		}
 		[ -x "$RENDERER_HELPER" ] || {
 			json_error "router CPU renderer is not installed"
 			return
@@ -941,6 +950,11 @@ cmd_resolve() {
 			json_error "$renderer_message"
 			return
 		fi
+	else
+		token="$(create_token "$path")" || {
+			json_error "cannot create stream token"
+			return
+		}
 	fi
 
 	json_init
@@ -968,7 +982,7 @@ cmd_resolve() {
 }
 
 cmd_renderer_status() {
-	local raw="$1" state
+	local raw="$1" state reason=""
 
 	parse_request "$raw" || {
 		json_error "invalid JSON request"
@@ -987,9 +1001,17 @@ cmd_renderer_status() {
 		starting|running|ended|error|stopped|expired|inactive) ;;
 		*) state="error" ;;
 	esac
+	if [ "$state" = "error" ]; then
+		reason="$("$RENDERER_HELPER" reason "$REQ_TOKEN" 2>/dev/null)" ||
+			reason=""
+		if string_has_control "$reason" || [ "${#reason}" -gt 160 ]; then
+			reason=""
+		fi
+	fi
 
 	json_init
 	json_add_string "state" "$state"
+	[ -z "$reason" ] || json_add_string "reason" "$reason"
 	json_dump
 }
 

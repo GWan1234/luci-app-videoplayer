@@ -171,4 +171,106 @@ do
 		fail "unexpected listing entry: $rejected"
 done
 
+renderer_stub="$work/videoplayer-renderer"
+cat > "$renderer_stub" <<'SH'
+#!/bin/sh
+[ "$#" -eq 3 ] && [ "$1" = "start" ] || exit 2
+printf 'started\n'
+SH
+chmod 0755 "$renderer_stub"
+
+# cmd_resolve must not consume a six-hour browser streaming-token bucket for
+# CPU sessions. Conversely, browser mode must not use the renderer namespace.
+# shellcheck disable=SC2034
+RENDERER_HELPER="$renderer_stub"
+parse_request() {
+	# Consumed by cmd_resolve from the sourced rpcd backend.
+	# shellcheck disable=SC2034
+	REQ_PATH="movie.mp4"
+	return 0
+}
+get_enabled() {
+	printf '1\n'
+}
+get_render_mode() {
+	printf 'router\n'
+}
+get_media_root() {
+	printf '%s\n' "$media"
+}
+resolve_under_root() {
+	printf '%s\n' "$media/movie.mp4"
+}
+relative_from_root() {
+	printf 'movie.mp4\n'
+}
+path_depth() {
+	printf '0\n'
+}
+get_max_depth() {
+	printf '8\n'
+}
+get_file_metadata() {
+	# Consumed by cmd_resolve from the sourced rpcd backend.
+	# shellcheck disable=SC2034
+	FILE_SIZE=1
+}
+json_init() {
+	:
+}
+json_add_string() {
+	:
+}
+json_add_int() {
+	:
+}
+json_add_boolean() {
+	:
+}
+json_dump() {
+	printf '{}\n'
+}
+json_error() {
+	fail "cmd_resolve returned an error: $1"
+}
+
+stream_token_marker="$work/stream-token-created"
+renderer_token_marker="$work/renderer-token-created"
+# Invoked indirectly by cmd_resolve from the sourced rpcd backend.
+# shellcheck disable=SC2329
+create_token() {
+	: > "$stream_token_marker"
+	return 1
+}
+# Invoked indirectly by cmd_resolve from the sourced rpcd backend.
+# shellcheck disable=SC2329
+generate_random_token() {
+	: > "$renderer_token_marker"
+	printf '22222222222222222222222222222222\n'
+}
+cmd_resolve '{}' router >/dev/null
+[[ ! -e "$stream_token_marker" ]] ||
+	fail "router mode allocated a browser stream token"
+[[ -e "$renderer_token_marker" ]] ||
+	fail "router mode did not allocate a renderer token"
+
+# Invoked indirectly by cmd_resolve from the sourced rpcd backend.
+# shellcheck disable=SC2329
+create_token() {
+	: > "$stream_token_marker"
+	printf '33333333333333333333333333333333\n'
+}
+# Invoked indirectly by cmd_resolve from the sourced rpcd backend.
+# shellcheck disable=SC2329
+generate_random_token() {
+	: > "$renderer_token_marker"
+	return 1
+}
+rm -f -- "$renderer_token_marker"
+cmd_resolve '{}' browser >/dev/null
+[[ ! -e "$renderer_token_marker" ]] ||
+	fail "browser mode allocated a renderer token"
+[[ -e "$stream_token_marker" ]] ||
+	fail "browser mode did not allocate a stream token"
+
 printf 'local-listing-test: ok\n'

@@ -75,8 +75,17 @@ FFmpeg is large for router software. Depending on architecture and repository
 configuration, `libffmpeg-full` alone may consume roughly 14–23 MiB after
 installation, before its other dependencies. Router CPU mode also requires an
 FFmpeg build containing the native MJPEG encoder, the `image2` muxer, and the
-`fps` and `scale` filters. The UI checks these capabilities before enabling a
-CPU-rendered session.
+`fps`, `scale`, and `format` filters. The UI checks these capabilities before
+enabling a CPU-rendered session.
+
+Despite its name, the official OpenWrt `libffmpeg-full` package is built
+without H.264, HEVC, and VC-1 decoders when OpenWrt's global
+`CONFIG_BUILD_PATENTED` option is disabled, as it is for official package
+repositories. Router-side decoding of those codecs requires an FFmpeg package
+built for the router's exact OpenWrt release and architecture with the needed
+decoders enabled. Do not install libraries built for another release or ABI.
+The user is responsible for checking codec patent and distribution rules in
+their jurisdiction.
 
 The scripts also use standard OpenWrt BusyBox commands, including `sort -z`
 and `flock`.
@@ -320,12 +329,20 @@ on the package manager and whether the file has been modified.
 - Browser mode codec support depends on the client browser.
 - Router CPU mode is an experimental silent preview capped at 640×360 and
   approximately 3 FPS. It has no audio, pause, seeking, duration, or timeline.
+- If router-side FFmpeg cannot start for a local file, the UI reports the
+  classified failure and automatically retries that file with browser
+  decoding. Automatic browser fallback starts muted; audio can be enabled with
+  the player control.
 - Router CPU mode can cause high CPU use, heat, stutter, and temporary LuCI
   slowdown. Reducing the output frame rate does not prevent FFmpeg from
   decoding the source stream, so high-resolution media may still overwhelm a
   low-powered router.
-- Official OpenWrt FFmpeg builds may omit patented decoders such as H.264.
-  A file that works in browser mode can therefore fail in router CPU mode.
+- The source file is read incrementally through a validated file descriptor;
+  it is not copied into RAM. FFmpeg still needs working memory for compressed
+  packets, decoded frames, reference frames, scaling, and JPEG output.
+- No player can guarantee every existing or future codec. Unsupported
+  decoders, DRM, encryption, damaged files, CPU performance, available RAM,
+  thermal limits, and storage throughput remain real constraints.
 - The remote server must allow the browser to load the resource. CORS is
   required when the server or page policy enforces a CORS check; convenient
   seeking also requires HTTP Range support.
@@ -348,11 +365,11 @@ exact payload contents. The builder also rejects metadata drift against the
 verifier and checks its version, release suffix, and dependencies against the
 OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
 exercises local media discovery against OpenWrt-compatible extension handling,
-exercises the renderer lifecycle with an isolated fake FFmpeg process, and
-builds and verifies both packages. After those checks pass on `main`, a
-separate job with narrowly scoped repository write access rebuilds the APK and
-updates the generated `snapshot` branch. It never uploads files to a router or
-changes GitHub Releases.
+exercises successful renderer lifecycle and missing-decoder classification
+with an isolated fake FFmpeg process, and builds and verifies both packages.
+After those checks pass on `main`, a separate job with narrowly scoped
+repository write access rebuilds the APK and updates the generated `snapshot`
+branch. It never uploads files to a router or changes GitHub Releases.
 
 ## Repository Structure
 

@@ -238,7 +238,11 @@ static int publish(const char *output)
 int main(int argc, char **argv)
 {
 	struct stat input;
+	char marker[32] = {0};
 	const char *output;
+	int fail_after_first_frame;
+	int line;
+	ssize_t marker_size;
 
 	if (has_arg(argc, argv, "-encoders")) {
 		puts(" V..... mjpeg CI stub");
@@ -253,6 +257,7 @@ int main(int argc, char **argv)
 	if (has_arg(argc, argv, "-filters")) {
 		puts(" ... fps V->V CI stub");
 		puts(" ... scale V->V CI stub");
+		puts(" ... format V->V CI stub");
 		return 0;
 	}
 
@@ -261,8 +266,15 @@ int main(int argc, char **argv)
 	    count_pair(argc, argv, "-threads", "1") < 2 ||
 	    count_pair(argc, argv, "-filter_threads", "1") != 1 ||
 	    count_pair(argc, argv, "-protocol_whitelist", "file,pipe") != 1 ||
+	    count_pair(argc, argv, "-fflags", "+genpts") != 1 ||
+	    count_pair(argc, argv, "-err_detect", "ignore_err") != 1 ||
 	    count_pair(argc, argv, "-i", "/proc/self/fd/3") != 1 ||
 	    count_pair(argc, argv, "-map", "0:V:0") != 1 ||
+	    count_pair(
+		    argc,
+		    argv,
+		    "-vf",
+		    "fps=3,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p") != 1 ||
 	    count_pair(argc, argv, "-c:v", "mjpeg") != 1 ||
 	    count_pair(argc, argv, "-f", "image2") != 1 ||
 	    count_pair(argc, argv, "-update", "1") != 1 ||
@@ -280,6 +292,25 @@ int main(int argc, char **argv)
 	if (!output_is_safe(output))
 		return 65;
 
+	marker_size = pread(3, marker, sizeof(marker) - 1, 0);
+	if (marker_size < 0)
+		return 67;
+	if (marker_size >= 15 && memcmp(marker, "decoder-missing", 15) == 0) {
+		fputs(
+			"Decoder (codec h264) not found for input stream #0:0\n",
+			stderr);
+		return 68;
+	}
+	if (marker_size >= 17 && memcmp(marker, "noisy-diagnostics", 17) == 0) {
+		for (line = 0; line < 4096; line++)
+			fputs(
+				"recoverable decoder diagnostic that must not stop playback\n",
+				stderr);
+		fflush(stderr);
+	}
+	fail_after_first_frame =
+		marker_size >= 15 && memcmp(marker, "runtime-failure", 15) == 0;
+
 	signal(SIGTERM, stop);
 	signal(SIGINT, stop);
 	signal(SIGHUP, stop);
@@ -287,6 +318,11 @@ int main(int argc, char **argv)
 	while (running) {
 		if (publish(output) != 0)
 			return 66;
+		if (fail_after_first_frame) {
+			sleep(4);
+			fputs("Cannot allocate memory while decoding frame\n", stderr);
+			return 69;
+		}
 
 		usleep(100000);
 	}
@@ -296,7 +332,10 @@ int main(int argc, char **argv)
 C
 
 chmod 0755 "$bin/ffmpeg"
-printf 'non-empty local media fixture\n' > "$work/media/input.bin"
+printf 'non-empty local media fixture\n' > "$work/media/bad apple.mp4"
+printf 'decoder-missing fixture\n' > "$work/media/h264.mp4"
+printf 'noisy-diagnostics fixture\n' > "$work/media/noisy.mp4"
+printf 'runtime-failure fixture\n' > "$work/media/runtime.mp4"
 
 check_response() {
 	python3 - "$1" "$2" <<'PY'
@@ -369,10 +408,72 @@ run_cgi() {
 
 token1=0123456789abcdef0123456789abcdef
 token2=fedcba9876543210fedcba9876543210
+missing_decoder=11111111111111111111111111111111
+noisy_diagnostics=22222222222222222222222222222222
+runtime_failure=33333333333333333333333333333333
 stale=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-media="$work/media/input.bin"
+media="$work/media/bad apple.mp4"
 
 assert_eq "$("$helper" probe)" available "probe"
+
+set +e
+missing_output="$("$helper" start "$missing_decoder" "$work/media/h264.mp4" 2>&1)"
+missing_rc=$?
+set -e
+
+assert_eq "$missing_rc" 1 "missing decoder exit code"
+assert_eq \
+	"$missing_output" \
+	"Installed FFmpeg has no decoder for this video codec" \
+	"missing decoder classification"
+assert_eq \
+	"$("$helper" status "$missing_decoder")" \
+	inactive \
+	"missing decoder session cleanup"
+[[ ! -e "$runtime/s-$missing_decoder/ffmpeg.log" &&
+   ! -e "$runtime/s-$missing_decoder/ffmpeg-log.pipe" ]] ||
+	fail "missing decoder diagnostics were not cleaned"
+
+assert_eq \
+	"$("$helper" start "$noisy_diagnostics" "$work/media/noisy.mp4")" \
+	started \
+	"large diagnostic stream does not stop playback"
+assert_eq \
+	"$("$helper" status "$noisy_diagnostics")" \
+	running \
+	"status after large diagnostic stream"
+diagnostic_size="$(stat -c '%s' "$runtime/s-$noisy_diagnostics/ffmpeg.log")"
+[[ "$diagnostic_size" -gt 0 && "$diagnostic_size" -le 65536 ]] ||
+	fail "diagnostic capture exceeded its 64 KiB limit: $diagnostic_size"
+assert_eq \
+	"$("$helper" stop "$noisy_diagnostics")" \
+	stopped \
+	"stop after large diagnostic stream"
+[[ ! -e "$runtime/s-$noisy_diagnostics/ffmpeg.log" &&
+   ! -e "$runtime/s-$noisy_diagnostics/ffmpeg-log.pipe" ]] ||
+	fail "large diagnostic stream artifacts were not cleaned"
+
+assert_eq \
+	"$("$helper" start "$runtime_failure" "$work/media/runtime.mp4")" \
+	started \
+	"runtime failure starts after its first frame"
+for _ in {1..160}; do
+	[[ "$("$helper" status "$runtime_failure")" == error ]] && break
+	sleep 0.05
+done
+assert_eq \
+	"$("$helper" status "$runtime_failure")" \
+	error \
+	"runtime failure status"
+assert_eq \
+	"$("$helper" reason "$runtime_failure")" \
+	"FFmpeg ran out of memory while decoding this video" \
+	"runtime failure reason"
+assert_eq \
+	"$("$helper" stop "$runtime_failure")" \
+	stopped \
+	"stop after runtime failure"
+
 assert_eq "$("$helper" start "$token1" "$media")" started "start"
 assert_eq "$("$helper" status "$token1")" running "status after start"
 
