@@ -33,8 +33,7 @@ PKG_VERSION = "1.0.0"
 PKG_DESC = "HTML5 video player in LuCI for local and remote media"
 PKG_LICENSE = "GPL-2.0-or-later"
 PKG_MAINTAINER = "openwrt-video-player contributors"
-# Set this to the canonical repository URL before publishing a package feed.
-PKG_URL = ""
+PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
 PKG_ARCH_IPK = "all"
 PKG_ARCH_APK = "noarch"
 DEPENDS = ["luci-base", "uhttpd", "jshn", "coreutils-stat"]
@@ -212,7 +211,7 @@ def collect_files() -> list[tuple[str, Path, int]]:
     # Ensure executables
     out: list[tuple[str, Path, int]] = []
     for install, path, mode in files:
-        if install.endswith("videoplayer-stream") or install.endswith("luci.videoplayer"):
+        if install.endswith(("videoplayer-stream", "luci.videoplayer")):
             mode = MODE_EXEC
         if "/uci-defaults/" in install or install.startswith("etc/uci-defaults/"):
             mode = MODE_EXEC
@@ -260,7 +259,7 @@ default_postinst
 	exit 0
 }}
 exit 0
-""".encode("utf-8")
+""".encode()
 
 
 def prerm_script() -> bytes:
@@ -271,7 +270,7 @@ export root="${{IPKG_INSTROOT}}"
 export pkgname="{PKG_NAME}"
 default_prerm
 exit 0
-""".encode("utf-8")
+""".encode()
 
 
 def postupgrade_script() -> bytes:
@@ -463,13 +462,14 @@ SourceName: {PKG_NAME}
 License: {PKG_LICENSE}
 Section: luci
 SourceDateEpoch: {mtime}
+URL: {PKG_URL}
 Maintainer: {PKG_MAINTAINER}
 Architecture: {PKG_ARCH_IPK}
 Installed-Size: {installed_size}
 Description:  {PKG_DESC}
  HTML5 video player inside LuCI. Plays local MP4 from router storage
  and remote HTTP(S) media URLs. Architecture-independent.
-""".encode("utf-8")
+""".encode()
 
     conffiles = ("\n".join(CONFFILES) + "\n").encode("utf-8")
     control_members = [

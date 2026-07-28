@@ -29,6 +29,7 @@ PKG_LICENSE = "GPL-2.0-or-later"
 PKG_DESCRIPTION = "HTML5 video player in LuCI for local and remote media"
 PKG_MAINTAINER = "openwrt-video-player contributors"
 PKG_ORIGIN = f"feeds/luci/applications/{PKG_NAME}"
+PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
 DEPENDENCIES = ("luci-base", "uhttpd", "jshn", "coreutils-stat")
 REQUIRED_DEPENDS = set(DEPENDENCIES)
 CONFFILES = ["/etc/config/videoplayer"]
@@ -144,10 +145,8 @@ def source_payload() -> dict[str, tuple[bytes, int]]:
             install_path = install_path.lstrip("/")
 
             mode = MODE_FILE
-            if (
-                install_path.startswith("etc/uci-defaults/")
-                or install_path.startswith("usr/libexec/")
-                or install_path.startswith("www/cgi-bin/")
+            if install_path.startswith(
+                ("etc/uci-defaults/", "usr/libexec/", "www/cgi-bin/")
             ):
                 mode = MODE_EXEC
 
@@ -394,13 +393,14 @@ SourceName: {PKG_NAME}
 License: {PKG_LICENSE}
 Section: luci
 SourceDateEpoch: {package_mtime}
+URL: {PKG_URL}
 Maintainer: {PKG_MAINTAINER}
 Architecture: {PKG_ARCH_IPK}
 Installed-Size: {installed_size}
 Description:  {PKG_DESCRIPTION}
  HTML5 video player inside LuCI. Plays local MP4 from router storage
  and remote HTTP(S) media URLs. Architecture-independent.
-""".encode("utf-8")
+""".encode()
 
 
 def verify_script(
@@ -479,6 +479,7 @@ def verify_ipk(ipk_path: Path, expected: dict[str, tuple[bytes, int]]) -> int:
         "License": PKG_LICENSE,
         "Section": "luci",
         "SourceDateEpoch": str(package_mtime),
+        "URL": PKG_URL,
         "Maintainer": PKG_MAINTAINER,
         "Architecture": PKG_ARCH_IPK,
         "Description": (
@@ -718,7 +719,7 @@ def expected_apk_uid(payload: dict[str, tuple[bytes, int]]) -> bytes:
         PKG_ARCH_APK,
         PKG_LICENSE,
         PKG_MAINTAINER,
-        "",
+        PKG_URL,
         *DEPENDENCIES,
     ):
         encoded = value.encode("utf-8")
@@ -897,7 +898,7 @@ def verify_apk(
     require(reader.string(info[6]) == PKG_LICENSE, "Wrong APK license")
     require(reader.string(info[7]) == PKG_ORIGIN, "Wrong APK origin")
     require(reader.string(info[8]) == PKG_MAINTAINER, "Wrong APK maintainer")
-    require(reader.string(info[9]) == "", "APK contains an unconfigured project URL")
+    require(reader.string(info[9]) == PKG_URL, "Wrong APK project URL")
 
     apk_depends: set[str] = set()
     for item in reader.array(info[15]):
