@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
-# shellcheck shell=busybox
+# shellcheck shell=sh
 #
 # Single-session router CPU renderer for luci-app-videoplayer.
 # FFmpeg decodes a validated local file and atomically refreshes one JPEG in
@@ -798,10 +798,10 @@ validate_source_path() {
 			return 1
 			;;
 	esac
-	valid_decimal "$size" 18 && [ "$size" -gt 0 ] || {
+	if ! valid_decimal "$size" 18 || [ "$size" -le 0 ]; then
 		exec 3<&-
 		return 1
-	}
+	fi
 	return 0
 }
 
@@ -847,6 +847,8 @@ cmd_worker() {
 		exit 1
 	}
 
+	# Invoked indirectly by the signal trap below.
+	# shellcheck disable=SC2317
 	stop_child() {
 		stopping=1
 		if [ -n "${ffmpeg_pid:-}" ]; then
@@ -1035,10 +1037,10 @@ cmd_start() {
 	}
 	expiry=$((now + TOKEN_TTL))
 	dir="$RUNTIME_DIR/s-$token"
-	[ ! -e "$dir" ] && [ ! -L "$dir" ] || {
+	if [ -e "$dir" ] || [ -L "$dir" ]; then
 		printf 'Renderer session collision\n' >&2
 		return 1
-	}
+	fi
 	(umask 077; mkdir -- "$dir") || {
 		printf 'Cannot create renderer session\n' >&2
 		return 1
@@ -1256,8 +1258,9 @@ cmd_cgi() {
 
 	dir="$RUNTIME_DIR/s-$CGI_TOKEN"
 	frame="$dir/frame.jpg"
-	[ -f "$frame" ] && [ ! -L "$frame" ] ||
+	if [ ! -f "$frame" ] || [ -L "$frame" ]; then
 		http_error "202 Accepted" "Frame is not ready"
+	fi
 	exec 7< "$frame" || http_error "503 Service Unavailable" "Cannot open frame"
 	opened="$(readlink -f -- /proc/self/fd/7 2>/dev/null)" || {
 		exec 7<&-
@@ -1278,12 +1281,14 @@ cmd_cgi() {
 	metadata="${metadata#*:}"
 	size="${metadata%%:*}"
 	metadata="${metadata#*:}"
-	[ "$kind" = "regular file" ] && valid_decimal "$size" 10 &&
-		[ "$size" -gt 0 ] && [ "$size" -le "$MAX_FRAME_BYTES" ] &&
-		[ "$metadata" = "0:600" ] || {
-			exec 7<&-
-			http_error "503 Service Unavailable" "Invalid frame"
-		}
+	if [ "$kind" != "regular file" ] ||
+	   ! valid_decimal "$size" 10 ||
+	   [ "$size" -le 0 ] ||
+	   [ "$size" -gt "$MAX_FRAME_BYTES" ] ||
+	   [ "$metadata" != "0:600" ]; then
+		exec 7<&-
+		http_error "503 Service Unavailable" "Invalid frame"
+	fi
 	frame_is_fresh /proc/self/fd/7 "$now" || {
 		exec 7<&-
 		http_error "503 Service Unavailable" "Renderer frame is stale"

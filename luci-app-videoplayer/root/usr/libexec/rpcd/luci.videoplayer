@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
-# shellcheck shell=busybox
+# shellcheck shell=sh
 # OpenWrt runs this with BusyBox ash, whose read supports NUL delimiters.
 # shellcheck disable=SC3045
 #
@@ -468,7 +468,9 @@ create_token() {
 				continue
 			fi
 			if [ -e "$token_file" ] || [ -L "$token_file" ]; then
-				[ -f "$token_file" ] && [ ! -L "$token_file" ] || continue
+				if [ ! -f "$token_file" ] || [ -L "$token_file" ]; then
+					continue
+				fi
 			fi
 
 			if ! (
