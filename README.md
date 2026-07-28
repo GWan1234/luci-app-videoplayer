@@ -347,6 +347,7 @@ permissions, timestamps, the 20-byte SHA-256 prefix in the APK UID, and the
 exact payload contents. The builder also rejects metadata drift against the
 verifier and checks its version, release suffix, and dependencies against the
 OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
+exercises local media discovery against OpenWrt-compatible extension handling,
 exercises the renderer lifecycle with an isolated fake FFmpeg process, and
 builds and verifies both packages. After those checks pass on `main`, a
 separate job with narrowly scoped repository write access rebuilds the APK and
@@ -360,7 +361,9 @@ openwrt-video-player/
 ├── .github/workflows/package-check.yml
 ├── README.md
 ├── LICENSE
-├── tests/renderer-behavior.sh
+├── tests/
+│   ├── local-listing.sh
+│   └── renderer-behavior.sh
 ├── scripts/
 │   ├── build-packages.py
 │   ├── install-from-github.sh

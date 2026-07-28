@@ -215,7 +215,8 @@ is_allowed_ext() {
 		*.*) ;;
 		*) return 1 ;;
 	esac
-	ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
+	ext="$(printf '%s' "${base##*.}" |
+		tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
 	case " $VIDEO_EXTS " in
 		*" $ext "*) return 0 ;;
 		*) return 1 ;;
@@ -226,7 +227,8 @@ mime_for() {
 	local name="$1" base ext
 
 	base="${name##*/}"
-	ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
+	ext="$(printf '%s' "${base##*.}" |
+		tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
 	case "$ext" in
 		webm) printf 'video/webm\n' ;;
 		ogg|ogv) printf 'video/ogg\n' ;;
