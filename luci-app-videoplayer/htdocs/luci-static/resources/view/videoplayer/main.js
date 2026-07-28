@@ -1167,7 +1167,7 @@ return view.extend({
 			const entries = Array.isArray(res.entries) ? res.entries : [];
 			if (!entries.length) {
 				self._appendTableMessage(table,
-					_('No video files here. Supported: mp4, webm, ogg, ogv, m4v, mov.'));
+					_('No supported video files were found in this directory.'));
 				if (line)
 					line.textContent = _('Directory loaded: %s').format(self._formatCwdLabel(self._cwd));
 				self._updatePageInfo(0, false);

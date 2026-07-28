@@ -128,6 +128,28 @@ def validate_source_metadata() -> None:
                 f"{actual!r} != {expected!r}"
             )
 
+    extension_sources = (
+        PKG_DIR / "root/usr/libexec/rpcd/luci.videoplayer",
+        PKG_DIR / "root/www/cgi-bin/videoplayer-stream",
+    )
+    extension_values: list[tuple[Path, str]] = []
+    for source in extension_sources:
+        try:
+            text = read_source_file(source, 1024 * 1024).decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PackageBuildError(
+                f"Cannot read extension manifest from {source}: {exc}"
+            ) from exc
+        match = re.search(r'^VIDEO_EXTS="([^"]+)"\s*$', text, re.MULTILINE)
+        if not match:
+            raise PackageBuildError(f"VIDEO_EXTS is missing from {source}")
+        extension_values.append((source, match.group(1)))
+
+    if extension_values[0][1] != extension_values[1][1]:
+        raise PackageBuildError(
+            "RPC and streaming backends have different VIDEO_EXTS manifests"
+        )
+
 
 def read_source_file(path: Path, remaining_payload_bytes: int) -> bytes:
     """Read one regular source file without following links or growing unbounded."""

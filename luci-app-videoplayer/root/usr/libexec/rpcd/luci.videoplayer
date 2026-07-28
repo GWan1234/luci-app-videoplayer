@@ -12,7 +12,7 @@
 
 export LC_ALL=C
 
-VIDEO_EXTS="mp4 webm ogg ogv m4v mov"
+VIDEO_EXTS="3g2 3gp 264 265 asf avi divx f4v flv h264 h265 hevc m2ts m2v m4v mkv mov mp4 mpe mpeg mpg mts ogg ogv rm rmvb ts vob webm wmv"
 TOKEN_DIR="/tmp/videoplayer-tokens"
 TOKEN_LOCK_FILE="/tmp/videoplayer-tokens.lock"
 TOKEN_LAYOUT_MARKER="$TOKEN_DIR/.bucket-v1"
@@ -231,6 +231,18 @@ mime_for() {
 		webm) printf 'video/webm\n' ;;
 		ogg|ogv) printf 'video/ogg\n' ;;
 		mov) printf 'video/quicktime\n' ;;
+		mkv) printf 'video/x-matroska\n' ;;
+		avi|divx) printf 'video/x-msvideo\n' ;;
+		mpg|mpeg|mpe|m2v|vob) printf 'video/mpeg\n' ;;
+		ts|m2ts|mts) printf 'video/mp2t\n' ;;
+		flv) printf 'video/x-flv\n' ;;
+		wmv) printf 'video/x-ms-wmv\n' ;;
+		asf) printf 'video/x-ms-asf\n' ;;
+		3gp) printf 'video/3gpp\n' ;;
+		3g2) printf 'video/3gpp2\n' ;;
+		h264|264) printf 'video/h264\n' ;;
+		h265|265|hevc) printf 'video/h265\n' ;;
+		rm|rmvb) printf 'application/vnd.rn-realmedia\n' ;;
 		*) printf 'video/mp4\n' ;;
 	esac
 }

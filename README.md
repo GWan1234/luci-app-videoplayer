@@ -19,10 +19,12 @@ that published release until 1.1.0 release assets exist.
 | Remote URLs | Play `http://` and `https://` URLs directly in the browser; remote URLs are never fetched by FFmpeg on the router |
 | Interface | **Services → Video Player** page in LuCI |
 
-The local browser lists `mp4`, `webm`, `ogg`, `ogv`, `m4v`, and `mov` files.
-MP4 with H.264 video and AAC audio offers the broadest client-browser
-compatibility. Router CPU mode depends on the decoders enabled in the
-installed OpenWrt FFmpeg build, so it may support a different subset.
+The local browser recognizes common containers and raw streams, including
+MP4/M4V/MOV, WebM, MKV, AVI/DivX, Ogg, MPEG/VOB, MPEG-TS/M2TS/MTS, FLV/F4V,
+WMV/ASF, 3GP/3G2, RealMedia, and raw H.264/H.265 files. Extension matching is
+case-insensitive. MP4 with H.264 video and AAC audio offers the broadest
+client-browser compatibility. Router CPU mode depends on the decoders enabled
+in the installed OpenWrt FFmpeg build, so it may support a different subset.
 Directory entries are sorted on the router in a stable bytewise order and
 returned in pages of 100 entries. A link to the parent directory is available
 on every page.
