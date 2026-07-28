@@ -7,8 +7,9 @@ FFmpeg. In both cases, the output stays inside the LuCI web interface. The
 application does not use HDMI or a framebuffer.
 
 Current source package version: **1.1.0**. The latest published GitHub release
-is still **1.0.0**; the pinned quick installer below intentionally installs
-that published release until 1.1.0 release assets exist.
+is still **1.0.0**. The release installer below remains pinned to that release,
+while a separate APK-only installer follows the latest successfully tested
+`main` source.
 
 ## Features
 
@@ -107,6 +108,8 @@ uci commit videoplayer
 
 ## Quick Installation from GitHub
 
+### Published Release (APK or IPK)
+
 After preparing the storage, connect to the router over SSH as `root`. The
 router must have working HTTPS access to GitHub:
 
@@ -134,6 +137,39 @@ verifies its pinned SHA-256 checksum, attempts to refresh the package indexes,
 and installs the package. The released APK is unsigned, so installation on
 OpenWrt 25.12+ uses `apk add --allow-untrusted`. Downloads are size-limited to
 protect the router's RAM-backed `/tmp` filesystem.
+
+### Current `main` APK (OpenWrt 25.12+)
+
+To install the newest successfully tested `main` source instead of Release
+1.0.0, use the separate APK-only installer:
+
+```sh
+(
+	set -e
+	installer="$(mktemp /tmp/install-videoplayer-main.XXXXXX)"
+	trap 'rm -f "$installer"' 0
+	trap 'exit 129' 1
+	trap 'exit 130' 2
+	trap 'exit 143' 15
+	(
+		ulimit -f 1024
+		wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-main-apk.sh'
+	)
+	sh "$installer"
+)
+```
+
+After every successful package-check run for a push to `main`, GitHub Actions
+rebuilds the current source package and publishes the APK, its SHA-256
+checksum, and the exact source commit to the generated `snapshot` branch. The
+installer pins all three files to one immutable snapshot commit, verifies the
+checksum, and confirms that the APK source commit still equals the current
+head of `main`. It refuses to install while a newer push is still being
+checked or if any verification fails. This path supports only `apk`; use the
+published-release installer above on OpenWrt versions that still use `opkg`.
+OpenWrt 25.12.1 and newer can force a reinstall when two snapshots share the
+same package version. On 25.12.0, the first installation works, but an existing
+copy must be removed manually before installing another same-version snapshot.
 
 ## Building and Verifying Packages Locally
 
@@ -312,8 +348,10 @@ exact payload contents. The builder also rejects metadata drift against the
 verifier and checks its version, release suffix, and dependencies against the
 OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
 exercises the renderer lifecycle with an isolated fake FFmpeg process, and
-builds and verifies both packages. It does not publish anything or upload
-files to a router.
+builds and verifies both packages. After those checks pass on `main`, a
+separate job with narrowly scoped repository write access rebuilds the APK and
+updates the generated `snapshot` branch. It never uploads files to a router or
+changes GitHub Releases.
 
 ## Repository Structure
 
@@ -326,6 +364,7 @@ openwrt-video-player/
 ├── scripts/
 │   ├── build-packages.py
 │   ├── install-from-github.sh
+│   ├── install-main-apk.sh
 │   ├── install-to-router.sh
 │   └── verify_packages.py
 └── luci-app-videoplayer/

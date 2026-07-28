@@ -10,7 +10,7 @@ bin/
 tmp_sample*
 __pycache__/
 .ruff_cache/
-# Package artifacts are generated locally and should be attached to releases,
-# not committed from routine builds.
+# Local package artifacts stay out of main; CI publishes the current APK to
+# the generated snapshot branch after successful checks.
 dist/*.apk
 dist/*.ipk
