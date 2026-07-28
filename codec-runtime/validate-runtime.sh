@@ -16,8 +16,9 @@ sysroot="$2"
 work="$3"
 qemu="${QEMU_AARCH64:-qemu-aarch64-static}"
 
-[ -f "$binary" ] && [ -x "$binary" ] ||
+if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
 	die "private FFmpeg binary is missing or not executable"
+fi
 [ -d "$sysroot" ] ||
 	die "target sysroot is missing"
 command -v "$qemu" >/dev/null 2>&1 ||
