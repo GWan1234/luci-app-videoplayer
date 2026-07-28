@@ -73,6 +73,35 @@ uci commit videoplayer
 /etc/init.d/rpcd reload
 ```
 
+## Quick Installation from GitHub
+
+After preparing the storage, connect to the router over SSH as `root`. The
+router must have working HTTPS access to GitHub:
+
+```sh
+(
+	set -e
+	installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"
+	trap 'rm -f "$installer"' 0
+	trap 'exit 129' 1
+	trap 'exit 130' 2
+	trap 'exit 143' 15
+	(
+		ulimit -f 1024
+		wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-from-github.sh'
+	)
+	sh "$installer"
+)
+```
+
+The installer detects whether the router uses `apk` or `opkg`, downloads the
+matching package from
+[Release 1.0.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.0.0),
+verifies its pinned SHA-256 checksum, attempts to refresh the package indexes,
+and installs the package. The released APK is unsigned, so installation on
+OpenWrt 25.12+ uses `apk add --allow-untrusted`. Downloads are size-limited to
+protect the router's RAM-backed `/tmp` filesystem.
+
 ## Building and Verifying Packages Locally
 
 Python 3.10 or newer is sufficient for rapid local development:
@@ -150,10 +179,9 @@ make menuconfig
 make package/luci-app-videoplayer/compile V=s
 ```
 
-The package is listed under **LuCI → Applications**. Before publishing it,
-specify the canonical project URL and maintainer contact in
-`luci-app-videoplayer/Makefile`; it currently contains deliberately neutral
-local values.
+The package is listed under **LuCI → Applications**. Its canonical project URL
+is configured in `luci-app-videoplayer/Makefile`; set a specific maintainer
+contact there before submitting it to an official package feed.
 
 ## Manual Installation over SSH for Development
 
@@ -233,8 +261,9 @@ the package manager and whether the file has been modified.
 `scripts/verify_packages.py` parses IPK and APK files without relying on
 `assert` and validates metadata, dependencies, conffiles, lifecycle scripts,
 permissions, timestamps, the 20-byte SHA-256 prefix in the APK UID, and the
-exact payload contents. The CI workflow only builds and verifies packages; it
-does not publish anything or upload files to a router.
+exact payload contents. The CI workflow checks script syntax, lints the GitHub
+installer, and builds and verifies packages. It does not publish anything or
+upload files to a router.
 
 ## Repository Structure
 
@@ -245,8 +274,9 @@ openwrt-video-player/
 ├── LICENSE
 ├── scripts/
 │   ├── build-packages.py
-│   ├── verify_packages.py
-│   └── install-to-router.sh
+│   ├── install-from-github.sh
+│   ├── install-to-router.sh
+│   └── verify_packages.py
 └── luci-app-videoplayer/
     ├── Makefile
     ├── htdocs/luci-static/resources/view/videoplayer/main.js

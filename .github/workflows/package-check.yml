@@ -38,6 +38,8 @@ jobs:
           for path in Path("luci-app-videoplayer").rglob("*.json"):
               json.loads(path.read_text(encoding="utf-8"))
           PY
+          sh -n scripts/install-from-github.sh
+          shellcheck -s sh scripts/install-from-github.sh
           sh -n scripts/install-to-router.sh
           sh -n luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer
           sh -n luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer
