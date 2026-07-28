@@ -235,6 +235,17 @@ static int publish(const char *output)
 	return 0;
 }
 
+static int marker_is(
+	const char *marker,
+	ssize_t marker_size,
+	const char *wanted)
+{
+	size_t wanted_size = strlen(wanted);
+
+	return marker_size >= (ssize_t)wanted_size &&
+	       memcmp(marker, wanted, wanted_size) == 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct stat input;
@@ -295,13 +306,82 @@ int main(int argc, char **argv)
 	marker_size = pread(3, marker, sizeof(marker) - 1, 0);
 	if (marker_size < 0)
 		return 67;
-	if (marker_size >= 15 && memcmp(marker, "decoder-missing", 15) == 0) {
+	if (marker_is(marker, marker_size, "decoder-missing")) {
 		fputs(
 			"Decoder (codec h264) not found for input stream #0:0\n",
 			stderr);
 		return 68;
 	}
-	if (marker_size >= 17 && memcmp(marker, "noisy-diagnostics", 17) == 0) {
+	if (marker_is(marker, marker_size, "decoder-modern")) {
+		fputs(
+			"[vist#0:0/h264 @ 0x1234] Decoding requested, "
+			"but no decoder found for: h264\n",
+			stderr);
+		return 70;
+	}
+	if (marker_is(marker, marker_size, "boundary-decoder")) {
+		for (line = 0; line < 16380; line++)
+			fputc('A', stderr);
+		fputs(
+			"Decoder (codec h264) not found for input stream #0:0\n",
+			stderr);
+		return 78;
+	}
+	if (marker_is(marker, marker_size, "v4l2-unusable")) {
+		fputs(
+			"[h264_v4l2m2m @ 0x1234] Could not find a valid device\n"
+			"[h264_v4l2m2m @ 0x1234] can't configure decoder\n"
+			"[vist#0:0/h264 @ 0x1234] Error while opening decoder: "
+			"Invalid argument\n",
+			stderr);
+		return 71;
+	}
+	if (marker_is(marker, marker_size, "noisy-v4l2")) {
+		for (line = 0; line < 4096; line++)
+			fputs(
+				"recoverable decoder diagnostic that precedes "
+				"the decisive final error\n",
+				stderr);
+		fputs(
+			"[h264_v4l2m2m @ 0x1234] Could not find a valid device\n"
+			"[h264_v4l2m2m @ 0x1234] can't configure decoder\n",
+			stderr);
+		return 72;
+	}
+	if (marker_is(marker, marker_size, "unknown-failure")) {
+		fputs("Demuxer exploded for test fixture\n", stderr);
+		return 73;
+	}
+	if (marker_is(marker, marker_size, "empty-diagnostics"))
+		return 74;
+	if (marker_is(marker, marker_size, "unsupported-option")) {
+		fputs(
+			"Unrecognized option 'atomic_writing'.\n"
+			"Error splitting the argument list: Option not found\n",
+			stderr);
+		return 75;
+	}
+	if (marker_is(marker, marker_size, "v4l2-permission")) {
+		fputs(
+			"[h264_v4l2m2m @ 0x1234] Error while opening decoder: "
+			"Permission denied\n",
+			stderr);
+		return 76;
+	}
+	if (marker_is(marker, marker_size, "sanitized-failure")) {
+		fputs(
+			"\x1b[decoder @ 0xdeadbeef] detailed\tproblem: ",
+			stderr);
+		for (line = 0; line < 200; line++)
+			fputc('X', stderr);
+		fputs(
+			"\n[out#0/image2 @ 0x5678] Error opening output file "
+			"/tmp/private.\n"
+			"Conversion failed!\n",
+			stderr);
+		return 77;
+	}
+	if (marker_is(marker, marker_size, "noisy-diagnostics")) {
 		for (line = 0; line < 4096; line++)
 			fputs(
 				"recoverable decoder diagnostic that must not stop playback\n",
@@ -309,7 +389,7 @@ int main(int argc, char **argv)
 		fflush(stderr);
 	}
 	fail_after_first_frame =
-		marker_size >= 15 && memcmp(marker, "runtime-failure", 15) == 0;
+		marker_is(marker, marker_size, "runtime-failure");
 
 	signal(SIGTERM, stop);
 	signal(SIGINT, stop);
@@ -334,6 +414,15 @@ C
 chmod 0755 "$bin/ffmpeg"
 printf 'non-empty local media fixture\n' > "$work/media/bad apple.mp4"
 printf 'decoder-missing fixture\n' > "$work/media/h264.mp4"
+printf 'decoder-modern fixture\n' > "$work/media/h264-modern.mp4"
+printf 'boundary-decoder fixture\n' > "$work/media/h264-boundary.mp4"
+printf 'v4l2-unusable fixture\n' > "$work/media/h264-v4l2.mp4"
+printf 'noisy-v4l2 fixture\n' > "$work/media/noisy-v4l2.mp4"
+printf 'unknown-failure fixture\n' > "$work/media/unknown.mp4"
+printf 'empty-diagnostics fixture\n' > "$work/media/empty.mp4"
+printf 'unsupported-option fixture\n' > "$work/media/unsupported-option.mp4"
+printf 'v4l2-permission fixture\n' > "$work/media/v4l2-permission.mp4"
+printf 'sanitized-failure fixture\n' > "$work/media/sanitized.mp4"
 printf 'noisy-diagnostics fixture\n' > "$work/media/noisy.mp4"
 printf 'runtime-failure fixture\n' > "$work/media/runtime.mp4"
 
@@ -409,6 +498,15 @@ run_cgi() {
 token1=0123456789abcdef0123456789abcdef
 token2=fedcba9876543210fedcba9876543210
 missing_decoder=11111111111111111111111111111111
+modern_decoder=12121212121212121212121212121212
+boundary_decoder=1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a
+v4l2_decoder=13131313131313131313131313131313
+noisy_v4l2=14141414141414141414141414141414
+unknown_failure=15151515151515151515151515151515
+empty_diagnostics=16161616161616161616161616161616
+unsupported_option=17171717171717171717171717171717
+v4l2_permission=18181818181818181818181818181818
+sanitized_failure=19191919191919191919191919191919
 noisy_diagnostics=22222222222222222222222222222222
 runtime_failure=33333333333333333333333333333333
 stale=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -424,7 +522,7 @@ set -e
 assert_eq "$missing_rc" 1 "missing decoder exit code"
 assert_eq \
 	"$missing_output" \
-	"Installed FFmpeg has no decoder for this video codec" \
+	"Installed FFmpeg has no usable decoder for this video; use browser mode or install a decoder-enabled FFmpeg build" \
 	"missing decoder classification"
 assert_eq \
 	"$("$helper" status "$missing_decoder")" \
@@ -433,6 +531,89 @@ assert_eq \
 [[ ! -e "$runtime/s-$missing_decoder/ffmpeg.log" &&
    ! -e "$runtime/s-$missing_decoder/ffmpeg-log.pipe" ]] ||
 	fail "missing decoder diagnostics were not cleaned"
+
+check_start_failure() {
+	local token="$1" path="$2" expected="$3" label="$4"
+	local output rc
+
+	set +e
+	output="$("$helper" start "$token" "$path" 2>&1)"
+	rc=$?
+	set -e
+
+	assert_eq "$rc" 1 "$label exit code"
+	assert_eq "$output" "$expected" "$label classification"
+	assert_eq "$("$helper" status "$token")" inactive "$label cleanup"
+	[[ ! -e "$runtime/s-$token/ffmpeg.log" &&
+	   ! -e "$runtime/s-$token/ffmpeg-log.pipe" ]] ||
+		fail "$label diagnostics were not cleaned"
+}
+
+check_start_failure \
+	"$modern_decoder" \
+	"$work/media/h264-modern.mp4" \
+	"Installed FFmpeg has no usable decoder for this video; use browser mode or install a decoder-enabled FFmpeg build" \
+	"modern missing decoder"
+check_start_failure \
+	"$boundary_decoder" \
+	"$work/media/h264-boundary.mp4" \
+	"Installed FFmpeg has no usable decoder for this video; use browser mode or install a decoder-enabled FFmpeg build" \
+	"decoder diagnostic crossing the head-tail boundary"
+check_start_failure \
+	"$v4l2_decoder" \
+	"$work/media/h264-v4l2.mp4" \
+	"Installed FFmpeg has no usable decoder for this video; use browser mode or install a decoder-enabled FFmpeg build" \
+	"unusable V4L2 decoder"
+check_start_failure \
+	"$noisy_v4l2" \
+	"$work/media/noisy-v4l2.mp4" \
+	"Installed FFmpeg has no usable decoder for this video; use browser mode or install a decoder-enabled FFmpeg build" \
+	"V4L2 decoder after noisy diagnostics"
+check_start_failure \
+	"$unknown_failure" \
+	"$work/media/unknown.mp4" \
+	"FFmpeg reported: Demuxer exploded for test fixture" \
+	"unknown FFmpeg diagnostic"
+check_start_failure \
+	"$empty_diagnostics" \
+	"$work/media/empty.mp4" \
+	"FFmpeg exited without diagnostic output" \
+	"empty FFmpeg diagnostic"
+check_start_failure \
+	"$unsupported_option" \
+	"$work/media/unsupported-option.mp4" \
+	"Installed FFmpeg does not support an option required by the renderer" \
+	"unsupported FFmpeg option"
+check_start_failure \
+	"$v4l2_permission" \
+	"$work/media/v4l2-permission.mp4" \
+	"FFmpeg was denied access to the decoder, source, or temporary output" \
+	"V4L2 decoder permission failure"
+
+set +e
+sanitized_output="$(
+	"$helper" start \
+		"$sanitized_failure" \
+		"$work/media/sanitized.mp4" 2>&1
+)"
+sanitized_rc=$?
+set -e
+assert_eq "$sanitized_rc" 1 "sanitized diagnostic exit code"
+[[ "$sanitized_output" == \
+   "FFmpeg reported: ?[decoder @ 0xADDR] detailed?problem: "* ]] ||
+	fail "sanitized diagnostic lost its meaningful error: $sanitized_output"
+[[ "$sanitized_output" == *... ]] ||
+	fail "sanitized diagnostic was not truncated: $sanitized_output"
+[[ "${#sanitized_output}" -le 160 ]] ||
+	fail "sanitized diagnostic exceeded status limit: ${#sanitized_output}"
+[[ "$sanitized_output" != *deadbeef* &&
+   "$sanitized_output" != *private* &&
+   "$sanitized_output" != *"Conversion failed"* ]] ||
+	fail "sanitized diagnostic exposed an address, path, or FFmpeg epilogue"
+assert_eq \
+	"$("$helper" status "$sanitized_failure")" \
+	inactive \
+	"sanitized diagnostic cleanup"
 
 assert_eq \
 	"$("$helper" start "$noisy_diagnostics" "$work/media/noisy.mp4")" \

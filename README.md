@@ -92,6 +92,23 @@ decoders enabled. Do not install libraries built for another release or ABI.
 The user is responsible for checking codec patent and distribution rules in
 their jurisdiction.
 
+If the player reports that the installed FFmpeg has no usable decoder for a
+video, inspect the installed decoder list:
+
+```sh
+ffmpeg -hide_banner -decoders 2>/dev/null | grep -E 'h264|hevc|vc1'
+```
+
+A plain decoder entry such as `h264` is the native software decoder. If it is
+listed but playback still fails, the player now reports a bounded, sanitized
+FFmpeg diagnostic that can be used to identify the separate failure. An entry
+such as `h264_v4l2m2m` is only a hardware wrapper: it works only with a
+compatible and accessible V4L2 device and does not replace the native software
+decoder. If only the wrapper is listed, use browser mode or install an FFmpeg
+build with the native decoder for the router's exact OpenWrt release and
+architecture. If neither entry is listed, a decoder-enabled FFmpeg build is
+also required.
+
 The scripts also use standard OpenWrt BusyBox commands, including `sort -z`
 and `flock`.
 
@@ -370,11 +387,13 @@ exact payload contents. The builder also rejects metadata drift against the
 verifier and checks its version, release suffix, and dependencies against the
 OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
 exercises browser extension filtering and extensionless CPU media discovery,
-exercises successful renderer lifecycle and missing-decoder classification with
-an isolated fake FFmpeg process, and builds and verifies both packages. After
-those checks pass on `main`, a separate job with narrowly scoped repository
-write access rebuilds the APK and updates the generated `snapshot` branch. It
-never uploads files to a router or changes GitHub Releases.
+exercises successful renderer lifecycle, modern and legacy missing-decoder
+diagnostics, unusable V4L2 hardware decoders, bounded noisy logs, and unknown
+FFmpeg failures with an isolated fake process, and builds and verifies both
+packages. After those checks pass on `main`, a separate job with narrowly
+scoped repository write access rebuilds the APK and updates the generated
+`snapshot` branch. It never uploads files to a router or changes GitHub
+Releases.
 
 ## Repository Structure
 

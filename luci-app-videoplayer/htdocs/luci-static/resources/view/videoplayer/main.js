@@ -285,7 +285,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-render-mode-desc',
 								class: 'cbi-value-description'
-							}, _('Local files only. Router mode uses FFmpeg to produce a silent low-frame-rate preview in this web page; it has no audio, pause, seeking, or timeline and may heavily load the router. If FFmpeg cannot start for a file, the player falls back to browser decoding. Remote URLs always use browser decoding.')),
+							}, _('Local files only. Router mode uses FFmpeg to produce a silent low-frame-rate preview in this web page; it has no audio, pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build and compatible decoder hardware. If FFmpeg cannot start for a file, the player falls back to browser decoding. Remote URLs always use browser decoding.')),
 							E('div', {
 								id: 'vp-render-mode-status',
 								class: rendererAvailable === false
@@ -993,7 +993,7 @@ return view.extend({
 			);
 		}
 		else if (this._rendererAvailable === true && this._renderMode === 'router') {
-			statusEl.textContent = _('FFmpeg renderer is available. Expect high CPU usage and a silent low-frame-rate preview; startup failures fall back to browser decoding.');
+			statusEl.textContent = _('The FFmpeg output pipeline is available, but individual videos may still lack a usable decoder. Expect high CPU usage and a silent low-frame-rate preview; startup failures fall back to browser decoding.');
 		}
 		else {
 			statusEl.textContent = '';

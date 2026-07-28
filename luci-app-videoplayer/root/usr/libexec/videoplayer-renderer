@@ -24,6 +24,8 @@ STOP_TIMEOUT=6
 MAX_PATH_LENGTH=4096
 MAX_FRAME_BYTES=4194304
 FFMPEG_LOG_MAX_BYTES=65536
+FFMPEG_LOG_HEAD_BYTES=16384
+FFMPEG_LOG_TAIL_BYTES=49151
 
 string_has_control() {
 	printf '%s' "$1" | grep -q '[[:cntrl:]]'
@@ -496,8 +498,36 @@ probe_renderer() {
 	return 0
 }
 
+last_ffmpeg_diagnostic() {
+	local log="$1"
+
+	LC_ALL=C awk '
+		{
+			line = $0
+			gsub(/[^ -~]/, "?", line)
+			gsub(/[[:space:]]+/, " ", line)
+			gsub(/0x[[:xdigit:]]+/, "0xADDR", line)
+			sub(/^ /, "", line)
+			sub(/ $/, "", line)
+			if (length(line) > 0) {
+				fallback = line
+				if (line !~ /^(\[[^]]+\] )?(Conversion failed!?|Nothing was written into output file|Error opening output file(s)?([ :]|$)|Error initializing a simple filtergraph)/)
+					last = line
+			}
+		}
+		END {
+			if (length(last) == 0)
+				last = fallback
+			if (length(last) > 136)
+				last = substr(last, 1, 133) "..."
+			if (length(last) > 0)
+				printf "FFmpeg reported: %s\n", last
+		}
+	' "$log" 2>/dev/null
+}
+
 ffmpeg_failure_reason() {
-	local log="$1" rc="$2"
+	local log="$1" rc="$2" diagnostic
 
 	if [ "$rc" -eq 137 ]; then
 		printf 'FFmpeg was killed; the router may be out of memory\n'
@@ -512,15 +542,15 @@ ffmpeg_failure_reason() {
 		return
 	fi
 	if ! safe_regular_file "$log" 600; then
-		printf 'FFmpeg pipeline failed before producing a frame\n'
+		printf 'FFmpeg diagnostics could not be read safely\n'
+		return
+	fi
+	if [ ! -s "$log" ]; then
+		printf 'FFmpeg exited without diagnostic output\n'
 		return
 	fi
 
 	if grep -Eqi \
-		'decoder([^[:alnum:]]|.* )(not found|is not available)|no decoder found|unknown decoder|decoding requested.*no decoder' \
-		"$log"; then
-		printf 'Installed FFmpeg has no decoder for this video codec\n'
-	elif grep -Eqi \
 		'stream map .* matches no streams|does not contain any stream|no video stream' \
 		"$log"; then
 		printf 'The file contains no playable video stream\n'
@@ -533,7 +563,31 @@ ffmpeg_failure_reason() {
 		"$log"; then
 		printf 'Renderer temporary storage is full\n'
 	elif grep -Eqi \
-		'impossible to convert|invalid pixel format|error (re)?initializing filters|failed to inject frame|error while filtering|option .* not found' \
+		'unrecognized option|error parsing options|option .* not found' \
+		"$log"; then
+		printf 'Installed FFmpeg does not support an option required by the renderer\n'
+	elif grep -Eqi \
+		'protocol .* not on whitelist|protocol not found' \
+		"$log"; then
+		printf 'Installed FFmpeg rejected the local file protocol\n'
+	elif grep -Eqi \
+		'permission denied|operation not permitted' \
+		"$log"; then
+		printf 'FFmpeg was denied access to the decoder, source, or temporary output\n'
+	elif grep -Eqi \
+		'decoder([^[:alnum:]]|.* )(not found|is not available)|no decoder found|unknown decoder|decoding requested.*no decoder' \
+		"$log"; then
+		printf 'Installed FFmpeg has no usable decoder for this video; use browser mode or install a decoder-enabled FFmpeg build\n'
+	elif grep -Eqi \
+		'could not find a valid device|can.t configure decoder' \
+		"$log"; then
+		printf 'Installed FFmpeg has no usable decoder for this video; use browser mode or install a decoder-enabled FFmpeg build\n'
+	elif grep -Eqi \
+		'error while opening decoder|failed to open codec|could not open codec' \
+		"$log"; then
+		printf 'FFmpeg could not initialize a decoder for this video codec\n'
+	elif grep -Eqi \
+		'impossible to convert|invalid pixel format|error (re)?initializing filters|failed to inject frame|error while filtering' \
 		"$log"; then
 		printf 'FFmpeg could not convert decoded frames to JPEG\n'
 	elif grep -Eqi \
@@ -541,7 +595,12 @@ ffmpeg_failure_reason() {
 		"$log"; then
 		printf 'FFmpeg rejected the video container or bitstream\n'
 	else
-		printf 'FFmpeg pipeline failed before producing a frame\n'
+		diagnostic="$(last_ffmpeg_diagnostic "$log")"
+		if [ -n "$diagnostic" ]; then
+			printf '%s\n' "$diagnostic"
+		else
+			printf 'FFmpeg exited without a readable diagnostic\n'
+		fi
 	fi
 }
 
@@ -1023,23 +1082,66 @@ cmd_worker() {
 		exit 1
 	}
 	log_anchor_open=1
-	# Drain the complete diagnostic stream while retaining at most 64 KiB.
-	# A persistent reader prevents recoverable FFmpeg errors from causing
-	# SIGPIPE, and a single awk process can be terminated safely by the trap.
+	# Drain the complete diagnostic stream while retaining at most 64 KiB:
+	# the first 16 KiB provides input/probe context and the last 48 KiB keeps
+	# the decisive final error even after a noisy decoder. A persistent reader
+	# prevents recoverable FFmpeg errors from causing SIGPIPE, and a single awk
+	# process can be terminated safely by the trap.
 	log_launching=1
-	LC_ALL=C awk -v max_bytes="$FFMPEG_LOG_MAX_BYTES" '
+	LC_ALL=C awk \
+		-v max_bytes="$FFMPEG_LOG_MAX_BYTES" \
+		-v head_bytes="$FFMPEG_LOG_HEAD_BYTES" \
+		-v tail_bytes="$FFMPEG_LOG_TAIL_BYTES" '
 		BEGIN {
-			written = 0
+			if (head_bytes < 0 || tail_bytes < 0 ||
+			    head_bytes + tail_bytes + 1 != max_bytes)
+				exit 2
+			head_written = 0
+			tail_first = 1
+			tail_last = 0
+			tail_used = 0
+			tail_dropped = 0
 		}
 		{
-			if (written >= max_bytes)
-				next
 			text = $0 ORS
-			remaining = max_bytes - written
-			if (length(text) > remaining)
-				text = substr(text, 1, remaining)
-			printf "%s", text
-			written += length(text)
+			if (head_written < head_bytes) {
+				remaining = head_bytes - head_written
+				part = text
+				if (length(part) > remaining)
+					part = substr(part, 1, remaining)
+				printf "%s", part
+				head_written += length(part)
+				text = substr(text, length(part) + 1)
+			}
+			if (length(text) > tail_bytes) {
+				text = substr(text, length(text) - tail_bytes + 1)
+				tail_dropped = 1
+			}
+			if (length(text) > 0) {
+				tail_last++
+				tail[tail_last] = text
+				tail_used += length(text)
+			}
+			while (tail_used > tail_bytes &&
+			       tail_first <= tail_last) {
+				excess = tail_used - tail_bytes
+				tail_dropped = 1
+				if (length(tail[tail_first]) <= excess) {
+					tail_used -= length(tail[tail_first])
+					delete tail[tail_first]
+					tail_first++
+				}
+				else {
+					tail[tail_first] = substr(tail[tail_first], excess + 1)
+					tail_used -= excess
+				}
+			}
+		}
+		END {
+			if (tail_used > 0 && tail_dropped)
+				printf "\n"
+			for (i = tail_first; i <= tail_last; i++)
+				printf "%s", tail[i]
 		}
 	' < "$log_pipe" > "$log_file" 2>/dev/null 3<&- 7>&- 8<&- &
 	log_pid=$!
