@@ -5,5 +5,7 @@ config videoplayer 'main'
 	option media_path '/mnt/video'
 	# Allow playback of remote HTTP(S) URLs in the browser player
 	option allow_remote '1'
+	# Local playback mode: browser or router
+	option render_mode 'browser'
 	# Max depth when browsing local folders
 	option max_depth '8'

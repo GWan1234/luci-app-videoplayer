@@ -41,15 +41,33 @@ jobs:
           sh -n scripts/install-from-github.sh
           shellcheck -s sh scripts/install-from-github.sh
           sh -n scripts/install-to-router.sh
+          bash -n tests/renderer-behavior.sh
+          shellcheck -s bash tests/renderer-behavior.sh
           sh -n luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer
           sh -n luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer
+          sh -n luci-app-videoplayer/root/usr/libexec/videoplayer-renderer
           sh -n luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream
+          sh -n luci-app-videoplayer/root/www/cgi-bin/videoplayer-frame
+          shellcheck -s sh scripts/install-to-router.sh
+          shellcheck -s sh -e SC3043 \
+            luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer \
+            luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream
+          shellcheck -s sh -e SC1091,SC3043 \
+            luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer
+          shellcheck -s sh -e SC3043,SC2329 \
+            luci-app-videoplayer/root/usr/libexec/videoplayer-renderer
+          shellcheck -s sh \
+            luci-app-videoplayer/root/www/cgi-bin/videoplayer-frame
           {
             printf '%s\n' '(function () {'
             cat luci-app-videoplayer/htdocs/luci-static/resources/view/videoplayer/main.js
             printf '%s\n' '})();'
           } > /tmp/videoplayer-main-wrapped.js
           node --check /tmp/videoplayer-main-wrapped.js
+
+      - name: Exercise renderer lifecycle
+        shell: bash
+        run: sudo bash tests/renderer-behavior.sh "$GITHUB_WORKSPACE"
 
       - name: Build, verify, and compare reproducible outputs
         env:

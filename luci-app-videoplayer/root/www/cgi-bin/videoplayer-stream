@@ -90,7 +90,7 @@ is_allowed_ext() {
 		*.*) ;;
 		*) return 1 ;;
 	esac
-	ext="$(printf '%s' "${base##*.}" | tr 'A-Z' 'a-z')"
+	ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
 	case " $VIDEO_EXTS " in
 		*" $ext "*) return 0 ;;
 		*) return 1 ;;
@@ -101,7 +101,7 @@ mime_for() {
 	local name="$1" base ext
 
 	base="${name##*/}"
-	ext="$(printf '%s' "${base##*.}" | tr 'A-Z' 'a-z')"
+	ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
 	case "$ext" in
 		webm) printf 'video/webm\n' ;;
 		ogg|ogv) printf 'video/ogg\n' ;;
@@ -321,6 +321,8 @@ invalid_query=0
 old_ifs="$IFS"
 IFS='&'
 set -f
+# Intentional field splitting on '&'; pathname expansion is disabled above.
+# shellcheck disable=SC2086
 set -- ${QUERY_STRING:-}
 set +f
 IFS="$old_ifs"

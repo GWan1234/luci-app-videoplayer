@@ -91,10 +91,15 @@ cleanup_token_store() (
 		-exec rm -rf -- '{}' \;
 )
 
+[ ! -x /usr/libexec/videoplayer-renderer ] ||
+	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
+
 rm -f \
 	/www/luci-static/resources/view/videoplayer/main.js \
 	/www/cgi-bin/videoplayer-stream \
+	/www/cgi-bin/videoplayer-frame \
 	/usr/libexec/rpcd/luci.videoplayer \
+	/usr/libexec/videoplayer-renderer \
 	/usr/share/luci/menu.d/luci-app-videoplayer.json \
 	/usr/share/rpcd/acl.d/luci-app-videoplayer.json
 
@@ -103,6 +108,7 @@ rmdir /www/luci-static/resources/view/videoplayer 2>/dev/null || true
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 rm -rf /tmp/luci-modulecache 2>/dev/null || true
 cleanup_token_store 2>/dev/null || true
+rm -f /tmp/videoplayer-render-v1.lock /tmp/videoplayer-render-v1.worker.lock 2>/dev/null || true
 /etc/init.d/rpcd reload 2>/dev/null || true
 
 echo "Program files removed; /etc/config/videoplayer and media were preserved."
@@ -136,7 +142,9 @@ for source_file in \
 	"$PKG/usr/share/luci/menu.d/luci-app-videoplayer.json" \
 	"$PKG/usr/share/rpcd/acl.d/luci-app-videoplayer.json" \
 	"$PKG/usr/libexec/rpcd/luci.videoplayer" \
+	"$PKG/usr/libexec/videoplayer-renderer" \
 	"$PKG/www/cgi-bin/videoplayer-stream" \
+	"$PKG/www/cgi-bin/videoplayer-frame" \
 	"$HTDOCS/luci-static/resources/view/videoplayer/main.js"
 do
 	if [ ! -f "$source_file" ]; then
@@ -155,10 +163,27 @@ missing() {
 	failed=1
 }
 
-for command_name in uci ubus sort stat flock; do
+for command_name in uci ubus sort stat flock ffmpeg; do
 	command -v "$command_name" >/dev/null 2>&1 ||
 		missing "command '$command_name'"
 done
+
+if command -v ffmpeg >/dev/null 2>&1; then
+	ffmpeg -hide_banner -encoders 2>/dev/null |
+		grep -Eq '^[[:space:]]*V[^[:space:]]*[[:space:]]+mjpeg([[:space:]]|$)' ||
+		missing "an ffmpeg build with the MJPEG encoder"
+	ffmpeg -hide_banner -muxers 2>/dev/null |
+		grep -Eq '^[[:space:]]*E[[:space:]]+image2([[:space:]]|$)' ||
+		missing "an ffmpeg build with the image2 muxer"
+	ffmpeg_filters="$(ffmpeg -hide_banner -filters 2>/dev/null)" ||
+		ffmpeg_filters=""
+	printf '%s\n' "$ffmpeg_filters" |
+		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+fps[[:space:]]' ||
+		missing "an ffmpeg build with the fps filter"
+	printf '%s\n' "$ffmpeg_filters" |
+		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+scale[[:space:]]' ||
+		missing "an ffmpeg build with the scale filter"
+fi
 
 if command -v stat >/dev/null 2>&1; then
 	stat_probe="$(LC_ALL=C stat -L -c '%F:%s' /etc/passwd 2>/dev/null)" || stat_probe=""
@@ -243,8 +268,12 @@ scp_openwrt "$PKG/usr/share/rpcd/acl.d/luci-app-videoplayer.json" \
 	"$TARGET:$REMOTE_STAGE/acl.json"
 scp_openwrt "$PKG/usr/libexec/rpcd/luci.videoplayer" \
 	"$TARGET:$REMOTE_STAGE/rpcd-backend"
+scp_openwrt "$PKG/usr/libexec/videoplayer-renderer" \
+	"$TARGET:$REMOTE_STAGE/renderer"
 scp_openwrt "$PKG/www/cgi-bin/videoplayer-stream" \
 	"$TARGET:$REMOTE_STAGE/stream-cgi"
+scp_openwrt "$PKG/www/cgi-bin/videoplayer-frame" \
+	"$TARGET:$REMOTE_STAGE/frame-cgi"
 scp_openwrt "$HTDOCS/luci-static/resources/view/videoplayer/main.js" \
 	"$TARGET:$REMOTE_STAGE/main.js"
 
@@ -284,10 +313,15 @@ if [ ! -f /etc/config/videoplayer ]; then
 	install_staged videoplayer.config /etc/config/videoplayer 0644
 fi
 
+[ ! -x /usr/libexec/videoplayer-renderer ] ||
+	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
+
 install_staged menu.json /usr/share/luci/menu.d/luci-app-videoplayer.json 0644
 install_staged acl.json /usr/share/rpcd/acl.d/luci-app-videoplayer.json 0644
 install_staged rpcd-backend /usr/libexec/rpcd/luci.videoplayer 0755
+install_staged renderer /usr/libexec/videoplayer-renderer 0755
 install_staged stream-cgi /www/cgi-bin/videoplayer-stream 0755
+install_staged frame-cgi /www/cgi-bin/videoplayer-frame 0755
 install_staged main.js /www/luci-static/resources/view/videoplayer/main.js 0644
 
 # Add only missing UCI values; this never creates the media directory.

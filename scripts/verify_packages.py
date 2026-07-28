@@ -22,24 +22,26 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DIST = ROOT / "dist"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.0.0"
+PKG_VERSION = "1.1.0"
 PKG_ARCH_IPK = "all"
 PKG_ARCH_APK = "noarch"
 PKG_LICENSE = "GPL-2.0-or-later"
-PKG_DESCRIPTION = "HTML5 video player in LuCI for local and remote media"
+PKG_DESCRIPTION = "LuCI video player with browser and router CPU rendering"
 PKG_MAINTAINER = "openwrt-video-player contributors"
 PKG_ORIGIN = f"feeds/luci/applications/{PKG_NAME}"
 PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
-DEPENDENCIES = ("luci-base", "uhttpd", "jshn", "coreutils-stat")
+DEPENDENCIES = ("luci-base", "uhttpd", "jshn", "coreutils-stat", "ffmpeg")
 REQUIRED_DEPENDS = set(DEPENDENCIES)
 CONFFILES = ["/etc/config/videoplayer"]
 REQUIRED_PACKAGE_FILES = {
     "etc/config/videoplayer",
     "etc/uci-defaults/80_luci-videoplayer",
     "usr/libexec/rpcd/luci.videoplayer",
+    "usr/libexec/videoplayer-renderer",
     "usr/share/luci/menu.d/luci-app-videoplayer.json",
     "usr/share/rpcd/acl.d/luci-app-videoplayer.json",
     "www/cgi-bin/videoplayer-stream",
+    "www/cgi-bin/videoplayer-frame",
     "www/luci-static/resources/view/videoplayer/main.js",
 }
 
@@ -398,8 +400,8 @@ Maintainer: {PKG_MAINTAINER}
 Architecture: {PKG_ARCH_IPK}
 Installed-Size: {installed_size}
 Description:  {PKG_DESCRIPTION}
- HTML5 video player inside LuCI. Plays local MP4 from router storage
- and remote HTTP(S) media URLs. Architecture-independent.
+ Browser playback and experimental FFmpeg-powered local CPU previews.
+ Remote HTTP(S) URLs always remain client-side. Application files are architecture-independent.
 """.encode()
 
 
@@ -484,8 +486,9 @@ def verify_ipk(ipk_path: Path, expected: dict[str, tuple[bytes, int]]) -> int:
         "Architecture": PKG_ARCH_IPK,
         "Description": (
             f"{PKG_DESCRIPTION}\n"
-            "HTML5 video player inside LuCI. Plays local MP4 from router storage\n"
-            "and remote HTTP(S) media URLs. Architecture-independent."
+            "Browser playback and experimental FFmpeg-powered local CPU previews.\n"
+            "Remote HTTP(S) URLs always remain client-side. Application files are "
+            "architecture-independent."
         ),
     }
     require(

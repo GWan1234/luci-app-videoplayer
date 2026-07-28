@@ -3,13 +3,14 @@
 		"description": "Grant access to LuCI Video Player (Services → Video Player)",
 		"read": {
 			"ubus": {
-				"luci.videoplayer": [ "get_status", "list", "resolve" ],
+				"luci.videoplayer": [ "get_status", "list", "resolve", "renderer_status" ],
 				"uci": [ "get", "changes", "configs" ]
 			},
 			"uci": [ "videoplayer" ]
 		},
 		"write": {
 			"ubus": {
+				"luci.videoplayer": [ "start_renderer", "stop_renderer" ],
 				"uci": [ "set", "add", "delete", "rename", "order", "apply", "confirm", "rollback" ]
 			},
 			"uci": [ "videoplayer" ]

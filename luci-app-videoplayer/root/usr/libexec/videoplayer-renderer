@@ -1,0 +1,1356 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# shellcheck shell=busybox
+#
+# Single-session router CPU renderer for luci-app-videoplayer.
+# FFmpeg decodes a validated local file and atomically refreshes one JPEG in
+# tmpfs. Short CGI requests serve the current frame, avoiding uhttpd's
+# long-running CGI timeout.
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export LC_ALL=C
+
+RUNTIME_DIR="/tmp/videoplayer-render-v1"
+RUNTIME_MARKER="$RUNTIME_DIR/.snapshot-v1"
+CURRENT_FILE="$RUNTIME_DIR/current"
+CONTROL_LOCK="/tmp/videoplayer-render-v1.lock"
+WORKER_LOCK="/tmp/videoplayer-render-v1.worker.lock"
+LAYOUT="snapshot-v1"
+TOKEN_TTL=21600
+HEARTBEAT_TIMEOUT=12
+FRAME_STALL_TIMEOUT=8
+STARTUP_TIMEOUT=15
+STOP_TIMEOUT=6
+MAX_PATH_LENGTH=4096
+MAX_FRAME_BYTES=4194304
+
+string_has_control() {
+	printf '%s' "$1" | grep -q '[[:cntrl:]]'
+}
+
+path_has_dotdot_component() {
+	case "$1" in
+		../*|*/../*|*/..) return 0 ;;
+	esac
+	return 1
+}
+
+valid_token() {
+	local token="$1"
+
+	[ "${#token}" -eq 32 ] || return 1
+	case "$token" in
+		*[!0-9a-f]*) return 1 ;;
+	esac
+	return 0
+}
+
+valid_decimal() {
+	local value="$1" max_digits="$2"
+
+	case "$value" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "${#value}" -le "$max_digits" ] || return 1
+	return 0
+}
+
+get_enabled() {
+	local value
+
+	value="$(uci -q get videoplayer.main.enabled 2>/dev/null)" || value=""
+	[ -n "$value" ] || value="1"
+	[ "$value" = "1" ]
+}
+
+get_render_mode() {
+	local value
+
+	value="$(uci -q get videoplayer.main.render_mode 2>/dev/null)" || value=""
+	case "$value" in
+		router) printf 'router\n' ;;
+		*) printf 'browser\n' ;;
+	esac
+}
+
+get_configured_media_path() {
+	local path
+
+	path="$(uci -q get videoplayer.main.media_path 2>/dev/null)" || path=""
+	[ -n "$path" ] || path="/mnt/video"
+	printf '%s\n' "$path"
+}
+
+canonicalize_media_root() {
+	local configured="$1" root
+
+	[ -n "$configured" ] || return 1
+	[ "${#configured}" -le "$MAX_PATH_LENGTH" ] || return 1
+	string_has_control "$configured" && return 1
+	case "$configured" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	path_has_dotdot_component "$configured" && return 1
+	[ -d "$configured" ] || return 1
+	root="$(readlink -f -- "$configured" 2>/dev/null)" || return 1
+	[ -n "$root" ] && [ -d "$root" ] && [ "$root" != "/" ] || return 1
+	string_has_control "$root" && return 1
+	printf '%s\n' "$root"
+}
+
+path_is_within_root() {
+	local root="$1" path="$2"
+
+	case "$path" in
+		"$root"|"$root"/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+ensure_lock_file() {
+	local path="$1" canonical metadata
+
+	if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+		(
+			umask 077
+			set -C
+			: > "$path"
+		) 2>/dev/null || :
+	fi
+	[ -f "$path" ] && [ ! -L "$path" ] || return 1
+	canonical="$(readlink -f -- "$path" 2>/dev/null)" || return 1
+	[ "$canonical" = "$path" ] || return 1
+	chmod 0600 "$path" 2>/dev/null || return 1
+	metadata="$(stat -c '%u:%a' -- "$path" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:600" ] || return 1
+	return 0
+}
+
+runtime_is_safe() {
+	local canonical metadata layout extra
+
+	[ -d "$RUNTIME_DIR" ] && [ ! -L "$RUNTIME_DIR" ] || return 1
+	canonical="$(readlink -f -- "$RUNTIME_DIR" 2>/dev/null)" || return 1
+	[ "$canonical" = "$RUNTIME_DIR" ] || return 1
+	metadata="$(stat -c '%u:%a' -- "$RUNTIME_DIR" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:700" ] || return 1
+
+	[ -f "$RUNTIME_MARKER" ] && [ ! -L "$RUNTIME_MARKER" ] || return 1
+	metadata="$(stat -c '%u:%a' -- "$RUNTIME_MARKER" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:600" ] || return 1
+	exec 7< "$RUNTIME_MARKER" || return 1
+	IFS= read -r layout <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	[ "$layout" = "$LAYOUT" ] || return 1
+	return 0
+}
+
+ensure_runtime() {
+	local marker_tmp
+
+	if [ -e "$RUNTIME_DIR" ] || [ -L "$RUNTIME_DIR" ]; then
+		[ -d "$RUNTIME_DIR" ] && [ ! -L "$RUNTIME_DIR" ] || return 1
+	else
+		(umask 077; mkdir -- "$RUNTIME_DIR") || return 1
+	fi
+	chmod 0700 "$RUNTIME_DIR" 2>/dev/null || return 1
+
+	if [ ! -e "$RUNTIME_MARKER" ] && [ ! -L "$RUNTIME_MARKER" ]; then
+		marker_tmp="$RUNTIME_DIR/.marker.$$"
+		rm -f -- "$marker_tmp" || return 1
+		if ! (
+			umask 077
+			set -C
+			printf '%s\n' "$LAYOUT" > "$marker_tmp"
+		) 2>/dev/null; then
+			rm -f -- "$marker_tmp"
+			return 1
+		fi
+		if ! ln "$marker_tmp" "$RUNTIME_MARKER" 2>/dev/null; then
+			[ -f "$RUNTIME_MARKER" ] && [ ! -L "$RUNTIME_MARKER" ] || {
+				rm -f -- "$marker_tmp"
+				return 1
+			}
+		fi
+		rm -f -- "$marker_tmp"
+	fi
+	chmod 0600 "$RUNTIME_MARKER" 2>/dev/null || return 1
+	runtime_is_safe
+}
+
+safe_regular_file() {
+	local path="$1" expected_mode="$2" canonical metadata
+
+	[ -f "$path" ] && [ ! -L "$path" ] || return 1
+	canonical="$(readlink -f -- "$path" 2>/dev/null)" || return 1
+	case "$canonical" in
+		"$RUNTIME_DIR"/*) ;;
+		*) return 1 ;;
+	esac
+	metadata="$(stat -c '%u:%a' -- "$path" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:$expected_mode" ] || return 1
+	return 0
+}
+
+session_dir_is_safe() {
+	local token="$1" dir canonical metadata
+
+	valid_token "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	canonical="$(readlink -f -- "$dir" 2>/dev/null)" || return 1
+	[ "$canonical" = "$dir" ] || return 1
+	metadata="$(stat -c '%u:%a' -- "$dir" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:700" ] || return 1
+	return 0
+}
+
+load_current() {
+	local version token expiry extra
+
+	CURRENT_TOKEN=""
+	CURRENT_EXPIRY=""
+	runtime_is_safe || return 1
+	safe_regular_file "$CURRENT_FILE" 600 || return 1
+	exec 7< "$CURRENT_FILE" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r token <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r expiry <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+
+	[ "$version" = "$LAYOUT" ] || return 1
+	valid_token "$token" || return 1
+	valid_decimal "$expiry" 12 || return 1
+	CURRENT_TOKEN="$token"
+	CURRENT_EXPIRY="$expiry"
+	return 0
+}
+
+write_current() {
+	local token="$1" expiry="$2" tmp="$RUNTIME_DIR/.current.$$"
+
+	valid_token "$token" && valid_decimal "$expiry" 12 || return 1
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n' "$LAYOUT" "$token" "$expiry" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$CURRENT_FILE"
+}
+
+write_session_request() {
+	local token="$1" expiry="$2" path="$3"
+	local dir tmp
+
+	dir="$RUNTIME_DIR/s-$token"
+	tmp="$dir/.request.$$"
+
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n%s\n' "$LAYOUT" "$token" "$expiry" "$path" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/request"
+}
+
+load_session_request() {
+	local token="$1" dir
+	local version stored_token expiry path extra
+
+	dir="$RUNTIME_DIR/s-$token"
+	SESSION_EXPIRY=""
+	SESSION_PATH=""
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/request" 600 || return 1
+	exec 7< "$dir/request" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_token <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r expiry <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r path <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+
+	[ "$version" = "$LAYOUT" ] && [ "$stored_token" = "$token" ] || return 1
+	valid_decimal "$expiry" 12 || return 1
+	[ -n "$path" ] && [ "${#path}" -le "$MAX_PATH_LENGTH" ] || return 1
+	string_has_control "$path" && return 1
+	case "$path" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	SESSION_EXPIRY="$expiry"
+	SESSION_PATH="$path"
+	return 0
+}
+
+write_status() {
+	local token="$1" state="$2" reason="${3:-}"
+	local dir tmp
+
+	dir="$RUNTIME_DIR/s-$token"
+	tmp="$dir/.status.$$"
+	session_dir_is_safe "$token" || return 1
+	case "$state" in
+		starting|running|ended|error|stopped) ;;
+		*) return 1 ;;
+	esac
+	string_has_control "$reason" && return 1
+	[ "${#reason}" -le 160 ] || return 1
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n' "$LAYOUT" "$state" "$reason" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/status"
+}
+
+load_status() {
+	local token="$1" dir
+	local version state reason extra
+
+	dir="$RUNTIME_DIR/s-$token"
+	SESSION_STATUS=""
+	SESSION_REASON=""
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/status" 600 || return 1
+	exec 7< "$dir/status" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r state <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r reason <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	[ "$version" = "$LAYOUT" ] || return 1
+	case "$state" in
+		starting|running|ended|error|stopped) ;;
+		*) return 1 ;;
+	esac
+	string_has_control "$reason" && return 1
+	SESSION_STATUS="$state"
+	SESSION_REASON="$reason"
+	return 0
+}
+
+write_heartbeat() {
+	local token="$1" now="$2" dir tmp
+
+	dir="$RUNTIME_DIR/s-$token"
+	tmp="$dir/.heartbeat.$$"
+	session_dir_is_safe "$token" && valid_decimal "$now" 12 || return 1
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n' "$now" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/heartbeat"
+}
+
+load_heartbeat() {
+	local token="$1" dir value extra
+
+	dir="$RUNTIME_DIR/s-$token"
+	HEARTBEAT_TIME=""
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/heartbeat" 600 || return 1
+	exec 7< "$dir/heartbeat" || return 1
+	IFS= read -r value <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	valid_decimal "$value" 12 || return 1
+	HEARTBEAT_TIME="$value"
+	return 0
+}
+
+probe_renderer() {
+	local output
+
+	command -v ffmpeg >/dev/null 2>&1 || {
+		printf 'ffmpeg is not installed\n'
+		return 1
+	}
+	output="$(ffmpeg -hide_banner -encoders 2>/dev/null)" || {
+		printf 'ffmpeg encoder probe failed\n'
+		return 1
+	}
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*V[^[:space:]]*[[:space:]]+mjpeg([[:space:]]|$)' || {
+			printf 'ffmpeg has no MJPEG encoder\n'
+			return 1
+		}
+	output="$(ffmpeg -hide_banner -muxers 2>/dev/null)" || {
+		printf 'ffmpeg muxer probe failed\n'
+		return 1
+	}
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*E[[:space:]]+image2([[:space:]]|$)' || {
+			printf 'ffmpeg has no image2 muxer\n'
+			return 1
+		}
+	output="$(ffmpeg -hide_banner -filters 2>/dev/null)" || {
+		printf 'ffmpeg filter probe failed\n'
+		return 1
+	}
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+fps[[:space:]]' || {
+			printf 'ffmpeg has no fps filter\n'
+			return 1
+		}
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+scale[[:space:]]' || {
+			printf 'ffmpeg has no scale filter\n'
+			return 1
+		}
+	printf 'available\n'
+	return 0
+}
+
+process_start_time() {
+	local pid="$1" value
+
+	valid_decimal "$pid" 10 || return 1
+	[ "$pid" -gt 1 ] || return 1
+	[ -r "/proc/$pid/stat" ] || return 1
+	value="$(awk '{ print $22 }' "/proc/$pid/stat" 2>/dev/null)" || return 1
+	valid_decimal "$value" 24 || return 1
+	printf '%s\n' "$value"
+}
+
+process_is_running() {
+	local pid="$1" state
+
+	valid_decimal "$pid" 10 || return 1
+	kill -0 "$pid" 2>/dev/null || return 1
+	state="$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null)" || return 1
+	[ "$state" != "Z" ] && [ "$state" != "X" ]
+}
+
+frame_is_fresh() {
+	local path="$1" now="$2" mtime
+
+	valid_decimal "$now" 12 || return 1
+	mtime="$(stat -L -c '%Y' -- "$path" 2>/dev/null)" || return 1
+	valid_decimal "$mtime" 12 || return 1
+	[ "$mtime" -le "$now" ] || return 1
+	[ $((now - mtime)) -le $((FRAME_STALL_TIMEOUT + 2)) ]
+}
+
+process_matches_worker() {
+	local pid="$1" start="$2" token="$3"
+	local actual cmdline old_ifs noglob=0
+
+	actual="$(process_start_time "$pid" 2>/dev/null)" || return 1
+	[ "$actual" = "$start" ] || return 1
+	[ -r "/proc/$pid/cmdline" ] || return 1
+	cmdline="$(tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null)" ||
+		return 1
+	old_ifs="$IFS"
+	IFS='
+'
+	case "$-" in
+		*f*) noglob=1 ;;
+		*) set -f ;;
+	esac
+	# Intentional split on the newlines produced from NUL separators above.
+	# shellcheck disable=SC2086
+	set -- $cmdline
+	[ "$noglob" -eq 1 ] || set +f
+	IFS="$old_ifs"
+	[ "$#" -eq 4 ] || return 1
+
+	case "$1" in
+		/bin/sh|/bin/ash|sh|ash) ;;
+		*) return 1 ;;
+	esac
+	[ "$2" = "/usr/libexec/videoplayer-renderer" ] || return 1
+	[ "$3" = "worker" ] || return 1
+	[ "$4" = "$token" ] || return 1
+	return 0
+}
+
+write_worker_identity() {
+	local token="$1" pid="$2" start="$3" name="${4:-worker}"
+	local dir="$RUNTIME_DIR/s-$token" tmp
+
+	case "$name" in
+		worker|ffmpeg) ;;
+		*) return 1 ;;
+	esac
+	tmp="$dir/.$name.$$"
+
+	valid_token "$token" && valid_decimal "$pid" 10 &&
+		valid_decimal "$start" 24 || return 1
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n%s\n' "$LAYOUT" "$token" "$pid" "$start" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/$name"
+}
+
+load_worker_identity() {
+	local token="$1" name="${2:-worker}" dir
+	local version stored_token pid start extra
+
+	dir="$RUNTIME_DIR/s-$token"
+	case "$name" in
+		worker|ffmpeg) ;;
+		*) return 1 ;;
+	esac
+	WORKER_PID=""
+	WORKER_START=""
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/$name" 600 || return 1
+	exec 7< "$dir/$name" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_token <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r pid <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r start <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	[ "$version" = "$LAYOUT" ] && [ "$stored_token" = "$token" ] || return 1
+	valid_decimal "$pid" 10 && valid_decimal "$start" 24 || return 1
+	WORKER_PID="$pid"
+	WORKER_START="$start"
+	return 0
+}
+
+process_matches_ffmpeg() {
+	local pid="$1" start="$2" token="$3" actual arg1 frame
+
+	actual="$(process_start_time "$pid" 2>/dev/null)" || return 1
+	[ "$actual" = "$start" ] || return 1
+	[ -r "/proc/$pid/cmdline" ] || return 1
+	arg1="$(tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n '1p')"
+	case "$arg1" in
+		ffmpeg|/usr/bin/ffmpeg) ;;
+		*) return 1 ;;
+	esac
+	frame="$RUNTIME_DIR/s-$token/frame.jpg"
+	tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null |
+		grep -Fqx -- "$frame"
+}
+
+stop_ffmpeg_bounded() {
+	local pid="$1" start="$2" token="$3" attempts=0
+
+	if ! process_matches_ffmpeg "$pid" "$start" "$token"; then
+		return 0
+	fi
+	kill -TERM "$pid" 2>/dev/null || :
+	while process_matches_ffmpeg "$pid" "$start" "$token"; do
+		attempts=$((attempts + 1))
+		[ "$attempts" -lt "$STOP_TIMEOUT" ] || break
+		sleep 1
+	done
+	if process_matches_ffmpeg "$pid" "$start" "$token"; then
+		kill -KILL "$pid" 2>/dev/null || :
+	fi
+	return 0
+}
+
+terminate_worker() {
+	local token="$1" i=0 wrapper_pid="" wrapper_start=""
+	local ffmpeg_pid="" ffmpeg_start=""
+
+	if load_worker_identity "$token" worker; then
+		wrapper_pid="$WORKER_PID"
+		wrapper_start="$WORKER_START"
+	fi
+	if load_worker_identity "$token" ffmpeg; then
+		ffmpeg_pid="$WORKER_PID"
+		ffmpeg_start="$WORKER_START"
+	fi
+
+	if [ -n "$wrapper_pid" ] &&
+	   process_matches_worker "$wrapper_pid" "$wrapper_start" "$token"; then
+		kill -TERM "$wrapper_pid" 2>/dev/null || :
+	fi
+	if [ -n "$ffmpeg_pid" ] &&
+	   process_matches_ffmpeg "$ffmpeg_pid" "$ffmpeg_start" "$token"; then
+		kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+	fi
+	while [ -n "$wrapper_pid" ] &&
+	      process_matches_worker "$wrapper_pid" "$wrapper_start" "$token"; do
+		i=$((i + 1))
+		[ "$i" -lt "$STOP_TIMEOUT" ] || break
+		sleep 1
+	done
+	if [ -n "$wrapper_pid" ] &&
+	   process_matches_worker "$wrapper_pid" "$wrapper_start" "$token"; then
+		kill -KILL "$wrapper_pid" 2>/dev/null || :
+	fi
+	if [ -n "$ffmpeg_pid" ] &&
+	   process_matches_ffmpeg "$ffmpeg_pid" "$ffmpeg_start" "$token"; then
+		kill -KILL "$ffmpeg_pid" 2>/dev/null || :
+	fi
+	return 0
+}
+
+wait_for_worker_lock() {
+	local attempts=0
+
+	ensure_lock_file "$WORKER_LOCK" || return 1
+	exec 8< "$WORKER_LOCK" || return 1
+	while ! flock -x -n 8; do
+		attempts=$((attempts + 1))
+		[ "$attempts" -lt "$STOP_TIMEOUT" ] || {
+			exec 8<&-
+			return 1
+		}
+		sleep 1
+	done
+	exec 8<&-
+	return 0
+}
+
+remove_session_dir() {
+	local token="$1" dir canonical metadata
+
+	valid_token "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	[ -e "$dir" ] || return 0
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	canonical="$(readlink -f -- "$dir" 2>/dev/null)" || return 1
+	[ "$canonical" = "$dir" ] || return 1
+	metadata="$(stat -c '%u:%a' -- "$dir" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:700" ] || return 1
+	rm -rf -- "$dir"
+}
+
+cleanup_old_sessions() {
+	local keep="${1:-}" dir name token
+
+	runtime_is_safe || return 1
+	for dir in "$RUNTIME_DIR"/s-*; do
+		[ -e "$dir" ] || continue
+		name="${dir##*/}"
+		token="${name#s-}"
+		valid_token "$token" || continue
+		[ "$token" = "$keep" ] && continue
+		remove_session_dir "$token" || :
+	done
+}
+
+stop_current_locked() {
+	local requested="${1:-}" token
+
+	if ! load_current; then
+		rm -f -- "$CURRENT_FILE" 2>/dev/null || :
+		return 1
+	fi
+	token="$CURRENT_TOKEN"
+	if [ -n "$requested" ] && [ "$requested" != "$token" ]; then
+		return 2
+	fi
+	terminate_worker "$token"
+	if session_dir_is_safe "$token"; then
+		write_status "$token" stopped "Stopped by the player" 2>/dev/null || :
+	fi
+	rm -f -- "$CURRENT_FILE" 2>/dev/null || :
+	return 0
+}
+
+validate_source_path() {
+	local expected="$1" configured root canonical opened metadata size
+
+	[ -n "$expected" ] && [ "${#expected}" -le "$MAX_PATH_LENGTH" ] || return 1
+	string_has_control "$expected" && return 1
+	case "$expected" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	path_has_dotdot_component "$expected" && return 1
+
+	configured="$(get_configured_media_path)"
+	root="$(canonicalize_media_root "$configured" 2>/dev/null)" || return 1
+	canonical="$(readlink -f -- "$expected" 2>/dev/null)" || return 1
+	[ "$canonical" = "$expected" ] || return 1
+	path_is_within_root "$root" "$canonical" || return 1
+	[ -f "$canonical" ] && [ -r "$canonical" ] || return 1
+
+	exec 3< "$canonical" || return 1
+	opened="$(readlink -f -- /proc/self/fd/3 2>/dev/null)" || {
+		exec 3<&-
+		return 1
+	}
+	if [ "$opened" != "$canonical" ] ||
+	   ! path_is_within_root "$root" "$opened"; then
+		exec 3<&-
+		return 1
+	fi
+	metadata="$(stat -L -c '%F:%s' -- /proc/self/fd/3 2>/dev/null)" || {
+		exec 3<&-
+		return 1
+	}
+	case "$metadata" in
+		"regular file:"*) size="${metadata#regular file:}" ;;
+		*)
+			exec 3<&-
+			return 1
+			;;
+	esac
+	valid_decimal "$size" 18 && [ "$size" -gt 0 ] || {
+		exec 3<&-
+		return 1
+	}
+	return 0
+}
+
+worker_current() {
+	local token="$1" now
+
+	load_current || return 1
+	[ "$CURRENT_TOKEN" = "$token" ] || return 1
+	now="$(date +%s 2>/dev/null)" || return 1
+	valid_decimal "$now" 12 || return 1
+	[ "$CURRENT_EXPIRY" -gt "$now" ] || return 1
+	get_enabled || return 1
+	[ "$(get_render_mode)" = "router" ] || return 1
+	return 0
+}
+
+cmd_worker() {
+	local token="$1" dir frame now pid start ffmpeg_pid ffmpeg_start rc=1
+	local frame_mtime="" last_frame_mtime="" last_frame_change=""
+	local running_written=0 stopping=0 failure_reason=""
+
+	valid_token "$token" || exit 2
+	ensure_lock_file "$WORKER_LOCK" || exit 1
+	exec 8< "$WORKER_LOCK" || exit 1
+	flock -x -n 8 || exit 1
+	load_session_request "$token" || exit 1
+	worker_current "$token" || exit 1
+	[ "$SESSION_EXPIRY" = "$CURRENT_EXPIRY" ] || exit 1
+	validate_source_path "$SESSION_PATH" || {
+		write_status "$token" error "Source file is no longer safe or readable" 2>/dev/null || :
+		exit 1
+	}
+	dir="$RUNTIME_DIR/s-$token"
+	frame="$dir/frame.jpg"
+	rm -f -- "$frame" "$frame.tmp" 2>/dev/null || :
+	pid="$$"
+	start="$(process_start_time "$pid" 2>/dev/null)" || {
+		exec 3<&-
+		exit 1
+	}
+	write_worker_identity "$token" "$pid" "$start" || {
+		exec 3<&-
+		exit 1
+	}
+
+	stop_child() {
+		stopping=1
+		if [ -n "${ffmpeg_pid:-}" ]; then
+			if [ -n "${ffmpeg_start:-}" ]; then
+				stop_ffmpeg_bounded "$ffmpeg_pid" "$ffmpeg_start" "$token"
+			else
+				kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+			fi
+			if ! process_is_running "$ffmpeg_pid"; then
+				wait "$ffmpeg_pid" 2>/dev/null || :
+			fi
+		fi
+		if worker_current "$token" 2>/dev/null; then
+			write_status "$token" stopped "Renderer stopped" 2>/dev/null || :
+		fi
+		exit 0
+	}
+	trap stop_child HUP INT TERM
+
+	umask 077
+	nice -n 10 ffmpeg \
+		-y \
+		-hide_banner \
+		-loglevel error \
+		-nostats \
+		-nostdin \
+		-re \
+		-protocol_whitelist file,pipe \
+		-threads 1 \
+		-i /proc/self/fd/3 \
+		-map 0:V:0 \
+		-an \
+		-sn \
+		-dn \
+		-map_metadata -1 \
+		-filter_threads 1 \
+		-vf "fps=3,scale=640:360:force_original_aspect_ratio=decrease:flags=fast_bilinear" \
+		-threads 1 \
+		-c:v mjpeg \
+		-q:v 8 \
+		-f image2 \
+		-update 1 \
+		-atomic_writing 1 \
+		"$frame" 8<&- </dev/null >/dev/null 2>/dev/null &
+	ffmpeg_pid=$!
+	ffmpeg_start="$(process_start_time "$ffmpeg_pid" 2>/dev/null)" || ffmpeg_start=""
+	if [ -z "$ffmpeg_start" ] ||
+	   ! write_worker_identity "$token" "$ffmpeg_pid" "$ffmpeg_start" ffmpeg; then
+		if [ -n "$ffmpeg_start" ]; then
+			stop_ffmpeg_bounded "$ffmpeg_pid" "$ffmpeg_start" "$token"
+		else
+			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+		fi
+		write_status "$token" error "Cannot track FFmpeg process" 2>/dev/null || :
+		exec 3<&-
+		exit 1
+	fi
+
+	while process_is_running "$ffmpeg_pid"; do
+		now="$(date +%s 2>/dev/null)" || now=""
+		if ! valid_decimal "$now" 12 ||
+		   ! worker_current "$token" ||
+		   ! load_heartbeat "$token" ||
+		   [ "$HEARTBEAT_TIME" -gt "$now" ]; then
+			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+			stopping=1
+			break
+		fi
+		if [ "$running_written" -eq 0 ]; then
+			[ $((now - HEARTBEAT_TIME)) -le $((STARTUP_TIMEOUT + 3)) ] || {
+				kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+				stopping=1
+				break
+			}
+		elif [ $((now - HEARTBEAT_TIME)) -gt "$HEARTBEAT_TIMEOUT" ]; then
+			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+			stopping=1
+			break
+		fi
+
+		if [ -f "$frame" ] && [ ! -L "$frame" ]; then
+			frame_mtime="$(stat -L -c '%Y' -- "$frame" 2>/dev/null)" ||
+				frame_mtime=""
+			if valid_decimal "$frame_mtime" 12 &&
+			   [ "$frame_mtime" -le "$now" ]; then
+				if [ "$frame_mtime" != "$last_frame_mtime" ]; then
+					last_frame_mtime="$frame_mtime"
+					last_frame_change="$now"
+				fi
+				if [ "$running_written" -eq 0 ]; then
+					if ! write_heartbeat "$token" "$now" ||
+					   ! write_status "$token" running ""; then
+						kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+						failure_reason="Cannot publish renderer state"
+						break
+					fi
+					running_written=1
+				fi
+			fi
+		fi
+		if [ "$running_written" -eq 1 ] &&
+		   valid_decimal "$last_frame_change" 12 &&
+		   [ $((now - last_frame_change)) -gt "$FRAME_STALL_TIMEOUT" ]; then
+			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+			failure_reason="FFmpeg stopped producing video frames"
+			break
+		fi
+		sleep 1
+	done
+
+	if [ "$stopping" -eq 1 ] || [ -n "$failure_reason" ]; then
+		stop_ffmpeg_bounded "$ffmpeg_pid" "$ffmpeg_start" "$token"
+	fi
+	if process_is_running "$ffmpeg_pid"; then
+		rc=1
+	else
+		wait "$ffmpeg_pid" 2>/dev/null
+		rc=$?
+	fi
+	ffmpeg_pid=""
+	rm -f -- "$dir/ffmpeg" 2>/dev/null || :
+	exec 3<&-
+
+	if worker_current "$token" 2>/dev/null; then
+		if [ -n "$failure_reason" ]; then
+			write_status "$token" error "$failure_reason" 2>/dev/null || :
+		elif [ "$stopping" -eq 1 ]; then
+			write_status "$token" stopped "Renderer stopped" 2>/dev/null || :
+		elif [ "$rc" -eq 0 ] && [ "$running_written" -eq 1 ]; then
+			write_status "$token" ended "End of video" 2>/dev/null || :
+		else
+			write_status "$token" error "FFmpeg could not decode this video" 2>/dev/null || :
+		fi
+	fi
+	exit 0
+}
+
+cmd_start() {
+	local token="$1" path="$2" now expiry dir pid start i=0 message
+
+	valid_token "$token" || {
+		printf 'Invalid renderer token\n' >&2
+		return 1
+	}
+	get_enabled || {
+		printf 'Local playback is disabled\n' >&2
+		return 1
+	}
+	[ "$(get_render_mode)" = "router" ] || {
+		printf 'Router CPU rendering is not selected\n' >&2
+		return 1
+	}
+	if ! message="$(probe_renderer 2>/dev/null)"; then
+		[ -n "$message" ] || message="FFmpeg renderer is unavailable"
+		printf '%s\n' "$message" >&2
+		return 1
+	fi
+	validate_source_path "$path" || {
+		printf 'Source file is no longer safe or readable\n' >&2
+		return 1
+	}
+	exec 3<&-
+
+	if ! ensure_lock_file "$CONTROL_LOCK"; then
+		printf 'Cannot initialize renderer state\n' >&2
+		return 1
+	fi
+	exec 9< "$CONTROL_LOCK" || return 1
+	flock -x 9 || return 1
+	ensure_runtime || {
+		printf 'Cannot initialize renderer state\n' >&2
+		return 1
+	}
+
+	stop_current_locked "" 2>/dev/null || :
+	wait_for_worker_lock || {
+		printf 'Previous renderer did not stop in time\n' >&2
+		return 1
+	}
+	cleanup_old_sessions "" 2>/dev/null || :
+
+	now="$(date +%s 2>/dev/null)" || now=""
+	valid_decimal "$now" 12 || {
+		printf 'Router clock is unavailable\n' >&2
+		return 1
+	}
+	expiry=$((now + TOKEN_TTL))
+	dir="$RUNTIME_DIR/s-$token"
+	[ ! -e "$dir" ] && [ ! -L "$dir" ] || {
+		printf 'Renderer session collision\n' >&2
+		return 1
+	}
+	(umask 077; mkdir -- "$dir") || {
+		printf 'Cannot create renderer session\n' >&2
+		return 1
+	}
+	chmod 0700 "$dir" 2>/dev/null || {
+		remove_session_dir "$token" 2>/dev/null || :
+		return 1
+	}
+	if ! write_session_request "$token" "$expiry" "$path" ||
+	   ! write_status "$token" starting "" ||
+	   ! write_heartbeat "$token" "$now" ||
+	   ! write_current "$token" "$expiry"; then
+		remove_session_dir "$token" 2>/dev/null || :
+		rm -f -- "$CURRENT_FILE" 2>/dev/null || :
+		printf 'Cannot publish renderer session\n' >&2
+		return 1
+	fi
+
+	/usr/libexec/videoplayer-renderer worker "$token" \
+		9<&- </dev/null >/dev/null 2>&1 &
+	pid=$!
+	start=""
+	while [ "$i" -lt 3 ] && [ -z "$start" ]; do
+		start="$(process_start_time "$pid" 2>/dev/null)" || start=""
+		[ -n "$start" ] || sleep 1
+		i=$((i + 1))
+	done
+	[ -n "$start" ] || {
+		kill -TERM "$pid" 2>/dev/null || :
+		rm -f -- "$CURRENT_FILE" 2>/dev/null || :
+		printf 'Renderer worker did not start\n' >&2
+		return 1
+	}
+	write_worker_identity "$token" "$pid" "$start" || {
+		kill -TERM "$pid" 2>/dev/null || :
+		rm -f -- "$CURRENT_FILE" 2>/dev/null || :
+		printf 'Cannot record renderer worker\n' >&2
+		return 1
+	}
+
+	i=0
+	while [ "$i" -lt "$STARTUP_TIMEOUT" ]; do
+		if load_current 2>/dev/null && [ "$CURRENT_TOKEN" = "$token" ] &&
+		   load_status "$token" 2>/dev/null; then
+			case "$SESSION_STATUS" in
+				running)
+					printf 'started\n'
+					return 0
+					;;
+				error|ended|stopped)
+					message="$SESSION_REASON"
+					[ -n "$message" ] || message="Renderer stopped before producing a frame"
+					stop_current_locked "$token" 2>/dev/null || :
+					printf '%s\n' "$message" >&2
+					return 1
+					;;
+			esac
+		fi
+		process_matches_worker "$pid" "$start" "$token" || {
+			stop_current_locked "$token" 2>/dev/null || :
+			printf 'Renderer worker exited during startup\n' >&2
+			return 1
+		}
+		sleep 1
+		i=$((i + 1))
+	done
+
+	stop_current_locked "$token" 2>/dev/null || :
+	printf 'Renderer did not produce a frame in time\n' >&2
+	return 1
+}
+
+cmd_stop() {
+	local token="$1" result
+
+	valid_token "$token" || return 1
+	ensure_lock_file "$CONTROL_LOCK" || return 1
+	exec 9< "$CONTROL_LOCK" || return 1
+	flock -x 9 || return 1
+	ensure_runtime || return 1
+	stop_current_locked "$token"
+	result=$?
+	case "$result" in
+		0) printf 'stopped\n'; return 0 ;;
+		2) printf 'stale\n'; return 2 ;;
+		*) printf 'inactive\n'; return 3 ;;
+	esac
+}
+
+cmd_status() {
+	local token="$1" now dir
+
+	valid_token "$token" || return 1
+	load_current || {
+		printf 'inactive\n'
+		return 0
+	}
+	[ "$CURRENT_TOKEN" = "$token" ] || {
+		printf 'inactive\n'
+		return 0
+	}
+	now="$(date +%s 2>/dev/null)" || return 1
+	valid_decimal "$now" 12 || return 1
+	if [ "$CURRENT_EXPIRY" -le "$now" ]; then
+		printf 'expired\n'
+		return 0
+	fi
+	load_status "$token" || {
+		printf 'error\n'
+		return 0
+	}
+	case "$SESSION_STATUS" in
+		starting|running)
+			if ! load_worker_identity "$token" worker ||
+			   ! process_matches_worker "$WORKER_PID" "$WORKER_START" "$token"; then
+				printf 'error\n'
+				return 0
+			fi
+			;;
+	esac
+	if [ "$SESSION_STATUS" = "running" ]; then
+		dir="$RUNTIME_DIR/s-$token"
+		if ! frame_is_fresh "$dir/frame.jpg" "$now"; then
+			printf 'error\n'
+			return 0
+		fi
+	fi
+	printf '%s\n' "$SESSION_STATUS"
+}
+
+http_error() {
+	local status="$1" message="$2"
+
+	printf 'Status: %s\r\n' "$status"
+	printf 'Content-Type: text/plain; charset=utf-8\r\n'
+	printf 'Cache-Control: no-store\r\n'
+	printf 'X-Content-Type-Options: nosniff\r\n'
+	printf 'Referrer-Policy: no-referrer\r\n'
+	printf '\r\n'
+	if [ "${REQUEST_METHOD:-GET}" != "HEAD" ]; then
+		printf '%s\n' "$message"
+	fi
+	exit 0
+}
+
+parse_frame_query() {
+	local query="$1" first rest value left right
+
+	CGI_TOKEN=""
+	[ -n "$query" ] || return 1
+	case "$query" in
+		*'&'*)
+			first="${query%%&*}"
+			rest="${query#*&}"
+			case "$rest" in
+				frame=*) value="${rest#frame=}" ;;
+				*) return 1 ;;
+			esac
+			case "$value" in
+				*-*)
+					left="${value%%-*}"
+					right="${value#*-}"
+					case "$right" in *-*) return 1 ;; esac
+					valid_decimal "$left" 16 && valid_decimal "$right" 16 ||
+						return 1
+					;;
+				*) valid_decimal "$value" 16 || return 1 ;;
+			esac
+			;;
+		*) first="$query" ;;
+	esac
+	case "$first" in
+		token=*) CGI_TOKEN="${first#token=}" ;;
+		*) return 1 ;;
+	esac
+	valid_token "$CGI_TOKEN"
+}
+
+cmd_cgi() {
+	local now dir frame opened metadata kind size status
+
+	case "${REQUEST_METHOD:-GET}" in
+		GET|HEAD) ;;
+		*)
+			printf 'Status: 405 Method Not Allowed\r\n'
+			printf 'Allow: GET, HEAD\r\n'
+			printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+			printf 'Method not allowed\n'
+			exit 0
+			;;
+	esac
+	parse_frame_query "${QUERY_STRING:-}" || http_error "400 Bad Request" "Invalid query"
+	get_enabled || http_error "403 Forbidden" "Local playback is disabled"
+	[ "$(get_render_mode)" = "router" ] ||
+		http_error "409 Conflict" "Router CPU rendering is not selected"
+	load_current || http_error "404 Not Found" "Renderer session not found"
+	[ "$CURRENT_TOKEN" = "$CGI_TOKEN" ] ||
+		http_error "404 Not Found" "Renderer session not found"
+	now="$(date +%s 2>/dev/null)" || http_error "503 Service Unavailable" "Clock unavailable"
+	valid_decimal "$now" 12 || http_error "503 Service Unavailable" "Clock unavailable"
+	[ "$CURRENT_EXPIRY" -gt "$now" ] || http_error "410 Gone" "Renderer session expired"
+	load_status "$CGI_TOKEN" ||
+		http_error "503 Service Unavailable" "Renderer state is invalid"
+	status="$SESSION_STATUS"
+	case "$status" in
+		starting) http_error "202 Accepted" "Renderer is starting" ;;
+		ended|stopped) http_error "410 Gone" "Playback ended" ;;
+		error) http_error "503 Service Unavailable" "Renderer failed" ;;
+		running) ;;
+	esac
+	if ! load_worker_identity "$CGI_TOKEN" worker ||
+	   ! process_matches_worker "$WORKER_PID" "$WORKER_START" "$CGI_TOKEN"; then
+		http_error "503 Service Unavailable" "Renderer worker is not running"
+	fi
+
+	dir="$RUNTIME_DIR/s-$CGI_TOKEN"
+	frame="$dir/frame.jpg"
+	[ -f "$frame" ] && [ ! -L "$frame" ] ||
+		http_error "202 Accepted" "Frame is not ready"
+	exec 7< "$frame" || http_error "503 Service Unavailable" "Cannot open frame"
+	opened="$(readlink -f -- /proc/self/fd/7 2>/dev/null)" || {
+		exec 7<&-
+		http_error "503 Service Unavailable" "Cannot verify frame"
+	}
+	case "$opened" in
+		"$frame"|"$frame (deleted)") ;;
+		*)
+			exec 7<&-
+			http_error "503 Service Unavailable" "Cannot verify frame"
+			;;
+	esac
+	metadata="$(stat -L -c '%F:%s:%u:%a' -- /proc/self/fd/7 2>/dev/null)" || {
+		exec 7<&-
+		http_error "503 Service Unavailable" "Cannot inspect frame"
+	}
+	kind="${metadata%%:*}"
+	metadata="${metadata#*:}"
+	size="${metadata%%:*}"
+	metadata="${metadata#*:}"
+	[ "$kind" = "regular file" ] && valid_decimal "$size" 10 &&
+		[ "$size" -gt 0 ] && [ "$size" -le "$MAX_FRAME_BYTES" ] &&
+		[ "$metadata" = "0:600" ] || {
+			exec 7<&-
+			http_error "503 Service Unavailable" "Invalid frame"
+		}
+	frame_is_fresh /proc/self/fd/7 "$now" || {
+		exec 7<&-
+		http_error "503 Service Unavailable" "Renderer frame is stale"
+	}
+
+	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
+		write_heartbeat "$CGI_TOKEN" "$now" || {
+			exec 7<&-
+			http_error "503 Service Unavailable" "Cannot refresh renderer lease"
+		}
+	fi
+
+	printf 'Status: 200 OK\r\n'
+	printf 'Content-Type: image/jpeg\r\n'
+	printf 'Content-Length: %s\r\n' "$size"
+	printf 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n'
+	printf 'Pragma: no-cache\r\n'
+	printf 'Expires: 0\r\n'
+	printf 'X-Content-Type-Options: nosniff\r\n'
+	printf 'Referrer-Policy: no-referrer\r\n'
+	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
+	printf '\r\n'
+	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
+		dd bs=65536 <&7 2>/dev/null
+	fi
+	exec 7<&-
+	exit 0
+}
+
+cmd_cleanup() {
+	ensure_lock_file "$CONTROL_LOCK" || return 1
+	exec 9< "$CONTROL_LOCK" || return 1
+	flock -x 9 || return 1
+	if runtime_is_safe; then
+		stop_current_locked "" 2>/dev/null || :
+		cleanup_old_sessions "" 2>/dev/null || :
+		rm -f -- "$CURRENT_FILE" "$RUNTIME_MARKER" 2>/dev/null || :
+		rmdir -- "$RUNTIME_DIR" 2>/dev/null || :
+	fi
+	return 0
+}
+
+case "${1:-}" in
+	probe) probe_renderer ;;
+	start)
+		[ "$#" -eq 3 ] || exit 2
+		cmd_start "$2" "$3"
+		;;
+	stop)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_stop "$2"
+		;;
+	status)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_status "$2"
+		;;
+	worker)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_worker "$2"
+		;;
+	cgi)
+		[ "$#" -eq 1 ] || exit 2
+		cmd_cgi
+		;;
+	cleanup)
+		[ "$#" -eq 1 ] || exit 2
+		cmd_cleanup
+		;;
+	*) exit 2 ;;
+esac

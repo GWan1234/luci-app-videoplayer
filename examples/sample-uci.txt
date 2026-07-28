@@ -5,4 +5,5 @@ config videoplayer 'main'
 	# USB stick mounted at /mnt/sda1:
 	option media_path '/mnt/sda1/videos'
 	option allow_remote '1'
+	option render_mode 'browser'
 	option max_depth '8'

@@ -10,13 +10,13 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_VERSION:=1.0.0
-# Override luci.mk's default release so the package version stays exactly 1.0.0.
+PKG_VERSION:=1.1.0
+# Override luci.mk's default release so the package version stays exactly 1.1.0.
 PKG_RELEASE:=
 
 LUCI_TITLE:=LuCI Video Player (local + remote)
-LUCI_DESCRIPTION:=HTML5 video player inside LuCI for local router storage and remote HTTP(S) media URLs.
-LUCI_DEPENDS:=+luci-base +uhttpd +jshn +coreutils-stat
+LUCI_DESCRIPTION:=LuCI video player with browser playback and experimental router-CPU rendering for local media.
+LUCI_DEPENDS:=+luci-base +uhttpd +jshn +coreutils-stat +ffmpeg
 LUCI_PKGARCH:=all
 LUCI_URL:=https://github.com/communism420/luci-app-videoplayer
 
@@ -25,15 +25,25 @@ LUCI_MAINTAINER:=openwrt-video-player contributors
 PKG_MAINTAINER:=$(LUCI_MAINTAINER)
 PKG_FILE_MODES:=/etc/uci-defaults/80_luci-videoplayer:root:root:0755 \
 	/usr/libexec/rpcd/luci.videoplayer:root:root:0755 \
-	/www/cgi-bin/videoplayer-stream:root:root:0755
+	/usr/libexec/videoplayer-renderer:root:root:0755 \
+	/www/cgi-bin/videoplayer-stream:root:root:0755 \
+	/www/cgi-bin/videoplayer-frame:root:root:0755
 
 define Package/luci-app-videoplayer/conffiles
 /etc/config/videoplayer
 endef
 
+define Package/luci-app-videoplayer/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] ||
+	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
+exit 0
+endef
+
 define Package/luci-app-videoplayer/postrm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
+	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
 	cleanup_token_store() (
 		lock_file="/tmp/videoplayer-tokens.lock"
 		token_dir="/tmp/videoplayer-tokens"
@@ -77,6 +87,7 @@ define Package/luci-app-videoplayer/postrm
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 	rm -rf /tmp/luci-modulecache 2>/dev/null || true
 	cleanup_token_store 2>/dev/null || true
+	rm -f /tmp/videoplayer-render-v1.lock /tmp/videoplayer-render-v1.worker.lock 2>/dev/null || true
 	/etc/init.d/rpcd reload 2>/dev/null || true
 }
 exit 0

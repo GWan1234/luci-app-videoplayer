@@ -5,7 +5,8 @@
 # shellcheck disable=SC3045
 #
 # ubus/rpcd backend for luci-app-videoplayer
-# Methods: get_status, list, resolve
+# Methods: get_status, list, resolve, start_renderer, renderer_status,
+#          stop_renderer
 
 . /usr/share/libubox/jshn.sh
 
@@ -28,6 +29,7 @@ MAX_SORT_ENTRIES=5000
 MAX_SORT_BYTES=1048576
 MAX_PATH_LENGTH=4096
 MAX_REQUEST_BYTES=16384
+RENDERER_HELPER="/usr/libexec/videoplayer-renderer"
 
 string_has_control() {
 	printf '%s' "$1" | grep -q '[[:cntrl:]]'
@@ -195,6 +197,16 @@ get_enabled() {
 	esac
 }
 
+get_render_mode() {
+	local value
+
+	value="$(uci -q get videoplayer.main.render_mode 2>/dev/null)" || value=""
+	case "$value" in
+		router) printf 'router\n' ;;
+		*) printf 'browser\n' ;;
+	esac
+}
+
 is_allowed_ext() {
 	local name="$1" base ext
 
@@ -203,7 +215,7 @@ is_allowed_ext() {
 		*.*) ;;
 		*) return 1 ;;
 	esac
-	ext="$(printf '%s' "${base##*.}" | tr 'A-Z' 'a-z')"
+	ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
 	case " $VIDEO_EXTS " in
 		*" $ext "*) return 0 ;;
 		*) return 1 ;;
@@ -214,7 +226,7 @@ mime_for() {
 	local name="$1" base ext
 
 	base="${name##*/}"
-	ext="$(printf '%s' "${base##*.}" | tr 'A-Z' 'a-z')"
+	ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
 	case "$ext" in
 		webm) printf 'video/webm\n' ;;
 		ogg|ogv) printf 'video/ogg\n' ;;
@@ -516,11 +528,12 @@ json_add_entry() {
 }
 
 parse_request() {
-	local raw="$1" nested_path nested_offset nested_limit
+	local raw="$1" nested_path nested_offset nested_limit nested_token
 
 	REQ_PATH=""
 	REQ_OFFSET=""
 	REQ_LIMIT=""
+	REQ_TOKEN=""
 
 	[ -n "$raw" ] || raw="{}"
 	[ "${#raw}" -le "$MAX_REQUEST_BYTES" ] || return 1
@@ -528,16 +541,19 @@ parse_request() {
 	json_get_var REQ_PATH path
 	json_get_var REQ_OFFSET offset
 	json_get_var REQ_LIMIT limit
+	json_get_var REQ_TOKEN token
 
 	if json_select params 2>/dev/null; then
 		json_get_var nested_path path
 		json_get_var nested_offset offset
 		json_get_var nested_limit limit
+		json_get_var nested_token token
 		json_select ..
 
 		[ -n "$REQ_PATH" ] || REQ_PATH="$nested_path"
 		[ -n "$REQ_OFFSET" ] || REQ_OFFSET="$nested_offset"
 		[ -n "$REQ_LIMIT" ] || REQ_LIMIT="$nested_limit"
+		[ -n "$REQ_TOKEN" ] || REQ_TOKEN="$nested_token"
 	fi
 
 	return 0
@@ -566,12 +582,22 @@ normalize_list_args() {
 
 cmd_get_status() {
 	local configured root valid=0 enabled allow_remote exists=0 readable=0
+	local render_mode renderer_available=0 renderer_reason
 
 	configured="$(get_configured_media_path)"
 	root="$(canonicalize_media_root "$configured" 2>/dev/null)" && valid=1
 	enabled="$(get_enabled)"
 	allow_remote="$(uci -q get videoplayer.main.allow_remote 2>/dev/null)" || allow_remote=""
 	[ -n "$allow_remote" ] || allow_remote="1"
+	render_mode="$(get_render_mode)"
+	if [ -x "$RENDERER_HELPER" ]; then
+		if renderer_reason="$("$RENDERER_HELPER" probe 2>/dev/null)"; then
+			renderer_available=1
+		fi
+	else
+		renderer_reason="renderer helper is not installed"
+	fi
+	[ -n "$renderer_reason" ] || renderer_reason="FFmpeg renderer probe failed"
 
 	[ -d "$configured" ] && exists=1
 	[ -r "$configured" ] && [ -x "$configured" ] && readable=1
@@ -584,6 +610,11 @@ cmd_get_status() {
 	json_add_boolean "media_path_valid" "$valid"
 	json_add_boolean "enabled" "$enabled"
 	json_add_boolean "allow_remote" "$([ "$allow_remote" = "1" ] && printf 1 || printf 0)"
+	json_add_string "render_mode" "$render_mode"
+	json_add_boolean "renderer_available" "$renderer_available"
+	if [ "$renderer_available" -eq 0 ]; then
+		json_add_string "renderer_reason" "$renderer_reason"
+	fi
 	json_add_boolean "media_path_exists" "$exists"
 	json_add_boolean "media_path_readable" "$readable"
 	json_dump
@@ -802,22 +833,37 @@ cmd_list() {
 }
 
 cmd_resolve() {
-	local raw="$1" rel root path canonical_rel parent depth max_depth token name mime
+	local raw="$1" requested_mode="${2:-browser}"
+	local rel root path canonical_rel parent depth max_depth token name mime
+	local render_mode renderer_message renderer_result
 
 	[ "$(get_enabled)" = "1" ] || {
 		json_error "video player disabled"
 		return
 	}
+	case "$requested_mode" in
+		browser) ;;
+		router)
+			[ "$(get_render_mode)" = "router" ] || {
+				json_error "router CPU rendering is not selected"
+				return
+			}
+			;;
+		*)
+			json_error "invalid rendering mode"
+			return
+			;;
+	esac
 
 	parse_request "$raw" || {
 		json_error "invalid JSON request"
 		return
 	}
 	rel="$REQ_PATH"
-	[ -n "$rel" ] && validate_relative_path "$rel" || {
+	if [ -z "$rel" ] || ! validate_relative_path "$rel"; then
 		json_error "path required or invalid"
 		return
-	}
+	fi
 
 	root="$(get_media_root 2>/dev/null)" || {
 		json_error "media path is invalid or inaccessible"
@@ -862,14 +908,96 @@ cmd_resolve() {
 
 	name="${path##*/}"
 	mime="$(mime_for "$path")"
+	render_mode="$requested_mode"
+
+	if [ "$render_mode" = "router" ]; then
+		[ -x "$RENDERER_HELPER" ] || {
+			json_error "router CPU renderer is not installed"
+			return
+		}
+		renderer_message="$("$RENDERER_HELPER" start "$token" "$path" 2>&1)"
+		renderer_result=$?
+		if [ "$renderer_result" -ne 0 ]; then
+			string_has_control "$renderer_message" && renderer_message=""
+			[ "${#renderer_message}" -le 160 ] || renderer_message=""
+			[ -n "$renderer_message" ] ||
+				renderer_message="router CPU renderer failed to start"
+			json_error "$renderer_message"
+			return
+		fi
+	fi
 
 	json_init
 	json_add_string "name" "$name"
 	json_add_string "path" "$canonical_rel"
 	json_add_int "size" "$FILE_SIZE"
-	json_add_string "stream_url" "/cgi-bin/videoplayer-stream?token=$token"
-	json_add_string "mime" "$mime"
+	json_add_string "render_mode" "$render_mode"
+	if [ "$render_mode" = "router" ]; then
+		json_add_string "stream_url" "/cgi-bin/videoplayer-frame?token=$token"
+		json_add_string "stream_type" "jpeg-frames"
+		json_add_string "session_token" "$token"
+		json_add_string "mime" "image/jpeg"
+		json_add_boolean "has_audio" 0
+		json_add_boolean "seekable" 0
+		json_add_int "frame_interval_ms" 333
+	else
+		json_add_string "stream_url" "/cgi-bin/videoplayer-stream?token=$token"
+		json_add_string "stream_type" "html5-video"
+		json_add_string "mime" "$mime"
+		json_add_boolean "has_audio" 1
+		json_add_boolean "seekable" 1
+	fi
 	json_add_int "expires_in" "$TOKEN_TTL"
+	json_dump
+}
+
+cmd_renderer_status() {
+	local raw="$1" state
+
+	parse_request "$raw" || {
+		json_error "invalid JSON request"
+		return
+	}
+	valid_token "$REQ_TOKEN" || {
+		json_error "renderer token required or invalid"
+		return
+	}
+	[ -x "$RENDERER_HELPER" ] || {
+		json_error "router CPU renderer is not installed"
+		return
+	}
+	state="$("$RENDERER_HELPER" status "$REQ_TOKEN" 2>/dev/null)" || state="error"
+	case "$state" in
+		starting|running|ended|error|stopped|expired|inactive) ;;
+		*) state="error" ;;
+	esac
+
+	json_init
+	json_add_string "state" "$state"
+	json_dump
+}
+
+cmd_stop_renderer() {
+	local raw="$1" result stopped=0
+
+	parse_request "$raw" || {
+		json_error "invalid JSON request"
+		return
+	}
+	valid_token "$REQ_TOKEN" || {
+		json_error "renderer token required or invalid"
+		return
+	}
+	[ -x "$RENDERER_HELPER" ] || {
+		json_error "router CPU renderer is not installed"
+		return
+	}
+	"$RENDERER_HELPER" stop "$REQ_TOKEN" >/dev/null 2>&1
+	result=$?
+	[ "$result" -ne 0 ] || stopped=1
+
+	json_init
+	json_add_boolean "stopped" "$stopped"
 	json_dump
 }
 
@@ -887,6 +1015,15 @@ case "$1" in
 		json_close_object
 		json_add_object "resolve"
 			json_add_string "path" "String"
+		json_close_object
+		json_add_object "start_renderer"
+			json_add_string "path" "String"
+		json_close_object
+		json_add_object "renderer_status"
+			json_add_string "token" "String"
+		json_close_object
+		json_add_object "stop_renderer"
+			json_add_string "token" "String"
 		json_close_object
 		json_dump
 		;;
@@ -911,7 +1048,10 @@ case "$1" in
 		case "$2" in
 			get_status) cmd_get_status ;;
 			list) cmd_list "$input" ;;
-			resolve) cmd_resolve "$input" ;;
+			resolve) cmd_resolve "$input" browser ;;
+			start_renderer) cmd_resolve "$input" router ;;
+			renderer_status) cmd_renderer_status "$input" ;;
+			stop_renderer) cmd_stop_renderer "$input" ;;
 			*) json_error "unknown method" ;;
 		esac
 		;;

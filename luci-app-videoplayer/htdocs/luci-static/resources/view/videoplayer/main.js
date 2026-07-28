@@ -3,11 +3,25 @@
 'require ui';
 'require uci';
 'require rpc';
+'require request';
 
 const callStatus  = rpc.declare({ object: 'luci.videoplayer', method: 'get_status' });
 const callList    = rpc.declare({ object: 'luci.videoplayer', method: 'list',    params: [ 'path', 'offset', 'limit' ] });
 const callResolve = rpc.declare({ object: 'luci.videoplayer', method: 'resolve', params: [ 'path' ] });
+const callStartRenderer = rpc.declare({ object: 'luci.videoplayer', method: 'start_renderer', params: [ 'path' ] });
+const callRendererStatus = rpc.declare({ object: 'luci.videoplayer', method: 'renderer_status', params: [ 'token' ] });
+const callStopRenderer   = rpc.declare({
+	object: 'luci.videoplayer',
+	method: 'stop_renderer',
+	params: [ 'token' ],
+	nobatch: true
+});
 const PAGE_SIZE = 100;
+const CPU_FRAME_INTERVAL_MS = 333;
+const CPU_HIDDEN_INTERVAL_MS = 2000;
+const CPU_FRAME_REQUEST_TIMEOUT_MS = 2500;
+const CPU_START_TIMEOUT_MS = 15000;
+const CPU_MAX_FRAME_BYTES = 4194304;
 
 function formatSize(bytes) {
 	const n = Number(bytes) || 0;
@@ -19,6 +33,10 @@ function formatSize(bytes) {
 
 function flagOn(v) {
 	return v === true || v === 1 || v === '1';
+}
+
+function normalizeRenderMode(value) {
+	return value === 'router' ? 'router' : 'browser';
 }
 
 function errorText(err) {
@@ -88,35 +106,66 @@ return view.extend({
 		const self = this;
 		const canWriteSettings = typeof L.hasViewPermission !== 'function' ||
 			L.hasViewPermission() === true;
+		const nextPlayGeneration = typeof self._playGeneration === 'number'
+			? self._playGeneration + 1
+			: 1;
+		const nextBrowseRequestId = typeof self._browseRequestId === 'number'
+			? self._browseRequestId + 1
+			: 1;
+		const previousCpuSession = typeof self._detachCpuSession === 'function'
+			? self._detachCpuSession(true)
+			: null;
+
+		if (typeof self._stopRendererBestEffort === 'function')
+			self._stopRendererBestEffort(previousCpuSession);
+		if (typeof self._clearVideoElement === 'function')
+			self._clearVideoElement();
+		if (self._pageHideHandler)
+			window.removeEventListener('pagehide', self._pageHideHandler);
 
 		const enabled = uci.get('videoplayer', 'main', 'enabled');
 		const mediaPath = uci.get('videoplayer', 'main', 'media_path') || status.media_path || '/mnt/video';
 		const allowRemote = uci.get('videoplayer', 'main', 'allow_remote');
+		const configuredRenderMode = uci.get('videoplayer', 'main', 'render_mode');
 		const localEnabled = enabled !== undefined
 			? flagOn(enabled)
 			: (status.enabled !== undefined ? flagOn(status.enabled) : true);
 		const remoteAllowed = allowRemote !== undefined
 			? flagOn(allowRemote)
 			: (status.allow_remote !== undefined ? flagOn(status.allow_remote) : true);
+		const renderMode = normalizeRenderMode(
+			configuredRenderMode !== undefined ? configuredRenderMode : status.render_mode
+		);
+		const rendererAvailable = status.renderer_available === undefined
+			? null
+			: flagOn(status.renderer_available);
 
 		self._cwd = '';
 		self._offset = 0;
 		self._limit = PAGE_SIZE;
 		self._hasMore = false;
 		self._browseLoading = false;
-		self._browseRequestId = 0;
-		self._playGeneration = 0;
+		self._browseRequestId = nextBrowseRequestId;
+		self._playGeneration = nextPlayGeneration;
+		self._localResolvePending = false;
 		self._currentSrc = null;
 		self._currentLabel = '';
 		self._currentKind = null;
+		self._currentRenderMode = null;
+		self._cpuSession = null;
 		self._localEnabled = localEnabled;
 		self._allowRemote = remoteAllowed;
+		self._renderMode = renderMode;
+		self._rendererAvailable = rendererAvailable;
 		self._canWriteSettings = canWriteSettings;
 		self._statusLoadError = statusResult.error || null;
 		self._status = {
 			media_path: status.media_path || mediaPath,
 			enabled: status.enabled !== undefined ? status.enabled : localEnabled,
 			allow_remote: status.allow_remote !== undefined ? status.allow_remote : remoteAllowed,
+			render_mode: normalizeRenderMode(status.render_mode || renderMode),
+			renderer_available: status.renderer_available,
+			renderer_reason: status.renderer_reason,
 			media_path_valid: status.media_path_valid,
 			media_path_exists: status.media_path_exists,
 			media_path_readable: status.media_path_readable
@@ -130,12 +179,26 @@ return view.extend({
 					padding: 8px;
 					margin-bottom: 10px;
 				}
-				#videoplayer-root video#videoplayer-video {
+				#videoplayer-root video#videoplayer-video,
+				#videoplayer-root img#videoplayer-cpu-frame {
 					width: 100%;
 					max-height: 70vh;
 					background: #000;
 					border-radius: 4px;
 					display: block;
+					object-fit: contain;
+				}
+				#videoplayer-root [hidden] { display: none !important; }
+				#videoplayer-root video#videoplayer-video:fullscreen,
+				#videoplayer-root img#videoplayer-cpu-frame:fullscreen,
+				#videoplayer-root video#videoplayer-video:-webkit-full-screen,
+				#videoplayer-root img#videoplayer-cpu-frame:-webkit-full-screen {
+					width: 100vw;
+					height: 100vh;
+					max-height: none;
+					border-radius: 0;
+					object-fit: contain;
+					background: #000;
 				}
 				#videoplayer-root .vp-toolbar {
 					display: flex;
@@ -191,12 +254,49 @@ return view.extend({
 
 			E('h2', {}, _('Video Player')),
 			E('div', { class: 'cbi-map-descr' },
-				_('Play local videos from router storage or remote HTTP(S) URLs — fully inside the LuCI web UI (HTML5 player).')),
+				_('Play videos in LuCI using normal browser decoding or experimental CPU rendering on the router.')),
 
 			/* Settings */
 			E('h3', {}, _('Settings')),
 			E('div', { class: 'cbi-section' }, [
 				E('div', { class: 'cbi-section-node' }, [
+					E('div', { class: 'cbi-value' }, [
+						E('label', {
+							class: 'cbi-value-title',
+							for: 'vp-render-mode'
+						}, _('Rendering mode')),
+						E('div', { class: 'cbi-value-field' }, [
+							E('select', {
+								id: 'vp-render-mode',
+								class: 'cbi-input-select',
+								disabled: canWriteSettings ? null : 'disabled',
+								'aria-describedby': 'vp-render-mode-desc vp-render-mode-status'
+							}, [
+								E('option', {
+									value: 'browser',
+									selected: renderMode === 'browser' ? 'selected' : null
+								}, _('Browser decoding (recommended)')),
+								E('option', {
+									value: 'router',
+									selected: renderMode === 'router' ? 'selected' : null
+								}, _('Router CPU rendering (experimental)'))
+							]),
+							E('div', {
+								id: 'vp-render-mode-desc',
+								class: 'cbi-value-description'
+							}, _('Local files only. Router mode uses FFmpeg to produce a silent low-frame-rate preview in this web page; it has no audio, pause, seeking, or timeline and may heavily load the router. Remote URLs always use browser decoding.')),
+							E('div', {
+								id: 'vp-render-mode-status',
+								class: rendererAvailable === false
+									? 'cbi-value-description alert-message warning'
+									: 'cbi-value-description',
+								role: 'status'
+							}, rendererAvailable === false
+								? _('Router CPU rendering is unavailable: %s').format(
+									status.renderer_reason || _('FFmpeg capability check failed'))
+								: '')
+						])
+					]),
 					E('div', { class: 'cbi-value' }, [
 						E('label', {
 							class: 'cbi-value-title',
@@ -298,7 +398,12 @@ return view.extend({
 							waiting: function (ev) { self._handleVideoWaiting(ev); },
 							playing: function (ev) { self._handleVideoPlaying(ev); },
 							volumechange: function (ev) { self._handleVolumeChange(ev); }
-						}, _('Your browser does not support HTML5 video.'))
+						}, _('Your browser does not support HTML5 video.')),
+						E('img', {
+							id: 'videoplayer-cpu-frame',
+							hidden: 'hidden',
+							'alt': _('Router-rendered video frame')
+						})
 					]),
 					E('div', {
 						id: 'videoplayer-nowplaying',
@@ -325,7 +430,12 @@ return view.extend({
 							class: 'btn cbi-button',
 							click: ui.createHandlerFn(self, 'handleFullscreen')
 						}, _('Fullscreen'))
-					])
+					]),
+					E('div', {
+						id: 'vp-cpu-player-note',
+						class: 'cbi-value-description',
+						hidden: 'hidden'
+					}, _('Router CPU mode is a silent low-frame-rate preview without pause, seeking, or a timeline.'))
 				])
 			]),
 
@@ -357,7 +467,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-remote-url-desc',
 								class: 'cbi-value-description'
-							}, _('Direct link to MP4/WebM. Loaded by the browser; server policy, codec support, or missing Range support may prevent playback.')),
+							}, _('Direct link to MP4/WebM. Remote media is always loaded by the browser, even when Router CPU mode is selected; server policy, codec support, or missing Range support may prevent playback.')),
 							E('div', {
 								id: 'vp-remote-url-error',
 								class: 'cbi-value-description',
@@ -481,7 +591,7 @@ return view.extend({
 			E('div', { class: 'cbi-section-descr', style: 'margin-top:1em;' }, [
 				E('p', {}, [
 					E('strong', {}, _('Notes:')), ' ',
-					_('Prefer H.264 + AAC in MP4 for maximum browser compatibility. Store media on USB if possible. Seeking needs HTTP Range (supported by the included CGI streamer).')
+					_('Prefer H.264 + AAC in MP4 for browser mode. Router CPU mode depends on the codecs enabled in the installed OpenWrt FFmpeg build and may not decode every file. Store media on USB if possible.')
 				])
 			])
 		]);
@@ -489,11 +599,18 @@ return view.extend({
 		/* Defer initial listing until DOM is attached */
 		window.setTimeout(function () {
 			self._syncRemoteControls();
+			self._updateRendererStatus();
+			self._setPlayerSurface('none');
 			if (self._canBrowseLocal())
 				self._browse('', 0);
 			else
 				self._renderLocalUnavailable();
 		}, 0);
+
+		self._pageHideHandler = function () {
+			self.handleStop();
+		};
+		window.addEventListener('pagehide', self._pageHideHandler);
 
 		return root;
 	},
@@ -503,7 +620,9 @@ return view.extend({
 		const enabledEl = document.getElementById('vp-enabled');
 		const pathEl = document.getElementById('vp-media-path');
 		const remoteEl = document.getElementById('vp-allow-remote');
+		const renderModeEl = document.getElementById('vp-render-mode');
 		let path = (pathEl && pathEl.value || '').trim();
+		const renderMode = normalizeRenderMode(renderModeEl && renderModeEl.value);
 
 		if (!self._canWriteSettings) {
 			notify(null, _('Settings are read-only for the current LuCI account.'), 5000, 'warning');
@@ -511,6 +630,15 @@ return view.extend({
 		}
 
 		self._clearFieldError(pathEl, 'vp-media-path-error');
+
+		if (renderMode === 'router' && self._rendererAvailable === false) {
+			notify(null, E('p', {},
+				_('Router CPU rendering is unavailable: %s').format(
+					(self._status && self._status.renderer_reason) ||
+					_('FFmpeg capability check failed'))),
+			7000, 'error');
+			return Promise.resolve();
+		}
 
 		if (!path || path.charAt(0) !== '/') {
 			const message = _('Media path must be an absolute path (start with /).');
@@ -536,6 +664,9 @@ return view.extend({
 			'/mnt/video'
 		).replace(/\/+$/, '');
 		const pathChanged = path !== previousPath;
+		const modeChanged = renderMode !== normalizeRenderMode(
+			uci.get('videoplayer', 'main', 'render_mode') || self._renderMode
+		);
 		const localEnabled = !!(enabledEl && enabledEl.checked);
 		const remoteAllowed = !!(remoteEl && remoteEl.checked);
 		let statusRefreshError = null;
@@ -545,17 +676,22 @@ return view.extend({
 		uci.set('videoplayer', 'main', 'enabled', localEnabled ? '1' : '0');
 		uci.set('videoplayer', 'main', 'media_path', path);
 		uci.set('videoplayer', 'main', 'allow_remote', remoteAllowed ? '1' : '0');
+		uci.set('videoplayer', 'main', 'render_mode', renderMode);
 
 		return uci.save().then(function () {
 			return uci.apply();
 		}).then(function () {
 			self._localEnabled = localEnabled;
 			self._allowRemote = remoteAllowed;
+			self._renderMode = renderMode;
 			self._statusLoadError = null;
 			self._status = {
 				media_path: path,
 				enabled: localEnabled,
 				allow_remote: remoteAllowed,
+				render_mode: renderMode,
+				renderer_available: self._rendererAvailable,
+				renderer_reason: self._status && self._status.renderer_reason,
 				media_path_valid: undefined,
 				media_path_exists: undefined,
 				media_path_readable: undefined
@@ -564,7 +700,7 @@ return view.extend({
 			/* Stop stale work as soon as the new UCI values have been applied. */
 			self._browseRequestId++;
 			self._browseLoading = true;
-			if ((!localEnabled || pathChanged) && self._currentKind === 'local')
+			if ((!localEnabled || pathChanged || modeChanged) && self._currentKind === 'local')
 				self.handleStop();
 			else if (!remoteAllowed && self._currentKind === 'remote')
 				self.handleStop();
@@ -575,12 +711,19 @@ return view.extend({
 					media_path: st.media_path || path,
 					enabled: st.enabled !== undefined ? st.enabled : localEnabled,
 					allow_remote: st.allow_remote !== undefined ? st.allow_remote : remoteAllowed,
+					render_mode: normalizeRenderMode(st.render_mode || renderMode),
+					renderer_available: st.renderer_available,
+					renderer_reason: st.renderer_reason,
 					media_path_valid: st.media_path_valid,
 					media_path_exists: st.media_path_exists,
 					media_path_readable: st.media_path_readable
 				};
 				self._localEnabled = st.enabled !== undefined ? flagOn(st.enabled) : localEnabled;
 				self._allowRemote = st.allow_remote !== undefined ? flagOn(st.allow_remote) : remoteAllowed;
+				self._renderMode = normalizeRenderMode(st.render_mode || renderMode);
+				self._rendererAvailable = st.renderer_available === undefined
+					? null
+					: flagOn(st.renderer_available);
 			}, function (err) {
 				statusRefreshError = err;
 				self._statusLoadError = err;
@@ -592,6 +735,8 @@ return view.extend({
 				enabledEl.checked = self._localEnabled;
 			if (remoteEl)
 				remoteEl.checked = self._allowRemote;
+			if (renderModeEl)
+				renderModeEl.value = self._renderMode;
 
 			if (pathChanged) {
 				self._cwd = '';
@@ -599,7 +744,7 @@ return view.extend({
 			}
 
 			self._browseLoading = false;
-			if ((!self._canBrowseLocal() || pathChanged) && self._currentKind === 'local')
+			if ((!self._canBrowseLocal() || pathChanged || modeChanged) && self._currentKind === 'local')
 				self.handleStop();
 			else if (!self._allowRemote && self._currentKind === 'remote')
 				self.handleStop();
@@ -614,6 +759,7 @@ return view.extend({
 			const line = document.getElementById('videoplayer-status-line');
 			if (line)
 				line.textContent = self._mediaStatusText(self._status);
+			self._updateRendererStatus();
 
 			if (statusRefreshError) {
 				notify(null, E('p', {},
@@ -639,10 +785,7 @@ return view.extend({
 	},
 
 	handleStop: function () {
-		this._playGeneration++;
-		this._clearVideoElement();
-		this._currentKind = null;
-		this._currentLabel = '';
+		this._stopPlayback();
 		this._setNowPlaying(_('Stopped.'));
 		return Promise.resolve();
 	},
@@ -650,6 +793,11 @@ return view.extend({
 	handleMute: function () {
 		const v = document.getElementById('videoplayer-video');
 		const button = document.getElementById('vp-mute-btn');
+
+		if (this._currentRenderMode === 'router') {
+			notify(null, _('Router CPU mode has no audio.'), 3000, 'warning');
+			return Promise.resolve();
+		}
 
 		if (v) {
 			v.muted = !v.muted;
@@ -661,9 +809,11 @@ return view.extend({
 
 	handleFullscreen: function () {
 		const v = document.getElementById('videoplayer-video');
+		const frame = document.getElementById('videoplayer-cpu-frame');
+		const target = this._currentRenderMode === 'router' ? frame : v;
 		let request;
 
-		if (!v)
+		if (!target)
 			return Promise.resolve();
 
 		try {
@@ -673,13 +823,13 @@ return view.extend({
 				else if (document.webkitExitFullscreen)
 					request = document.webkitExitFullscreen();
 			}
-			else if (v.requestFullscreen) {
-				request = v.requestFullscreen();
+			else if (target.requestFullscreen) {
+				request = target.requestFullscreen();
 			}
-			else if (v.webkitRequestFullscreen) {
-				request = v.webkitRequestFullscreen();
+			else if (target.webkitRequestFullscreen) {
+				request = target.webkitRequestFullscreen();
 			}
-			else if (v.webkitEnterFullscreen) {
+			else if (this._currentRenderMode !== 'router' && v.webkitEnterFullscreen) {
 				request = v.webkitEnterFullscreen();
 			}
 			else {
@@ -821,6 +971,32 @@ return view.extend({
 			prevButton.disabled = disabled || this._offset <= 0;
 		if (nextButton)
 			nextButton.disabled = disabled || !this._hasMore;
+	},
+
+	_updateRendererStatus: function () {
+		const statusEl = document.getElementById('vp-render-mode-status');
+
+		if (!statusEl)
+			return;
+		statusEl.className = 'cbi-value-description';
+
+		if (this._renderMode === 'router' && !this._canWriteSettings) {
+			statusEl.className += ' alert-message warning';
+			statusEl.textContent = _('This read-only LuCI account cannot start the router CPU renderer. Local videos will use browser decoding.');
+		}
+		else if (this._rendererAvailable === false) {
+			statusEl.className += ' alert-message warning';
+			statusEl.textContent = _('Router CPU rendering is unavailable: %s').format(
+				(this._status && this._status.renderer_reason) ||
+				_('FFmpeg capability check failed')
+			);
+		}
+		else if (this._rendererAvailable === true && this._renderMode === 'router') {
+			statusEl.textContent = _('FFmpeg renderer is available. Expect high CPU usage and a silent low-frame-rate preview.');
+		}
+		else {
+			statusEl.textContent = '';
+		}
 	},
 
 	_updatePageInfo: function (entryCount, loading) {
@@ -1106,13 +1282,115 @@ return view.extend({
 	_clearVideoElement: function () {
 		const video = document.getElementById('videoplayer-video');
 
-		this._currentSrc = null;
 		if (!video)
 			return;
 
 		video.pause();
 		video.removeAttribute('src');
 		video.load();
+	},
+
+	_setPlayerSurface: function (surface) {
+		const video = document.getElementById('videoplayer-video');
+		const frame = document.getElementById('videoplayer-cpu-frame');
+		const note = document.getElementById('vp-cpu-player-note');
+		const mute = document.getElementById('vp-mute-btn');
+		const showVideo = surface === 'video';
+		const showCpu = surface === 'cpu';
+
+		if (video) {
+			video.hidden = !showVideo;
+			video.setAttribute('aria-hidden', showVideo ? 'false' : 'true');
+		}
+		if (frame) {
+			frame.hidden = !showCpu;
+			frame.setAttribute('aria-hidden', showCpu ? 'false' : 'true');
+		}
+		if (note)
+			note.hidden = !showCpu;
+		if (mute) {
+			mute.disabled = showCpu;
+			mute.title = showCpu ? _('Router CPU mode has no audio.') : '';
+		}
+	},
+
+	_revokeObjectUrl: function (url) {
+		if (!url || !window.URL || typeof window.URL.revokeObjectURL !== 'function')
+			return;
+		try {
+			window.URL.revokeObjectURL(url);
+		}
+		catch (err) {
+			/* Ignore cleanup failures from browsers with partial blob support. */
+		}
+	},
+
+	_cancelCpuPolling: function (session, clearFrame) {
+		const frame = document.getElementById('videoplayer-cpu-frame');
+
+		if (!session)
+			return;
+		session.active = false;
+		if (session.timer != null)
+			window.clearTimeout(session.timer);
+		session.timer = null;
+		if (session.decodeTimer != null)
+			window.clearTimeout(session.decodeTimer);
+		session.decodeTimer = null;
+		if (typeof session.cancelDecode === 'function')
+			session.cancelDecode();
+		session.cancelDecode = null;
+		if (session.decoder) {
+			session.decoder.onload = null;
+			session.decoder.onerror = null;
+			session.decoder.src = '';
+		}
+		session.decoder = null;
+		this._revokeObjectUrl(session.nextObjectUrl);
+		session.nextObjectUrl = null;
+
+		if (clearFrame && frame)
+			frame.removeAttribute('src');
+		this._revokeObjectUrl(session.objectUrl);
+		session.objectUrl = null;
+	},
+
+	_detachCpuSession: function (clearFrame) {
+		const session = this._cpuSession;
+
+		if (!session)
+			return null;
+		this._cpuSession = null;
+		this._cancelCpuPolling(session, clearFrame !== false);
+		return session;
+	},
+
+	_stopRendererBestEffort: function (session) {
+		if (!session || !session.token)
+			return;
+		callStopRenderer(session.token).catch(function () {});
+	},
+
+	_stopPlayback: function () {
+		this._playGeneration++;
+		const session = this._detachCpuSession(true);
+		this._stopRendererBestEffort(session);
+		this._clearVideoElement();
+		this._currentSrc = null;
+		this._currentKind = null;
+		this._currentRenderMode = null;
+		this._currentLabel = '';
+		this._setPlayerSurface('none');
+	},
+
+	_preparePlaybackSurface: function () {
+		const session = this._detachCpuSession(true);
+
+		this._stopRendererBestEffort(session);
+		this._clearVideoElement();
+		this._currentSrc = null;
+		this._currentRenderMode = null;
+		this._setPlayerSurface('none');
 	},
 
 	_playInVideo: function (url, label, generation, kind) {
@@ -1122,12 +1400,14 @@ return view.extend({
 		if (!video || generation !== self._playGeneration)
 			return Promise.resolve();
 
-		self._clearVideoElement();
+		self._preparePlaybackSurface();
 		self._currentKind = kind;
+		self._currentRenderMode = 'browser';
 		self._currentLabel = label || url;
+		self._setPlayerSurface('video');
 		video.src = url;
 		self._currentSrc = video.src || url;
-		self._setNowPlaying(_('Loading: %s').format(self._currentLabel));
+		self._setNowPlaying(_('Loading in browser: %s').format(self._currentLabel));
 
 		video.load();
 		let p;
@@ -1159,9 +1439,293 @@ return view.extend({
 		return Promise.resolve();
 	},
 
+	_isCurrentCpuSession: function (session) {
+		return !!session &&
+			this._cpuSession === session &&
+			session.active &&
+			session.generation === this._playGeneration &&
+			this._currentKind === 'local' &&
+			this._currentRenderMode === 'router';
+	},
+
+	_scheduleCpuFramePoll: function (session, delay) {
+		const self = this;
+
+		if (!self._isCurrentCpuSession(session))
+			return;
+		if (session.timer != null)
+			window.clearTimeout(session.timer);
+		session.timer = window.setTimeout(function () {
+			session.timer = null;
+			self._pollCpuFrame(session);
+		}, Math.max(0, Number(delay) || 0));
+	},
+
+	_installCpuFrame: function (session, blob) {
+		const self = this;
+
+		return new Promise(function (resolve, reject) {
+			if (!self._isCurrentCpuSession(session)) {
+				resolve();
+				return;
+			}
+
+			const objectUrl = window.URL.createObjectURL(blob);
+			const decoder = new Image();
+			let settled = false;
+
+			session.nextObjectUrl = objectUrl;
+			session.decoder = decoder;
+
+			const finish = function (ok, err) {
+				const frame = document.getElementById('videoplayer-cpu-frame');
+				const current = self._isCurrentCpuSession(session);
+
+				if (settled)
+					return;
+				settled = true;
+				if (session.decodeTimer != null)
+					window.clearTimeout(session.decodeTimer);
+				session.decodeTimer = null;
+				decoder.onload = null;
+				decoder.onerror = null;
+				if (session.decoder === decoder)
+					session.decoder = null;
+				if (session.cancelDecode === cancelDecode)
+					session.cancelDecode = null;
+
+				if (!ok || !current || !frame) {
+					if (session.nextObjectUrl === objectUrl)
+						session.nextObjectUrl = null;
+					self._revokeObjectUrl(objectUrl);
+					if (ok || !current)
+						resolve();
+					else
+						reject(err || new Error(_('The router returned an invalid video frame.')));
+					return;
+				}
+
+				const previous = session.objectUrl;
+				frame.src = objectUrl;
+				session.objectUrl = objectUrl;
+				session.nextObjectUrl = null;
+				self._revokeObjectUrl(previous);
+				if (!session.firstFrameSeen) {
+					session.firstFrameSeen = true;
+					self._setNowPlaying(
+						_('Router CPU preview: %s (silent, low frame rate)').format(session.label)
+					);
+				}
+				resolve();
+			};
+			const cancelDecode = function () {
+				finish(true);
+			};
+
+			session.cancelDecode = cancelDecode;
+			decoder.onload = function () { finish(true); };
+			decoder.onerror = function () {
+				finish(false, new Error(_('The router returned a JPEG frame the browser could not decode.')));
+			};
+			session.decodeTimer = window.setTimeout(function () {
+				finish(false, new Error(_('Timed out while decoding a router-rendered frame.')));
+			}, 1500);
+			decoder.src = objectUrl;
+		});
+	},
+
+	_finishCpuPlayback: function (session, message, isError) {
+		if (!this._isCurrentCpuSession(session))
+			return Promise.resolve();
+
+		const stopped = this._detachCpuSession(true);
+		this._stopRendererBestEffort(stopped);
+		this._currentSrc = null;
+		this._currentKind = null;
+		this._currentRenderMode = null;
+		this._currentLabel = '';
+		this._setPlayerSurface('none');
+		this._setNowPlaying(message);
+		if (isError)
+			notify(null, E('p', {}, message), 8000, 'error');
+		return Promise.resolve();
+	},
+
+	_handleCpuPollFailure: function (session, err) {
+		const self = this;
+
+		if (!self._isCurrentCpuSession(session))
+			return Promise.resolve();
+		session.errors++;
+
+		if (session.errors < 3) {
+			self._scheduleCpuFramePoll(session, 500);
+			return Promise.resolve();
+		}
+
+		return callRendererStatus(session.token).then(function (res) {
+			if (!self._isCurrentCpuSession(session))
+				return;
+			const state = res && res.state || 'error';
+			if (state === 'ended' || state === 'stopped' || state === 'expired' || state === 'inactive') {
+				return self._finishCpuPlayback(
+					session,
+					_('Router CPU playback ended: %s').format(session.label),
+					false
+				);
+			}
+			if (state === 'error') {
+				return self._finishCpuPlayback(
+					session,
+					_('Router CPU renderer failed for %s. The installed FFmpeg build may not support this video codec.').format(session.label),
+					true
+				);
+			}
+
+			if (session.errors >= 5 && !session.warned) {
+				session.warned = true;
+				notify(null, E('p', {},
+					_('Router-rendered frames are temporarily unavailable: %s').format(errorText(err))),
+				7000, 'warning');
+			}
+			self._scheduleCpuFramePoll(
+				session,
+				Math.min(2000, 250 * Math.pow(2, Math.min(session.errors, 3)))
+			);
+		}).catch(function () {
+			if (self._isCurrentCpuSession(session))
+				self._scheduleCpuFramePoll(session, 2000);
+		});
+	},
+
+	_pollCpuFrame: function (session) {
+		const self = this;
+		const started = Date.now();
+
+		if (!self._isCurrentCpuSession(session))
+			return Promise.resolve();
+		session.sequence++;
+
+		return request.get(session.frameUrl, {
+			responseType: 'blob',
+			timeout: CPU_FRAME_REQUEST_TIMEOUT_MS,
+			/* The unique frame query plus no-store response headers prevent
+			 * caching. LuCI's cache:false adds a second bare query field,
+			 * which the intentionally strict CGI parser rejects. */
+			cache: true,
+			query: {
+				frame: String(session.generation) + '-' + String(session.sequence)
+			}
+		}).then(function (res) {
+			if (!self._isCurrentCpuSession(session))
+				return;
+
+			if (res.status === 202) {
+				if (Date.now() - session.startedAt > CPU_START_TIMEOUT_MS) {
+					return self._finishCpuPlayback(
+						session,
+						_('Router renderer did not produce a frame in time.'),
+						true
+					);
+				}
+				return;
+			}
+			if (res.status === 410 || res.status === 404) {
+				return self._finishCpuPlayback(
+					session,
+					_('Router CPU playback ended: %s').format(session.label),
+					false
+				);
+			}
+			if (!res.ok || res.status !== 200)
+				throw new Error(_('Frame request failed with HTTP %d').format(res.status));
+
+			const type = String(res.headers.get('Content-Type') || '')
+				.split(';', 1)[0].trim().toLowerCase();
+			const blob = res.blob();
+			if (type !== 'image/jpeg' || !blob || !blob.size ||
+			    blob.size > CPU_MAX_FRAME_BYTES)
+				throw new Error(_('The router renderer returned an invalid frame.'));
+			return self._installCpuFrame(session, blob);
+		}).then(function () {
+			if (!self._isCurrentCpuSession(session))
+				return;
+			session.errors = 0;
+			session.warned = false;
+			const interval = document.hidden
+				? CPU_HIDDEN_INTERVAL_MS
+				: CPU_FRAME_INTERVAL_MS;
+			self._scheduleCpuFramePoll(
+				session,
+				Math.max(0, interval - (Date.now() - started))
+			);
+		}).catch(function (err) {
+			return self._handleCpuPollFailure(session, err);
+		});
+	},
+
+	_playCpuFrames: function (res, label, generation) {
+		const self = this;
+		const token = String(res.session_token || '');
+		const frameUrl = String(res.stream_url || '');
+
+		if (!/^[0-9a-f]{32}$/.test(token) || !/^\/cgi-bin\/videoplayer-frame\?token=[0-9a-f]{32}$/.test(frameUrl)) {
+			if (/^[0-9a-f]{32}$/.test(token))
+				callStopRenderer(token).catch(function () {});
+			self._currentKind = null;
+			self._currentRenderMode = null;
+			self._currentSrc = null;
+			self._setPlayerSurface('none');
+			self._setNowPlaying(_('The router renderer returned an invalid session.'));
+			notify(null, E('p', {}, _('The router renderer returned an invalid session.')),
+				7000, 'error');
+			return Promise.resolve();
+		}
+
+		self._preparePlaybackSurface();
+		if (generation !== self._playGeneration) {
+			callStopRenderer(token).catch(function () {});
+			return Promise.resolve();
+		}
+
+		const session = {
+			token: token,
+			frameUrl: frameUrl,
+			generation: generation,
+			label: label,
+			active: true,
+			timer: null,
+			sequence: 0,
+			errors: 0,
+			warned: false,
+			startedAt: Date.now(),
+			firstFrameSeen: false,
+			objectUrl: null,
+			nextObjectUrl: null,
+			decoder: null,
+			cancelDecode: null,
+			decodeTimer: null
+		};
+		self._cpuSession = session;
+		self._currentKind = 'local';
+		self._currentRenderMode = 'router';
+		self._currentLabel = label;
+		self._currentSrc = frameUrl;
+		self._setPlayerSurface('cpu');
+		self._setNowPlaying(_('Starting router CPU renderer: %s').format(label));
+		self._scheduleCpuFramePoll(session, 0);
+		return Promise.resolve();
+	},
+
 	_playLocal: function (relPath, name) {
 		const self = this;
 		relPath = String(relPath || '').replace(/^\/+/, '');
+		const useRouter = self._renderMode === 'router' && self._canWriteSettings;
+
+		if (self._localResolvePending) {
+			notify(null, _('Another local video is still being prepared.'), 3000, 'warning');
+			return Promise.resolve();
+		}
 
 		if (!self._localEnabled) {
 			notify(null, E('p', {}, _('Local streamer is disabled')), 5000, 'warning');
@@ -1179,21 +1743,46 @@ return view.extend({
 			notify(null, E('p', {}, _('No file path for playback')), 6000, 'error');
 			return Promise.resolve();
 		}
+		if (useRouter && self._rendererAvailable === false) {
+			notify(null, E('p', {},
+				_('Router CPU rendering is unavailable: %s').format(
+					(self._status && self._status.renderer_reason) ||
+					_('FFmpeg capability check failed'))),
+			7000, 'error');
+			return Promise.resolve();
+		}
+		if (self._renderMode === 'router' && !useRouter) {
+			notify(null,
+				_('Router CPU rendering requires write permission. Using browser decoding for this account.'),
+				5000, 'warning');
+		}
 
 		const label = name || relPath;
 		const generation = ++self._playGeneration;
-		self._clearVideoElement();
+		self._preparePlaybackSurface();
 		self._currentKind = 'local';
+		self._currentRenderMode = useRouter ? 'router' : 'browser';
 		self._currentLabel = label;
 		self._setNowPlaying(_('Preparing local video: %s').format(label));
+		self._localResolvePending = true;
 
-		return callResolve(relPath).then(function (res) {
-			if (generation !== self._playGeneration || !self._canBrowseLocal())
-				return;
+		const prepareLocal = useRouter
+			? callStartRenderer
+			: callResolve;
 
+		return prepareLocal(relPath).then(function (res) {
 			res = res || {};
+			if (generation !== self._playGeneration || !self._canBrowseLocal()) {
+				if (/^[0-9a-f]{32}$/.test(String(res.session_token || '')))
+					callStopRenderer(res.session_token).catch(function () {});
+				return;
+			}
+
 			if (res.error) {
 				self._currentKind = null;
+				self._currentRenderMode = null;
+				self._currentSrc = null;
+				self._setPlayerSurface('none');
 				self._setNowPlaying(_('Unable to prepare local video: %s').format(label));
 				notify(null, E('p', {},
 					_('Unable to resolve local video: %s').format(res.error)),
@@ -1203,22 +1792,33 @@ return view.extend({
 
 			if (!res.stream_url) {
 				self._currentKind = null;
+				self._currentRenderMode = null;
+				self._currentSrc = null;
+				self._setPlayerSurface('none');
 				self._setNowPlaying(_('Unable to prepare local video: %s').format(label));
 				notify(null, E('p', {}, _('The streamer did not return a playback URL.')), 7000, 'error');
 				return;
 			}
 
 			/* stream_url is an opaque, ACL-protected token URL; never rebuild it client-side. */
+			if (normalizeRenderMode(res.render_mode) === 'router' ||
+			    res.stream_type === 'jpeg-frames')
+				return self._playCpuFrames(res, label, generation);
 			return self._playInVideo(res.stream_url, label, generation, 'local');
 		}).catch(function (err) {
 			if (generation !== self._playGeneration)
 				return;
 
 			self._currentKind = null;
+			self._currentRenderMode = null;
+			self._currentSrc = null;
+			self._setPlayerSurface('none');
 			self._setNowPlaying(_('Unable to prepare local video: %s').format(label));
 			notify(null, E('p', {},
 				_('Unable to resolve local video: %s').format(errorText(err))),
 			7000, 'error');
+		}).finally(function () {
+			self._localResolvePending = false;
 		});
 	},
 
@@ -1266,7 +1866,7 @@ return view.extend({
 
 	_handleVideoError: function (ev) {
 		const video = ev && ev.currentTarget;
-		if (!video || !this._currentSrc)
+		if (!video || !this._currentSrc || this._currentRenderMode !== 'browser')
 			return;
 
 		const code = video.error && video.error.code;
@@ -1293,21 +1893,21 @@ return view.extend({
 	},
 
 	_handleVideoEnded: function () {
-		if (!this._currentSrc)
+		if (!this._currentSrc || this._currentRenderMode !== 'browser')
 			return;
 		this._setNowPlaying(_('Playback ended: %s').format(this._currentLabel || this._currentSrc));
 	},
 
 	_handleVideoWaiting: function () {
-		if (!this._currentSrc)
+		if (!this._currentSrc || this._currentRenderMode !== 'browser')
 			return;
 		this._setNowPlaying(_('Buffering: %s').format(this._currentLabel || this._currentSrc));
 	},
 
 	_handleVideoPlaying: function () {
-		if (!this._currentSrc)
+		if (!this._currentSrc || this._currentRenderMode !== 'browser')
 			return;
-		this._setNowPlaying(_('Now playing: %s').format(this._currentLabel || this._currentSrc));
+		this._setNowPlaying(_('Browser playback: %s').format(this._currentLabel || this._currentSrc));
 	},
 
 	_syncMuteControl: function (video, button) {
@@ -1318,6 +1918,7 @@ return view.extend({
 
 		button.textContent = video.muted ? _('Unmute') : _('Mute');
 		button.setAttribute('aria-pressed', video.muted ? 'true' : 'false');
+		button.disabled = this._currentRenderMode === 'router';
 	},
 
 	_handleVolumeChange: function (ev) {

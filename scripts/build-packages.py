@@ -16,6 +16,7 @@ import gzip
 import hashlib
 import io
 import os
+import re
 import stat
 import struct
 import tarfile
@@ -29,22 +30,24 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DEFAULT_DIST = ROOT / "dist"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.0.0"
-PKG_DESC = "HTML5 video player in LuCI for local and remote media"
+PKG_VERSION = "1.1.0"
+PKG_DESC = "LuCI video player with browser and router CPU rendering"
 PKG_LICENSE = "GPL-2.0-or-later"
 PKG_MAINTAINER = "openwrt-video-player contributors"
 PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
 PKG_ARCH_IPK = "all"
 PKG_ARCH_APK = "noarch"
-DEPENDS = ["luci-base", "uhttpd", "jshn", "coreutils-stat"]
+DEPENDS = ["luci-base", "uhttpd", "jshn", "coreutils-stat", "ffmpeg"]
 CONFFILES = ["/etc/config/videoplayer"]
 REQUIRED_PACKAGE_FILES = {
     "etc/config/videoplayer",
     "etc/uci-defaults/80_luci-videoplayer",
     "usr/libexec/rpcd/luci.videoplayer",
+    "usr/libexec/videoplayer-renderer",
     "usr/share/luci/menu.d/luci-app-videoplayer.json",
     "usr/share/rpcd/acl.d/luci-app-videoplayer.json",
     "www/cgi-bin/videoplayer-stream",
+    "www/cgi-bin/videoplayer-frame",
     "www/luci-static/resources/view/videoplayer/main.js",
 }
 
@@ -62,6 +65,68 @@ MAX_BUILT_PACKAGE_BYTES = 32 * 1024 * 1024
 
 class PackageBuildError(RuntimeError):
     """Raised when package construction or verification fails."""
+
+
+def validate_source_metadata() -> None:
+    """Fail early if the OpenWrt and standalone package manifests drift apart."""
+    makefile_path = PKG_DIR / "Makefile"
+    try:
+        makefile = read_source_file(makefile_path, 1024 * 1024).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PackageBuildError(f"Cannot read package Makefile: {exc}") from exc
+
+    version_match = re.search(r"^PKG_VERSION:=(\S+)\s*$", makefile, re.MULTILINE)
+    release_match = re.search(r"^PKG_RELEASE:=(.*)$", makefile, re.MULTILINE)
+    depends_match = re.search(r"^LUCI_DEPENDS:=(.*)$", makefile, re.MULTILINE)
+    if not version_match or not release_match or not depends_match:
+        raise PackageBuildError("Makefile package metadata is incomplete")
+
+    makefile_depends = {
+        token.removeprefix("+")
+        for token in depends_match.group(1).split()
+        if token.startswith("+")
+    }
+    if version_match.group(1) != PKG_VERSION:
+        raise PackageBuildError(
+            f"Makefile version {version_match.group(1)!r} does not match "
+            f"builder version {PKG_VERSION!r}"
+        )
+    if release_match.group(1).strip():
+        raise PackageBuildError("PKG_RELEASE must stay empty for a suffix-free version")
+    if makefile_depends != set(DEPENDS):
+        raise PackageBuildError(
+            "Makefile dependencies do not match the standalone builder: "
+            f"{sorted(makefile_depends)!r} != {sorted(DEPENDS)!r}"
+        )
+
+    try:
+        import verify_packages as verifier
+    except ImportError as exc:
+        raise PackageBuildError(
+            "Cannot import scripts/verify_packages.py"
+        ) from exc
+
+    verifier_values = {
+        "version": (verifier.PKG_VERSION, PKG_VERSION),
+        "IPK architecture": (verifier.PKG_ARCH_IPK, PKG_ARCH_IPK),
+        "APK architecture": (verifier.PKG_ARCH_APK, PKG_ARCH_APK),
+        "license": (verifier.PKG_LICENSE, PKG_LICENSE),
+        "description": (verifier.PKG_DESCRIPTION, PKG_DESC),
+        "maintainer": (verifier.PKG_MAINTAINER, PKG_MAINTAINER),
+        "URL": (verifier.PKG_URL, PKG_URL),
+        "dependencies": (set(verifier.DEPENDENCIES), set(DEPENDS)),
+        "conffiles": (set(verifier.CONFFILES), set(CONFFILES)),
+        "required files": (
+            set(verifier.REQUIRED_PACKAGE_FILES),
+            set(REQUIRED_PACKAGE_FILES),
+        ),
+    }
+    for label, (actual, expected) in verifier_values.items():
+        if actual != expected:
+            raise PackageBuildError(
+                f"Verifier {label} metadata does not match the builder: "
+                f"{actual!r} != {expected!r}"
+            )
 
 
 def read_source_file(path: Path, remaining_payload_bytes: int) -> bytes:
@@ -203,7 +268,12 @@ def collect_files() -> list[tuple[str, Path, int]]:
             ):
                 mode = MODE_EXEC
             # shell scripts without extension
-            if path.name in ("videoplayer-stream", "luci.videoplayer") or "uci-defaults" in install:
+            if path.name in (
+                "videoplayer-stream",
+                "videoplayer-frame",
+                "videoplayer-renderer",
+                "luci.videoplayer",
+            ) or "uci-defaults" in install:
                 mode = MODE_EXEC
 
             files.append((install, path, mode))
@@ -211,7 +281,14 @@ def collect_files() -> list[tuple[str, Path, int]]:
     # Ensure executables
     out: list[tuple[str, Path, int]] = []
     for install, path, mode in files:
-        if install.endswith(("videoplayer-stream", "luci.videoplayer")):
+        if install.endswith(
+            (
+                "videoplayer-stream",
+                "videoplayer-frame",
+                "videoplayer-renderer",
+                "luci.videoplayer",
+            )
+        ):
             mode = MODE_EXEC
         if "/uci-defaults/" in install or install.startswith("etc/uci-defaults/"):
             mode = MODE_EXEC
@@ -252,7 +329,11 @@ export pkgname="{PKG_NAME}"
 add_group_and_user
 default_postinst
 [ -n "${{IPKG_INSTROOT}}" ] || {{
-	chmod 0755 /www/cgi-bin/videoplayer-stream /usr/libexec/rpcd/luci.videoplayer 2>/dev/null || true
+	chmod 0755 \
+		/www/cgi-bin/videoplayer-stream \
+		/www/cgi-bin/videoplayer-frame \
+		/usr/libexec/rpcd/luci.videoplayer \
+		/usr/libexec/videoplayer-renderer 2>/dev/null || true
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 	rm -rf /tmp/luci-modulecache 2>/dev/null || true
 	/etc/init.d/rpcd reload 2>/dev/null || true
@@ -268,6 +349,8 @@ def prerm_script() -> bytes:
 . ${{IPKG_INSTROOT}}/lib/functions.sh
 export root="${{IPKG_INSTROOT}}"
 export pkgname="{PKG_NAME}"
+[ -n "${{IPKG_INSTROOT}}" ] ||
+	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
 default_prerm
 exit 0
 """.encode()
@@ -280,6 +363,7 @@ def postupgrade_script() -> bytes:
 def postrm_script() -> bytes:
     return b"""#!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] || {
+	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
 	cleanup_token_store() (
 		lock_file="/tmp/videoplayer-tokens.lock"
 		token_dir="/tmp/videoplayer-tokens"
@@ -323,6 +407,7 @@ def postrm_script() -> bytes:
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 	rm -rf /tmp/luci-modulecache 2>/dev/null || true
 	cleanup_token_store 2>/dev/null || true
+	rm -f /tmp/videoplayer-render-v1.lock /tmp/videoplayer-render-v1.worker.lock 2>/dev/null || true
 	/etc/init.d/rpcd reload 2>/dev/null || true
 }
 exit 0
@@ -467,8 +552,8 @@ Maintainer: {PKG_MAINTAINER}
 Architecture: {PKG_ARCH_IPK}
 Installed-Size: {installed_size}
 Description:  {PKG_DESC}
- HTML5 video player inside LuCI. Plays local MP4 from router storage
- and remote HTTP(S) media URLs. Architecture-independent.
+ Browser playback and experimental FFmpeg-powered local CPU previews.
+ Remote HTTP(S) URLs always remain client-side. Application files are architecture-independent.
 """.encode()
 
     conffiles = ("\n".join(CONFFILES) + "\n").encode("utf-8")
@@ -934,6 +1019,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    validate_source_metadata()
     output_dir = args.output_dir.resolve()
     ipk_path = output_dir / f"{PKG_NAME}_{PKG_VERSION}_{PKG_ARCH_IPK}.ipk"
     apk_path = output_dir / f"{PKG_NAME}-{PKG_VERSION}.apk"

@@ -22,6 +22,7 @@ ensure_option() {
 ensure_option enabled 1
 ensure_option media_path /mnt/video
 ensure_option allow_remote 1
+ensure_option render_mode browser
 ensure_option max_depth 8
 
 [ "$changed" -eq 0 ] || uci commit videoplayer
@@ -78,13 +79,17 @@ cleanup_token_store() (
 		-exec rm -rf -- '{}' \;
 )
 
-chmod 0755 /www/cgi-bin/videoplayer-stream 2>/dev/null || true
-chmod 0755 /usr/libexec/rpcd/luci.videoplayer 2>/dev/null || true
+chmod 0755 \
+	/www/cgi-bin/videoplayer-stream \
+	/www/cgi-bin/videoplayer-frame \
+	/usr/libexec/rpcd/luci.videoplayer \
+	/usr/libexec/videoplayer-renderer 2>/dev/null || true
 
 # Force LuCI to rebuild its menu index.
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 rm -rf /tmp/luci-modulecache 2>/dev/null || true
 # Revoke tokens from older layouts and start with a bounded token store.
 cleanup_token_store 2>/dev/null || true
+/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
 
 exit 0
