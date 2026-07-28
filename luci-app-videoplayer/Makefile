@@ -71,12 +71,12 @@ define Package/luci-app-videoplayer/postrm
 				rm -f -- "$$marker_tmp"
 				return 1
 			}
-			ln "$$marker_tmp" "$$marker" 2>/dev/null || {
-				[ -f "$$marker" ] && [ ! -L "$$marker" ] || {
+			if ! ln "$$marker_tmp" "$$marker" 2>/dev/null; then
+				if [ ! -f "$$marker" ] || [ -L "$$marker" ]; then
 					rm -f -- "$$marker_tmp"
 					return 1
-				}
-			}
+				fi
+			fi
 			rm -f -- "$$marker_tmp"
 		fi
 		[ -f "$$marker" ] && [ ! -L "$$marker" ] || return 1

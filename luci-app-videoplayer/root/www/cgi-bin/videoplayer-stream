@@ -337,8 +337,9 @@ for pair in "$@"; do
 	esac
 done
 
-[ "$token_count" -eq 1 ] && [ "$invalid_query" -eq 0 ] ||
+if [ "$token_count" -ne 1 ] || [ "$invalid_query" -ne 0 ]; then
 	http_err "400 Bad Request" "Exactly one token parameter is required"
+fi
 valid_token "$token" || http_err "403 Forbidden" "Invalid or expired stream token"
 
 load_token "$token" || http_err "403 Forbidden" "Invalid or expired stream token"

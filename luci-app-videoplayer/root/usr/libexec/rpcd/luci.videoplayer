@@ -358,10 +358,10 @@ ensure_token_dir() {
 		# Publish the marker without replacing an inode another creator may
 		# already be using as the global token-writer lock.
 		if ! ln "$marker_tmp" "$TOKEN_LAYOUT_MARKER" 2>/dev/null; then
-			[ -f "$TOKEN_LAYOUT_MARKER" ] && [ ! -L "$TOKEN_LAYOUT_MARKER" ] || {
+			if [ ! -f "$TOKEN_LAYOUT_MARKER" ] || [ -L "$TOKEN_LAYOUT_MARKER" ]; then
 				rm -f -- "$marker_tmp"
 				return 1
-			}
+			fi
 		fi
 		rm -f -- "$marker_tmp"
 	fi

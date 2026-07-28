@@ -176,10 +176,10 @@ ensure_runtime() {
 			return 1
 		fi
 		if ! ln "$marker_tmp" "$RUNTIME_MARKER" 2>/dev/null; then
-			[ -f "$RUNTIME_MARKER" ] && [ ! -L "$RUNTIME_MARKER" ] || {
+			if [ ! -f "$RUNTIME_MARKER" ] || [ -L "$RUNTIME_MARKER" ]; then
 				rm -f -- "$marker_tmp"
 				return 1
-			}
+			fi
 		fi
 		rm -f -- "$marker_tmp"
 	fi
