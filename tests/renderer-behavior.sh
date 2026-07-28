@@ -46,8 +46,9 @@ terminate_owned_pid() {
 
 	[[ -r "/proc/$pid/cmdline" ]] || return 0
 	cmdline="$(tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-	[[ "$cmdline" == *"$work/"* ]] &&
+	if [[ "$cmdline" == *"$work/"* ]]; then
 		kill -KILL "$pid" 2>/dev/null || true
+	fi
 }
 
 cleanup() {
