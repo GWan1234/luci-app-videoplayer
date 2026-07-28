@@ -26,9 +26,12 @@ WMV/ASF, 3GP/3G2, RealMedia, and raw H.264/H.265 files. Extension matching is
 case-insensitive. MP4 with H.264 video and AAC audio offers the broadest
 client-browser compatibility. Router CPU mode depends on the decoders enabled
 in the installed OpenWrt FFmpeg build, so it may support a different subset.
-Directory entries are sorted on the router in a stable bytewise order and
-returned in pages of 100 entries. A link to the parent directory is available
-on every page.
+When CPU mode is available, the browser lists every regular non-symlink file
+inside the media directory so FFmpeg can probe uncommon containers and files
+without an extension by content. Browser mode keeps the extension allowlist and
+does not stream arbitrary files. Directory entries are sorted on the router in
+a stable bytewise order and returned in pages of 100 entries. A link to the
+parent directory is available on every page.
 
 ```text
 LuCI (main.js)
@@ -47,13 +50,15 @@ UCI videoplayer.main.media_path ── root of the accessible media library
 
 LuCI calls ACL-protected backend methods. Browser resolution and renderer
 status require read permission; starting or stopping the CPU renderer requires
-write permission. Read-only LuCI accounts automatically fall back to browser
-decoding. The backend validates the path and issues a short-lived opaque
-token. The CGI endpoint accepts only this token, never a file path supplied by
-the browser. Tokens are stored in 4,096 fixed bucket slots, preventing their
-count and lookup cost from growing without bound. If a random collision
-selects a slot containing an unexpired token, the backend chooses another slot
-instead of overwriting it.
+write permission. The unrestricted regular-file listing used only by CPU mode
+also requires write permission; the read-only `list` method retains the video
+extension allowlist. Read-only LuCI accounts automatically fall back to browser
+decoding. The backend validates the path and issues a short-lived opaque token.
+The CGI endpoint accepts only this token, never a file path supplied by the
+browser. Tokens are stored in 4,096 fixed bucket slots, preventing their count
+and lookup cost from growing without bound. If a random collision selects a
+slot containing an unexpired token, the backend chooses another slot instead
+of overwriting it.
 
 Router CPU mode has a separate single-session runtime. Only one FFmpeg worker
 may run at a time, and selecting another local video replaces the previous
@@ -364,12 +369,12 @@ permissions, timestamps, the 20-byte SHA-256 prefix in the APK UID, and the
 exact payload contents. The builder also rejects metadata drift against the
 verifier and checks its version, release suffix, and dependencies against the
 OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
-exercises local media discovery against OpenWrt-compatible extension handling,
-exercises successful renderer lifecycle and missing-decoder classification
-with an isolated fake FFmpeg process, and builds and verifies both packages.
-After those checks pass on `main`, a separate job with narrowly scoped
-repository write access rebuilds the APK and updates the generated `snapshot`
-branch. It never uploads files to a router or changes GitHub Releases.
+exercises browser extension filtering and extensionless CPU media discovery,
+exercises successful renderer lifecycle and missing-decoder classification with
+an isolated fake FFmpeg process, and builds and verifies both packages. After
+those checks pass on `main`, a separate job with narrowly scoped repository
+write access rebuilds the APK and updates the generated `snapshot` branch. It
+never uploads files to a router or changes GitHub Releases.
 
 ## Repository Structure
 

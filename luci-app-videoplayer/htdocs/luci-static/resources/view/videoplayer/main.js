@@ -6,7 +6,8 @@
 'require request';
 
 const callStatus  = rpc.declare({ object: 'luci.videoplayer', method: 'get_status' });
-const callList    = rpc.declare({ object: 'luci.videoplayer', method: 'list',    params: [ 'path', 'offset', 'limit' ] });
+const callList    = rpc.declare({ object: 'luci.videoplayer', method: 'list', params: [ 'path', 'offset', 'limit' ] });
+const callRendererList = rpc.declare({ object: 'luci.videoplayer', method: 'list_renderer', params: [ 'path', 'offset', 'limit' ] });
 const callResolve = rpc.declare({ object: 'luci.videoplayer', method: 'resolve', params: [ 'path' ] });
 const callStartRenderer = rpc.declare({ object: 'luci.videoplayer', method: 'start_renderer', params: [ 'path' ] });
 const callRendererStatus = rpc.declare({ object: 'luci.videoplayer', method: 'renderer_status', params: [ 'token' ] });
@@ -1115,6 +1116,12 @@ return view.extend({
 			offset = 0;
 
 		const requestId = ++self._browseRequestId;
+		const listMode = self._renderMode === 'router' &&
+			self._canWriteSettings &&
+			self._rendererAvailable !== false
+				? 'router'
+				: 'browser';
+		const listRequest = listMode === 'router' ? callRendererList : callList;
 		const activeElement = document.activeElement;
 		const restoreFocus = !!opts.focusCwd || !!opts.focusControlId ||
 			!!(activeElement && table.contains(activeElement));
@@ -1131,7 +1138,7 @@ return view.extend({
 		self._updatePageInfo(0, true);
 		self._syncLocalControls();
 
-		return callList(path, offset, PAGE_SIZE).then(function (res) {
+		return listRequest(path, offset, PAGE_SIZE).then(function (res) {
 			if (requestId !== self._browseRequestId)
 				return;
 
@@ -1167,7 +1174,9 @@ return view.extend({
 			const entries = Array.isArray(res.entries) ? res.entries : [];
 			if (!entries.length) {
 				self._appendTableMessage(table,
-					_('No supported video files were found in this directory.'));
+					listMode === 'router'
+						? _('No regular files were found in this directory.')
+						: _('No supported video files were found in this directory.'));
 				if (line)
 					line.textContent = _('Directory loaded: %s').format(self._formatCwdLabel(self._cwd));
 				self._updatePageInfo(0, false);

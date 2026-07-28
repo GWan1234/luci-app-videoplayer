@@ -15,9 +15,11 @@ assert_eq() {
 repo_root="$(readlink -f -- "${1:-$PWD}")"
 rpc_backend="$repo_root/luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer"
 stream_backend="$repo_root/luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream"
+acl_file="$repo_root/luci-app-videoplayer/root/usr/share/rpcd/acl.d/luci-app-videoplayer.json"
 
 [[ -f "$rpc_backend" ]] || fail "rpc backend not found"
 [[ -f "$stream_backend" ]] || fail "stream backend not found"
+[[ -f "$acl_file" ]] || fail "rpc ACL not found"
 
 work="$(mktemp -d /tmp/videoplayer-listing-ci.XXXXXX)"
 
@@ -36,6 +38,19 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+python3 - "$acl_file" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+acl = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+grant = acl["luci-app-videoplayer"]
+read_methods = grant["read"]["ubus"]["luci.videoplayer"]
+write_methods = grant["write"]["ubus"]["luci.videoplayer"]
+assert "list_renderer" not in read_methods, read_methods
+assert "list_renderer" in write_methods, write_methods
+PY
 
 uppercase=ABCDEFGHIJKLMNOPQRSTUVWXYZ
 lowercase=abcdefghijklmnopqrstuvwxyz
@@ -171,6 +186,41 @@ do
 		fail "unexpected listing entry: $rejected"
 done
 
+# Consumed by list_file_is_visible from the sourced rpcd backend.
+# shellcheck disable=SC2034
+LIST_ALLOW_ANY_FILE=1
+declare -A cpu_seen=()
+cpu_record_count=0
+while IFS= read -r -d '' record; do
+	[[ "$record" == [12]* ]] || fail "unexpected CPU listing record prefix"
+	full="${record:1}"
+	cpu_seen["${record:0:1}:${full##*/}"]=1
+	cpu_record_count=$((cpu_record_count + 1))
+done < <(stream_sorted_children "$media" 1)
+unset LIST_ALLOW_ANY_FILE
+
+assert_eq "$cpu_record_count" "8" "CPU directory entry count"
+for expected in \
+	"1:Sub Folder" \
+	"2:.hidden.webm" \
+	"2:My Film.MkV" \
+	"2:UPPER.MP4" \
+	"2:clip.3GP" \
+	"2:movie.mp4" \
+	"2:no-extension" \
+	"2:notes.txt"
+do
+	[[ -n "${cpu_seen[$expected]:-}" ]] ||
+		fail "missing CPU listing entry: $expected"
+done
+for rejected in \
+	"2:in-root-link.mp4" \
+	"2:out-of-root-link.mp4"
+do
+	[[ -z "${cpu_seen[$rejected]:-}" ]] ||
+		fail "unexpected CPU listing entry: $rejected"
+done
+
 renderer_stub="$work/videoplayer-renderer"
 cat > "$renderer_stub" <<'SH'
 #!/bin/sh
@@ -183,10 +233,11 @@ chmod 0755 "$renderer_stub"
 # CPU sessions. Conversely, browser mode must not use the renderer namespace.
 # shellcheck disable=SC2034
 RENDERER_HELPER="$renderer_stub"
+test_request_path="no-extension"
 parse_request() {
 	# Consumed by cmd_resolve from the sourced rpcd backend.
 	# shellcheck disable=SC2034
-	REQ_PATH="movie.mp4"
+	REQ_PATH="$test_request_path"
 	return 0
 }
 get_enabled() {
@@ -199,10 +250,10 @@ get_media_root() {
 	printf '%s\n' "$media"
 }
 resolve_under_root() {
-	printf '%s\n' "$media/movie.mp4"
+	printf '%s/%s\n' "$media" "$2"
 }
 relative_from_root() {
-	printf 'movie.mp4\n'
+	printf '%s\n' "${2#"$1"/}"
 }
 path_depth() {
 	printf '0\n'
@@ -237,13 +288,13 @@ json_error() {
 stream_token_marker="$work/stream-token-created"
 renderer_token_marker="$work/renderer-token-created"
 # Invoked indirectly by cmd_resolve from the sourced rpcd backend.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 create_token() {
 	: > "$stream_token_marker"
 	return 1
 }
 # Invoked indirectly by cmd_resolve from the sourced rpcd backend.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 generate_random_token() {
 	: > "$renderer_token_marker"
 	printf '22222222222222222222222222222222\n'
@@ -254,14 +305,15 @@ cmd_resolve '{}' router >/dev/null
 [[ -e "$renderer_token_marker" ]] ||
 	fail "router mode did not allocate a renderer token"
 
+test_request_path="movie.mp4"
 # Invoked indirectly by cmd_resolve from the sourced rpcd backend.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 create_token() {
 	: > "$stream_token_marker"
 	printf '33333333333333333333333333333333\n'
 }
 # Invoked indirectly by cmd_resolve from the sourced rpcd backend.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 generate_random_token() {
 	: > "$renderer_token_marker"
 	return 1
