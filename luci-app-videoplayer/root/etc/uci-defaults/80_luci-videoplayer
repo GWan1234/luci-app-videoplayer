@@ -1,0 +1,90 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Restore missing defaults without replacing an existing section or option.
+changed=0
+
+if ! uci -q get videoplayer.main >/dev/null 2>&1; then
+	uci set videoplayer.main='videoplayer'
+	changed=1
+fi
+
+ensure_option() {
+	local option="$1"
+	local value="$2"
+
+	if ! uci -q get "videoplayer.main.$option" >/dev/null 2>&1; then
+		uci set "videoplayer.main.$option=$value"
+		changed=1
+	fi
+}
+
+ensure_option enabled 1
+ensure_option media_path /mnt/video
+ensure_option allow_remote 1
+ensure_option max_depth 8
+
+[ "$changed" -eq 0 ] || uci commit videoplayer
+
+cleanup_token_store() (
+	lock_file="/tmp/videoplayer-tokens.lock"
+	token_dir="/tmp/videoplayer-tokens"
+	marker="$token_dir/.bucket-v1"
+
+	if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+		(
+			umask 077
+			set -C
+			: > "$lock_file"
+		) 2>/dev/null || :
+	fi
+	[ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+	[ "$(stat -c '%u' -- "$lock_file" 2>/dev/null)" = "0" ] || return 1
+	[ "$(readlink -f -- "$lock_file" 2>/dev/null)" = "$lock_file" ] || return 1
+	chmod 0600 "$lock_file" 2>/dev/null || return 1
+
+	exec 9< "$lock_file" || return 1
+	flock -x 9 || return 1
+
+	# Coordinate once with the immediately preceding bucket-v1 allocator,
+	# which used the marker inode itself as its writer lock.
+	if [ ! -e "$token_dir" ] && [ ! -L "$token_dir" ]; then
+		(umask 077; mkdir "$token_dir") || return 1
+	fi
+	[ -d "$token_dir" ] && [ ! -L "$token_dir" ] || return 1
+	[ "$(stat -c '%u' -- "$token_dir" 2>/dev/null)" = "0" ] || return 1
+	[ "$(readlink -f -- "$token_dir" 2>/dev/null)" = "$token_dir" ] || return 1
+	chmod 0700 "$token_dir" 2>/dev/null || return 1
+
+	if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+		marker_tmp="$token_dir/.cleanup-marker.$$"
+		rm -f -- "$marker_tmp" || return 1
+		(umask 077; set -C; printf 'bucket-v1\n' > "$marker_tmp") 2>/dev/null || {
+			rm -f -- "$marker_tmp"
+			return 1
+		}
+		ln "$marker_tmp" "$marker" 2>/dev/null || {
+			[ -f "$marker" ] && [ ! -L "$marker" ] || {
+				rm -f -- "$marker_tmp"
+				return 1
+			}
+		}
+		rm -f -- "$marker_tmp"
+	fi
+	[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+	exec 8< "$marker" || return 1
+	flock -x 8 || return 1
+	find "$token_dir" -mindepth 1 -maxdepth 1 ! -name '.bucket-v1' \
+		-exec rm -rf -- '{}' \;
+)
+
+chmod 0755 /www/cgi-bin/videoplayer-stream 2>/dev/null || true
+chmod 0755 /usr/libexec/rpcd/luci.videoplayer 2>/dev/null || true
+
+# Force LuCI to rebuild its menu index.
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
+rm -rf /tmp/luci-modulecache 2>/dev/null || true
+# Revoke tokens from older layouts and start with a bounded token store.
+cleanup_token_store 2>/dev/null || true
+
+exit 0

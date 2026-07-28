@@ -1,0 +1,9 @@
+config videoplayer 'main'
+	option enabled '1'
+	# Existing directory that contains media files. It is not created automatically.
+	# Use mounted USB/SD storage; copying video to an unmounted /mnt path fills overlay.
+	option media_path '/mnt/video'
+	# Allow playback of remote HTTP(S) URLs in the browser player
+	option allow_remote '1'
+	# Max depth when browsing local folders
+	option max_depth '8'

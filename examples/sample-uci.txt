@@ -1,0 +1,8 @@
+# Example /etc/config/videoplayer after install
+
+config videoplayer 'main'
+	option enabled '1'
+	# USB stick mounted at /mnt/sda1:
+	option media_path '/mnt/sda1/videos'
+	option allow_remote '1'
+	option max_depth '8'

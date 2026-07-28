@@ -1,0 +1,58 @@
+name: Package checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check source syntax
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          for path in (
+              Path("scripts/build-packages.py"),
+              Path("scripts/verify_packages.py"),
+          ):
+              compile(path.read_text(encoding="utf-8"), str(path), "exec")
+
+          for path in Path("luci-app-videoplayer").rglob("*.json"):
+              json.loads(path.read_text(encoding="utf-8"))
+          PY
+          sh -n scripts/install-to-router.sh
+          sh -n luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer
+          sh -n luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer
+          sh -n luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream
+          {
+            printf '%s\n' '(function () {'
+            cat luci-app-videoplayer/htdocs/luci-static/resources/view/videoplayer/main.js
+            printf '%s\n' '})();'
+          } > /tmp/videoplayer-main-wrapped.js
+          node --check /tmp/videoplayer-main-wrapped.js
+
+      - name: Build, verify, and compare reproducible outputs
+        env:
+          SOURCE_DATE_EPOCH: "1767225600"
+        run: python scripts/build-packages.py --check-reproducible
+
+      - name: Verify existing outputs through the standalone CLI
+        run: python scripts/build-packages.py --verify-only

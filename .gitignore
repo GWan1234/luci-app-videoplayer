@@ -1,0 +1,16 @@
+*.o
+*.so
+*.swp
+*~
+.DS_Store
+tmp/
+build/
+bin/
+.staging/
+tmp_sample*
+__pycache__/
+.ruff_cache/
+# Package artifacts are generated locally and should be attached to releases,
+# not committed from routine builds.
+dist/*.apk
+dist/*.ipk

@@ -1,0 +1,18 @@
+{
+	"luci-app-videoplayer": {
+		"description": "Grant access to LuCI Video Player (Services → Video Player)",
+		"read": {
+			"ubus": {
+				"luci.videoplayer": [ "get_status", "list", "resolve" ],
+				"uci": [ "get", "changes", "configs" ]
+			},
+			"uci": [ "videoplayer" ]
+		},
+		"write": {
+			"ubus": {
+				"uci": [ "set", "add", "delete", "rename", "order", "apply", "confirm", "rollback" ]
+			},
+			"uci": [ "videoplayer" ]
+		}
+	}
+}

@@ -1,0 +1,264 @@
+# luci-app-videoplayer
+
+A playful but functional video player for **OpenWrt**, integrated into **LuCI**.
+Videos are played by the client browser through the HTML5 `<video>` element;
+the router only lists the media library and serves files over HTTP. It does not
+use HDMI, a framebuffer, or video decoding on the router itself.
+
+Current package version: **1.0.0**.
+
+## Features
+
+| Mode | How it works |
+|---|---|
+| Local files | Browse a directory on a USB drive, SD card, or other storage device and stream files with HTTP Range support |
+| Remote URLs | Play `http://` and `https://` URLs directly when the browser can load the resource |
+| Interface | **Services → Video Player** page in LuCI |
+
+The local browser lists `mp4`, `webm`, `ogg`, `ogv`, `m4v`, and `mov` files.
+MP4 with H.264 video and AAC audio offers the broadest browser compatibility.
+Directory entries are sorted on the router in a stable bytewise order and
+returned in pages of 100 entries. A link to the parent directory is available
+on every page.
+
+```text
+LuCI (main.js)
+    │ ubus/rpcd
+    ▼
+luci.videoplayer ── authenticated list / resolve / get_status
+    │
+    ▼
+/cgi-bin/videoplayer-stream?token=… ── HTTP Range (206)
+    │
+    ▼
+UCI videoplayer.main.media_path ── root of the accessible media library
+```
+
+LuCI calls the ACL-protected `resolve` method. The backend validates the path
+and issues a short-lived opaque token. The CGI endpoint accepts only this
+token, never a file path supplied by the browser. Tokens are stored in 4,096
+fixed bucket slots, preventing their count and lookup cost from growing without
+bound. If a random collision selects a slot containing an unexpired token, the
+backend chooses another slot instead of overwriting it.
+
+## Requirements
+
+The package directly depends on `luci-base`, `uhttpd`, `jshn`, and
+`coreutils-stat`. It contains no CPU-specific binaries: the package
+architecture is `all` for IPK and `noarch` for APK. It also uses standard
+OpenWrt BusyBox commands, including `sort -z` and `flock`.
+
+## Preparing the Storage
+
+The application deliberately **does not create `/mnt/video` automatically**.
+First connect a USB drive or SD card, create the mount point, and confirm that
+the storage device is actually mounted:
+
+```sh
+mkdir -p /mnt/video
+mount /dev/sda1 /mnt/video       # Example; the device and filesystem may differ
+mount | grep ' /mnt/video '
+df -h /mnt/video
+```
+
+Copy videos there only after these checks succeed. If the storage device is not
+mounted, writing to `/mnt/video` will use the router's internal overlay and may
+quickly exhaust its flash storage.
+
+To use a different path:
+
+```sh
+uci set videoplayer.main.media_path='/path/to/media'
+uci commit videoplayer
+/etc/init.d/rpcd reload
+```
+
+## Building and Verifying Packages Locally
+
+Python 3.10 or newer is sufficient for rapid local development:
+
+```sh
+python scripts/build-packages.py --check-reproducible
+python scripts/build-packages.py --verify-only
+```
+
+The builder uses `SOURCE_DATE_EPOCH` (default: `0`), so identical sources
+produce byte-for-byte identical packages. Example with an explicit timestamp:
+
+```sh
+SOURCE_DATE_EPOCH=1767225600 python scripts/build-packages.py --check-reproducible
+```
+
+In PowerShell:
+
+```powershell
+$env:SOURCE_DATE_EPOCH = '1767225600'
+python scripts/build-packages.py --check-reproducible
+```
+
+The resulting files are written to `dist/`:
+
+| File | Package manager | OpenWrt |
+|---|---|---|
+| `luci-app-videoplayer-1.0.0.apk` | `apk` | 25.12+ / snapshots |
+| `luci-app-videoplayer_1.0.0_all.ipk` | `opkg` | 24.10 and compatible releases that use `opkg` |
+
+The IPK uses the gzip-compressed GNU tar format expected by OpenWrt 24.10.
+`Installed-Size` is calculated in the same way as by the standard
+`ipkg-build` script: from the size of the uncompressed `data.tar`.
+
+The locally built APK is unsigned, and its minimal built-in builder is intended
+for development and testing. For a public package repository, use the official
+OpenWrt SDK/Buildroot and its standard `apk mkpkg` tool. It creates and signs a
+package in the format expected by the selected OpenWrt release.
+
+## Installing a Prebuilt Local Package
+
+OpenWrt 25.12+:
+
+```sh
+scp -O dist/luci-app-videoplayer-1.0.0.apk root@192.168.1.1:/tmp/
+ssh root@192.168.1.1
+apk add --allow-untrusted /tmp/luci-app-videoplayer-1.0.0.apk
+```
+
+OpenWrt 24.10 (`opkg`):
+
+```sh
+scp -O dist/luci-app-videoplayer_1.0.0_all.ipk root@192.168.1.1:/tmp/
+ssh root@192.168.1.1
+opkg install /tmp/luci-app-videoplayer_1.0.0_all.ipk
+```
+
+If your `scp` implementation does not support `-O`, omit that option. After
+installation, sign out of LuCI and sign in again if the new menu item does not
+appear.
+
+Package managers may consider an older build with a release suffix newer than
+this suffix-free `1.0.0` build. When replacing such an installation, explicitly
+allow a downgrade or remove the old package before installing this one.
+
+Direct URL:
+`http://<router-ip>/cgi-bin/luci/admin/services/videoplayer`.
+
+## Building in the Official OpenWrt Tree
+
+```sh
+cp -a luci-app-videoplayer feeds/luci/applications/
+./scripts/feeds install luci-app-videoplayer
+make menuconfig
+make package/luci-app-videoplayer/compile V=s
+```
+
+The package is listed under **LuCI → Applications**. Before publishing it,
+specify the canonical project URL and maintainer contact in
+`luci-app-videoplayer/Makefile`; it currently contains deliberately neutral
+local values.
+
+## Manual Installation over SSH for Development
+
+```sh
+chmod +x scripts/install-to-router.sh
+./scripts/install-to-router.sh root@192.168.1.1
+```
+
+The script first uploads files to a temporary directory and then replaces the
+installed files atomically. An existing `/etc/config/videoplayer` is preserved;
+missing UCI options are added separately. The script tries `scp -O` first and
+then falls back to regular `scp`.
+
+To remove only the program files installed manually:
+
+```sh
+./scripts/install-to-router.sh --uninstall root@192.168.1.1
+```
+
+The configuration and media library are preserved.
+
+## UCI Configuration
+
+Contents of `/etc/config/videoplayer`:
+
+```text
+config videoplayer 'main'
+	option enabled '1'
+	option media_path '/mnt/video'
+	option allow_remote '1'
+	option max_depth '8'
+```
+
+| Option | Description |
+|---|---|
+| `enabled` | Enable or disable the streamer |
+| `media_path` | Root directory of the local media library |
+| `allow_remote` | Show the remote URL field in the interface |
+| `max_depth` | Maximum traversal depth for nested directories |
+
+The `uci-defaults` script is idempotent: it restores a missing section and adds
+only missing options without overwriting user-defined values.
+`/etc/config/videoplayer` is declared as a conffile, so the package manager
+treats it as user configuration during upgrades.
+
+## Removing the Package
+
+```sh
+# OpenWrt with apk
+apk del luci-app-videoplayer
+
+# OpenWrt with opkg
+opkg remove luci-app-videoplayer
+```
+
+The post-removal script clears only LuCI caches and reloads rpcd. Videos are
+never deleted. How the configuration file is handled during removal depends on
+the package manager and whether the file has been modified.
+
+## Limitations and Security
+
+- This is a web interface, not a hardware HDMI player.
+- Codec support depends on the client browser.
+- The remote server must allow the browser to load the resource. CORS is
+  required when the server or page policy enforces a CORS check; convenient
+  seeking also requires HTTP Range support.
+- Do not store sensitive files inside `media_path`.
+- To protect memory on resource-constrained routers, each directory is limited
+  to 5,000 entries and 1 MiB of combined path data. Split larger libraries into
+  subdirectories.
+- Access LuCI only from a trusted LAN or through a VPN. Do not expose it
+  directly to the internet.
+- Transferring large files over Wi-Fi may be slow on a low-powered SoC.
+
+## Verification
+
+`scripts/verify_packages.py` parses IPK and APK files without relying on
+`assert` and validates metadata, dependencies, conffiles, lifecycle scripts,
+permissions, timestamps, the 20-byte SHA-256 prefix in the APK UID, and the
+exact payload contents. The CI workflow only builds and verifies packages; it
+does not publish anything or upload files to a router.
+
+## Repository Structure
+
+```text
+openwrt-video-player/
+├── .github/workflows/package-check.yml
+├── README.md
+├── LICENSE
+├── scripts/
+│   ├── build-packages.py
+│   ├── verify_packages.py
+│   └── install-to-router.sh
+└── luci-app-videoplayer/
+    ├── Makefile
+    ├── htdocs/luci-static/resources/view/videoplayer/main.js
+    └── root/
+        ├── etc/config/videoplayer
+        ├── etc/uci-defaults/80_luci-videoplayer
+        ├── usr/libexec/rpcd/luci.videoplayer
+        ├── usr/share/luci/menu.d/…
+        ├── usr/share/rpcd/acl.d/…
+        └── www/cgi-bin/videoplayer-stream
+```
+
+## License
+
+[GPL-2.0-or-later](LICENSE).

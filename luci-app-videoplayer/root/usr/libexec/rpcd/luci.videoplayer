@@ -1,0 +1,918 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# shellcheck shell=busybox
+# OpenWrt runs this with BusyBox ash, whose read supports NUL delimiters.
+# shellcheck disable=SC3045
+#
+# ubus/rpcd backend for luci-app-videoplayer
+# Methods: get_status, list, resolve
+
+. /usr/share/libubox/jshn.sh
+
+export LC_ALL=C
+
+VIDEO_EXTS="mp4 webm ogg ogv m4v mov"
+TOKEN_DIR="/tmp/videoplayer-tokens"
+TOKEN_LOCK_FILE="/tmp/videoplayer-tokens.lock"
+TOKEN_LAYOUT_MARKER="$TOKEN_DIR/.bucket-v1"
+TOKEN_BUCKET_HEX=3
+TOKEN_TTL=21600
+TOKEN_CREATE_ATTEMPTS=128
+TOKEN_LOCK_ATTEMPTS=5
+DEFAULT_MAX_DEPTH=8
+MAX_MAX_DEPTH=64
+DEFAULT_LIST_LIMIT=100
+MAX_LIST_LIMIT=200
+MAX_LIST_OFFSET=5000
+MAX_SORT_ENTRIES=5000
+MAX_SORT_BYTES=1048576
+MAX_PATH_LENGTH=4096
+MAX_REQUEST_BYTES=16384
+
+string_has_control() {
+	printf '%s' "$1" | grep -q '[[:cntrl:]]'
+}
+
+path_has_dotdot_component() {
+	case "$1" in
+		../*|*/../*|*/..) return 0 ;;
+	esac
+	return 1
+}
+
+normalize_decimal() {
+	local value="$1"
+
+	case "$value" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
+		value="${value#0}"
+	done
+
+	printf '%s\n' "$value"
+}
+
+validate_relative_path() {
+	local rel="$1" rest part
+
+	[ "${#rel}" -le "$MAX_PATH_LENGTH" ] || return 1
+	string_has_control "$rel" && return 1
+
+	case "$rel" in
+		/*) return 1 ;;
+	esac
+
+	rest="$rel"
+	while :; do
+		part="${rest%%/*}"
+		[ "$part" != ".." ] || return 1
+		[ "$rest" != "$part" ] || break
+		rest="${rest#*/}"
+	done
+
+	return 0
+}
+
+get_configured_media_path() {
+	local path
+
+	path="$(uci -q get videoplayer.main.media_path 2>/dev/null)" || path=""
+	[ -n "$path" ] || path="/mnt/video"
+	printf '%s\n' "$path"
+}
+
+canonicalize_media_root() {
+	local configured="$1" root
+
+	[ -n "$configured" ] || return 1
+	[ "${#configured}" -le "$MAX_PATH_LENGTH" ] || return 1
+	string_has_control "$configured" && return 1
+
+	case "$configured" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	path_has_dotdot_component "$configured" && return 1
+
+	[ -d "$configured" ] || return 1
+	root="$(readlink -f -- "$configured" 2>/dev/null)" || return 1
+	[ -n "$root" ] && [ -d "$root" ] || return 1
+	string_has_control "$root" && return 1
+
+	# Exposing the entire router filesystem is never a valid media sandbox.
+	[ "$root" != "/" ] || return 1
+
+	printf '%s\n' "$root"
+}
+
+get_media_root() {
+	local configured
+
+	configured="$(get_configured_media_path)"
+	canonicalize_media_root "$configured"
+}
+
+path_is_within_root() {
+	local root="$1" path="$2"
+
+	case "$path" in
+		"$root"|"$root"/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+resolve_under_root() {
+	local root="$1" rel="$2" candidate resolved
+
+	validate_relative_path "$rel" || return 1
+
+	if [ -n "$rel" ]; then
+		candidate="$root/$rel"
+	else
+		candidate="$root"
+	fi
+
+	[ -e "$candidate" ] || return 1
+	resolved="$(readlink -f -- "$candidate" 2>/dev/null)" || return 1
+	[ -n "$resolved" ] && [ -e "$resolved" ] || return 1
+	string_has_control "$resolved" && return 1
+	path_is_within_root "$root" "$resolved" || return 1
+
+	printf '%s\n' "$resolved"
+}
+
+relative_from_root() {
+	local root="$1" path="$2"
+
+	if [ "$path" = "$root" ]; then
+		printf '\n'
+	else
+		printf '%s\n' "${path#"$root"/}"
+	fi
+}
+
+path_depth() {
+	local rest="$1" part depth=0
+
+	rest="${rest#/}"
+	while [ -n "$rest" ]; do
+		part="${rest%%/*}"
+		if [ -n "$part" ] && [ "$part" != "." ]; then
+			depth=$((depth + 1))
+		fi
+		[ "$rest" != "$part" ] || break
+		rest="${rest#*/}"
+	done
+
+	printf '%s\n' "$depth"
+}
+
+get_max_depth() {
+	local value
+
+	value="$(uci -q get videoplayer.main.max_depth 2>/dev/null)" || value=""
+	[ -n "$value" ] || value="$DEFAULT_MAX_DEPTH"
+	value="$(normalize_decimal "$value")" || value="$DEFAULT_MAX_DEPTH"
+
+	if [ "${#value}" -gt 2 ] || [ "$value" -gt "$MAX_MAX_DEPTH" ]; then
+		value="$MAX_MAX_DEPTH"
+	fi
+
+	printf '%s\n' "$value"
+}
+
+get_enabled() {
+	local value
+
+	value="$(uci -q get videoplayer.main.enabled 2>/dev/null)" || value=""
+	[ -n "$value" ] || value="1"
+
+	case "$value" in
+		1) printf '1\n' ;;
+		*) printf '0\n' ;;
+	esac
+}
+
+is_allowed_ext() {
+	local name="$1" base ext
+
+	base="${name##*/}"
+	case "$base" in
+		*.*) ;;
+		*) return 1 ;;
+	esac
+	ext="$(printf '%s' "${base##*.}" | tr 'A-Z' 'a-z')"
+	case " $VIDEO_EXTS " in
+		*" $ext "*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+mime_for() {
+	local name="$1" base ext
+
+	base="${name##*/}"
+	ext="$(printf '%s' "${base##*.}" | tr 'A-Z' 'a-z')"
+	case "$ext" in
+		webm) printf 'video/webm\n' ;;
+		ogg|ogv) printf 'video/ogg\n' ;;
+		mov) printf 'video/quicktime\n' ;;
+		*) printf 'video/mp4\n' ;;
+	esac
+}
+
+# Open once, verify the opened descriptor still names the expected canonical
+# in-root file, then obtain metadata through /proc/self/fd to avoid a symlink
+# swap between validation and stat(1).
+get_file_metadata() {
+	local expected="$1" root="$2" opened metadata size
+
+	FILE_SIZE=""
+	FILE_MTIME=""
+
+	exec 9< "$expected" || return 1
+	opened="$(readlink -f -- /proc/self/fd/9 2>/dev/null)" || {
+		exec 9<&-
+		return 1
+	}
+
+	if [ "$opened" != "$expected" ] || ! path_is_within_root "$root" "$opened"; then
+		exec 9<&-
+		return 1
+	fi
+
+	metadata="$(stat -L -c '%F:%s' -- /proc/self/fd/9 2>/dev/null)" || {
+		exec 9<&-
+		return 1
+	}
+	case "$metadata" in
+		"regular file:"*) size="${metadata#regular file:}" ;;
+		*)
+			exec 9<&-
+			return 1
+			;;
+	esac
+	case "$size" in
+		''|*[!0-9]*)
+			exec 9<&-
+			return 1
+			;;
+	esac
+	[ "${#size}" -le 18 ] || {
+		exec 9<&-
+		return 1
+	}
+
+	FILE_SIZE="$size"
+	FILE_MTIME="$(date -r /proc/self/fd/9 '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+	exec 9<&-
+	return 0
+}
+
+valid_token() {
+	local token="$1"
+
+	[ "${#token}" -eq 32 ] || return 1
+	case "$token" in
+		*[!0-9a-f]*) return 1 ;;
+	esac
+	return 0
+}
+
+ensure_token_lock() {
+	local canonical metadata owner
+
+	if [ ! -e "$TOKEN_LOCK_FILE" ] && [ ! -L "$TOKEN_LOCK_FILE" ]; then
+		(
+			umask 077
+			set -C
+			: > "$TOKEN_LOCK_FILE"
+		) 2>/dev/null || :
+	fi
+
+	[ -f "$TOKEN_LOCK_FILE" ] && [ ! -L "$TOKEN_LOCK_FILE" ] || return 1
+	owner="$(stat -c '%u' -- "$TOKEN_LOCK_FILE" 2>/dev/null)" || return 1
+	[ "$owner" = "0" ] || return 1
+	canonical="$(readlink -f -- "$TOKEN_LOCK_FILE" 2>/dev/null)" || return 1
+	[ "$canonical" = "$TOKEN_LOCK_FILE" ] || return 1
+	chmod 0600 "$TOKEN_LOCK_FILE" 2>/dev/null || return 1
+	metadata="$(stat -c '%u:%a' -- "$TOKEN_LOCK_FILE" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:600" ] || return 1
+	return 0
+}
+
+ensure_token_dir() {
+	local canonical metadata owner layout marker_tmp
+
+	if [ -e "$TOKEN_DIR" ] || [ -L "$TOKEN_DIR" ]; then
+		[ -d "$TOKEN_DIR" ] && [ ! -L "$TOKEN_DIR" ] || return 1
+		owner="$(stat -c '%u' -- "$TOKEN_DIR" 2>/dev/null)" || return 1
+		[ "$owner" = "0" ] || return 1
+	else
+		(umask 077 && mkdir -p -- "$TOKEN_DIR") || return 1
+	fi
+
+	canonical="$(readlink -f -- "$TOKEN_DIR" 2>/dev/null)" || return 1
+	[ "$canonical" = "$TOKEN_DIR" ] || return 1
+	chmod 0700 "$TOKEN_DIR" 2>/dev/null || return 1
+	metadata="$(stat -c '%u:%a' -- "$TOKEN_DIR" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:700" ] || return 1
+
+	if [ ! -e "$TOKEN_LAYOUT_MARKER" ] && [ ! -L "$TOKEN_LAYOUT_MARKER" ]; then
+		# A package upgrade normally removes the old directory in uci-defaults.
+		# For hot code replacement, discard legacy 32-hex token files once.
+		find "$TOKEN_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null |
+		(
+			while IFS= read -r -d '' legacy_file; do
+				legacy_name="${legacy_file##*/}"
+				valid_token "$legacy_name" || continue
+				rm -f -- "$legacy_file"
+			done
+		)
+
+		marker_tmp="$TOKEN_DIR/.bucket-v1.$$"
+		rm -f -- "$marker_tmp" || return 1
+		if ! (
+			umask 077
+			set -C
+			printf 'bucket-v1\n' > "$marker_tmp"
+		) 2>/dev/null; then
+			rm -f -- "$marker_tmp"
+			return 1
+		fi
+
+		# Publish the marker without replacing an inode another creator may
+		# already be using as the global token-writer lock.
+		if ! ln "$marker_tmp" "$TOKEN_LAYOUT_MARKER" 2>/dev/null; then
+			[ -f "$TOKEN_LAYOUT_MARKER" ] && [ ! -L "$TOKEN_LAYOUT_MARKER" ] || {
+				rm -f -- "$marker_tmp"
+				return 1
+			}
+		fi
+		rm -f -- "$marker_tmp"
+	fi
+
+	[ -f "$TOKEN_LAYOUT_MARKER" ] && [ ! -L "$TOKEN_LAYOUT_MARKER" ] || return 1
+	IFS= read -r layout < "$TOKEN_LAYOUT_MARKER" || return 1
+	[ "$layout" = "bucket-v1" ] || return 1
+	return 0
+}
+
+bucket_has_active_token() {
+	local token_file="$1" bucket="$2" now="$3"
+	local stored_token stored_expiry stored_path extra stored_bucket
+
+	[ -f "$token_file" ] && [ ! -L "$token_file" ] || return 1
+	exec 7< "$token_file" || return 1
+	IFS= read -r stored_token <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_expiry <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_path <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+
+	valid_token "$stored_token" || return 1
+	stored_bucket="$(printf '%.3s' "$stored_token")"
+	[ "$stored_bucket" = "$bucket" ] || return 1
+	case "$stored_expiry" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "${#stored_expiry}" -le 12 ] || return 1
+	[ "$stored_expiry" -gt "$now" ] || return 1
+	[ -n "$stored_path" ] && [ "${#stored_path}" -le "$MAX_PATH_LENGTH" ] || return 1
+	string_has_control "$stored_path" && return 1
+	case "$stored_path" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	return 0
+}
+
+create_token() {
+	local canonical_path="$1"
+
+	string_has_control "$canonical_path" && return 1
+	ensure_token_lock || return 1
+
+	(
+		local now expiry token bucket token_file
+		local token_tmp="$TOKEN_DIR/.new" attempts=0 lock_attempts=0
+
+		# The lock lives outside TOKEN_DIR so package upgrades cannot replace
+		# its inode while an older rpcd worker still holds it.
+		exec 8< "$TOKEN_LOCK_FILE" || exit 1
+		while ! flock -x -n 8; do
+			lock_attempts=$((lock_attempts + 1))
+			[ "$lock_attempts" -lt "$TOKEN_LOCK_ATTEMPTS" ] || exit 1
+			sleep 1
+		done
+		ensure_token_dir || exit 1
+
+		# Keep taking the bucket-v1 marker lock as well. This lets an upgrade
+		# drain workers from the previous layout without ever replacing the
+		# directory or marker inode under a waiting process.
+		exec 6< "$TOKEN_LAYOUT_MARKER" || exit 1
+		lock_attempts=0
+		while ! flock -x -n 6; do
+			lock_attempts=$((lock_attempts + 1))
+			[ "$lock_attempts" -lt "$TOKEN_LOCK_ATTEMPTS" ] || exit 1
+			sleep 1
+		done
+
+		now="$(date +%s 2>/dev/null)" || exit 1
+		case "$now" in
+			''|*[!0-9]*) exit 1 ;;
+		esac
+		[ "${#now}" -le 12 ] || exit 1
+		expiry=$((now + TOKEN_TTL))
+
+		rm -f -- "$token_tmp" || exit 1
+		while [ "$attempts" -lt "$TOKEN_CREATE_ATTEMPTS" ]; do
+			attempts=$((attempts + 1))
+			token="$(hexdump -v -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)" ||
+				exit 1
+			valid_token "$token" || continue
+			bucket="$(printf '%.3s' "$token")"
+			[ "${#bucket}" -eq "$TOKEN_BUCKET_HEX" ] || continue
+			token_file="$TOKEN_DIR/t-$bucket"
+
+			# Never revoke a usable token early because a random prefix
+			# collided. Expired or malformed slots may be replaced atomically.
+			if bucket_has_active_token "$token_file" "$bucket" "$now"; then
+				continue
+			fi
+			if [ -e "$token_file" ] || [ -L "$token_file" ]; then
+				[ -f "$token_file" ] && [ ! -L "$token_file" ] || continue
+			fi
+
+			if ! (
+				umask 077
+				printf '%s\n%s\n%s\n' \
+					"$token" "$expiry" "$canonical_path" > "$token_tmp"
+			); then
+				rm -f -- "$token_tmp"
+				exit 1
+			fi
+			if mv -f -- "$token_tmp" "$token_file"; then
+				printf '%s\n' "$token"
+				exit 0
+			fi
+			rm -f -- "$token_tmp"
+			exit 1
+		done
+
+		rm -f -- "$token_tmp"
+		exit 1
+	)
+}
+
+json_error() {
+	json_init
+	json_add_string "error" "$1"
+	json_dump
+}
+
+json_list_error() {
+	local message="$1" offset="${2:-0}" limit="${3:-$DEFAULT_LIST_LIMIT}"
+
+	json_init
+	json_add_string "error" "$message"
+	json_add_int "offset" "$offset"
+	json_add_int "limit" "$limit"
+	json_add_boolean "has_more" 0
+	json_add_array "entries"
+	json_close_array
+	json_dump
+}
+
+json_add_entry() {
+	local name="$1" type="$2" size="$3" rel="$4" mtime="$5"
+
+	json_add_object ""
+	json_add_string "name" "$name"
+	json_add_string "type" "$type"
+	json_add_string "path" "$rel"
+	if [ -n "$size" ]; then
+		json_add_int "size" "$size"
+	fi
+	if [ -n "$mtime" ]; then
+		json_add_string "mtime" "$mtime"
+	fi
+	json_close_object
+}
+
+parse_request() {
+	local raw="$1" nested_path nested_offset nested_limit
+
+	REQ_PATH=""
+	REQ_OFFSET=""
+	REQ_LIMIT=""
+
+	[ -n "$raw" ] || raw="{}"
+	[ "${#raw}" -le "$MAX_REQUEST_BYTES" ] || return 1
+	json_load "$raw" 2>/dev/null || return 1
+	json_get_var REQ_PATH path
+	json_get_var REQ_OFFSET offset
+	json_get_var REQ_LIMIT limit
+
+	if json_select params 2>/dev/null; then
+		json_get_var nested_path path
+		json_get_var nested_offset offset
+		json_get_var nested_limit limit
+		json_select ..
+
+		[ -n "$REQ_PATH" ] || REQ_PATH="$nested_path"
+		[ -n "$REQ_OFFSET" ] || REQ_OFFSET="$nested_offset"
+		[ -n "$REQ_LIMIT" ] || REQ_LIMIT="$nested_limit"
+	fi
+
+	return 0
+}
+
+normalize_list_args() {
+	local offset="$1" limit="$2"
+
+	[ -n "$offset" ] || offset=0
+	[ -n "$limit" ] || limit="$DEFAULT_LIST_LIMIT"
+
+	offset="$(normalize_decimal "$offset")" || return 1
+	limit="$(normalize_decimal "$limit")" || return 1
+
+	[ "${#offset}" -le 7 ] && [ "$offset" -le "$MAX_LIST_OFFSET" ] || return 1
+	[ "${#limit}" -le 3 ] || return 1
+	[ "$limit" -gt 0 ] || return 1
+	if [ "$limit" -gt "$MAX_LIST_LIMIT" ]; then
+		limit="$MAX_LIST_LIMIT"
+	fi
+
+	LIST_OFFSET="$offset"
+	LIST_LIMIT="$limit"
+	return 0
+}
+
+cmd_get_status() {
+	local configured root valid=0 enabled allow_remote exists=0 readable=0
+
+	configured="$(get_configured_media_path)"
+	root="$(canonicalize_media_root "$configured" 2>/dev/null)" && valid=1
+	enabled="$(get_enabled)"
+	allow_remote="$(uci -q get videoplayer.main.allow_remote 2>/dev/null)" || allow_remote=""
+	[ -n "$allow_remote" ] || allow_remote="1"
+
+	[ -d "$configured" ] && exists=1
+	[ -r "$configured" ] && [ -x "$configured" ] && readable=1
+
+	json_init
+	json_add_string "media_path" "$configured"
+	if [ "$valid" -eq 1 ]; then
+		json_add_string "canonical_media_path" "$root"
+	fi
+	json_add_boolean "media_path_valid" "$valid"
+	json_add_boolean "enabled" "$enabled"
+	json_add_boolean "allow_remote" "$([ "$allow_remote" = "1" ] && printf 1 || printf 0)"
+	json_add_boolean "media_path_exists" "$exists"
+	json_add_boolean "media_path_readable" "$readable"
+	json_dump
+}
+
+list_emit_paginated() {
+	local name="$1" type="$2" size="$3" rel="$4" mtime="$5"
+
+	if [ "$LIST_SEEN" -lt "$LIST_OFFSET" ]; then
+		LIST_SEEN=$((LIST_SEEN + 1))
+		return 0
+	fi
+
+	if [ "$LIST_ADDED" -ge "$LIST_LIMIT" ]; then
+		LIST_HAS_MORE=1
+		return 2
+	fi
+
+	json_add_entry "$name" "$type" "$size" "$rel" "$mtime"
+	LIST_SEEN=$((LIST_SEEN + 1))
+	LIST_ADDED=$((LIST_ADDED + 1))
+	return 0
+}
+
+list_skip_or_full() {
+	if [ "$LIST_SEEN" -lt "$LIST_OFFSET" ]; then
+		LIST_SEEN=$((LIST_SEEN + 1))
+		return 1
+	fi
+
+	if [ "$LIST_ADDED" -ge "$LIST_LIMIT" ]; then
+		LIST_HAS_MORE=1
+		return 2
+	fi
+
+	return 0
+}
+
+list_consider_path() {
+	local expected_type="$1" full="$2" name rel_out child position
+
+	[ -e "$full" ] || return 0
+	name="${full##*/}"
+	case "$name" in
+		.|..) return 0 ;;
+	esac
+
+	if [ -n "$LIST_REL" ]; then
+		rel_out="$LIST_REL/$name"
+	else
+		rel_out="$name"
+	fi
+	validate_relative_path "$rel_out" || return 0
+	child="$(resolve_under_root "$LIST_ROOT" "$rel_out" 2>/dev/null)" || return 0
+
+	case "$expected_type" in
+		dir)
+			[ -d "$child" ] || return 0
+			list_emit_paginated "$name" "dir" "" "$rel_out" ""
+			return $?
+			;;
+		file)
+			[ -f "$child" ] || return 0
+			is_allowed_ext "$child" || return 0
+			list_skip_or_full
+			position=$?
+			[ "$position" -ne 1 ] || return 0
+			[ "$position" -ne 2 ] || return 2
+			get_file_metadata "$child" "$LIST_ROOT" || return 0
+			list_emit_paginated "$name" "file" "$FILE_SIZE" "$rel_out" "$FILE_MTIME"
+			return $?
+			;;
+		auto)
+			if [ -d "$child" ]; then
+				list_emit_paginated "$name" "dir" "" "$rel_out" ""
+				return $?
+			fi
+			[ -f "$child" ] || return 0
+			is_allowed_ext "$child" || return 0
+			list_skip_or_full
+			position=$?
+			[ "$position" -ne 1 ] || return 0
+			[ "$position" -ne 2 ] || return 2
+			get_file_metadata "$child" "$LIST_ROOT" || return 0
+			list_emit_paginated "$name" "file" "$FILE_SIZE" "$rel_out" "$FILE_MTIME"
+			return $?
+			;;
+	esac
+
+	return 0
+}
+
+stream_sorted_children() {
+	local path="$1" include_dirs="$2"
+
+	# Prefix records so C-locale sorting is deterministic and directories stay
+	# before files. The producer stops before sort(1) can consume unbounded RAM.
+	find "$path" -mindepth 1 -maxdepth 1 -print0 2>/dev/null |
+	(
+		count=0
+		bytes=0
+		while IFS= read -r -d '' candidate; do
+			count=$((count + 1))
+			bytes=$((bytes + ${#candidate} + 2))
+			if [ "$count" -gt "$MAX_SORT_ENTRIES" ] ||
+			   [ "$bytes" -gt "$MAX_SORT_BYTES" ]; then
+				# This sorts before normal records, allowing the consumer to
+				# fail without emitting a partial directory listing.
+				printf '0\000'
+				break
+			fi
+
+			prefix=""
+			if [ "$include_dirs" -eq 1 ] && [ -d "$candidate" ] && [ ! -L "$candidate" ]; then
+				prefix=1
+			elif [ -f "$candidate" ] && [ ! -L "$candidate" ] &&
+			     is_allowed_ext "$candidate"; then
+				prefix=2
+			else
+				continue
+			fi
+			printf '%s%s\000' "$prefix" "$candidate"
+		done
+	) | sort -z
+}
+
+cmd_list() {
+	local raw="$1" rel root path depth max_depth parent full record expected_type result include_dirs=0
+
+	parse_request "$raw" || {
+		json_list_error "invalid JSON request"
+		return
+	}
+	normalize_list_args "$REQ_OFFSET" "$REQ_LIMIT" || {
+		json_list_error "invalid offset or limit"
+		return
+	}
+	[ "$(get_enabled)" = "1" ] || {
+		json_list_error "video player disabled" "$LIST_OFFSET" "$LIST_LIMIT"
+		return
+	}
+
+	rel="$REQ_PATH"
+	validate_relative_path "$rel" || {
+		json_list_error "invalid path" "$LIST_OFFSET" "$LIST_LIMIT"
+		return
+	}
+
+	root="$(get_media_root 2>/dev/null)" || {
+		json_list_error "media path is invalid or inaccessible" "$LIST_OFFSET" "$LIST_LIMIT"
+		return
+	}
+	path="$(resolve_under_root "$root" "$rel" 2>/dev/null)" || {
+		json_list_error "invalid or inaccessible path" "$LIST_OFFSET" "$LIST_LIMIT"
+		return
+	}
+	[ -d "$path" ] || {
+		json_list_error "not a directory" "$LIST_OFFSET" "$LIST_LIMIT"
+		return
+	}
+
+	rel="$(relative_from_root "$root" "$path")"
+	depth="$(path_depth "$rel")"
+	max_depth="$(get_max_depth)"
+	if [ "$depth" -gt "$max_depth" ]; then
+		json_list_error "maximum directory depth exceeded" "$LIST_OFFSET" "$LIST_LIMIT"
+		return
+	fi
+
+	LIST_ROOT="$root"
+	LIST_REL="$rel"
+	LIST_SEEN=0
+	LIST_ADDED=0
+	LIST_HAS_MORE=0
+
+	json_init
+	json_add_string "path" "$rel"
+	json_add_int "offset" "$LIST_OFFSET"
+	json_add_int "limit" "$LIST_LIMIT"
+	json_add_array "entries"
+
+	if [ -n "$rel" ]; then
+		parent="${rel%/*}"
+		[ "$parent" != "$rel" ] || parent=""
+		# Navigation to the parent is available on every page and does not
+		# consume a child entry from offset/limit pagination.
+		json_add_entry ".." "dir" "" "$parent" ""
+	fi
+	[ "$depth" -lt "$max_depth" ] && include_dirs=1
+
+	# Keep JSON state and pagination counters in the pipeline consumer.
+	stream_sorted_children "$path" "$include_dirs" |
+	(
+		while IFS= read -r -d '' record; do
+			case "$record" in
+				0)
+					json_list_error \
+						"directory has too many entries to sort safely" \
+						"$LIST_OFFSET" "$LIST_LIMIT"
+					exit 0
+					;;
+				1*) expected_type="dir" ;;
+				2*) expected_type="file" ;;
+				*) continue ;;
+			esac
+			full="${record#?}"
+			list_consider_path "$expected_type" "$full"
+			result=$?
+			[ "$result" -ne 2 ] || break
+		done
+
+		json_close_array
+		json_add_boolean "has_more" "$LIST_HAS_MORE"
+		json_dump
+	)
+}
+
+cmd_resolve() {
+	local raw="$1" rel root path canonical_rel parent depth max_depth token name mime
+
+	[ "$(get_enabled)" = "1" ] || {
+		json_error "video player disabled"
+		return
+	}
+
+	parse_request "$raw" || {
+		json_error "invalid JSON request"
+		return
+	}
+	rel="$REQ_PATH"
+	[ -n "$rel" ] && validate_relative_path "$rel" || {
+		json_error "path required or invalid"
+		return
+	}
+
+	root="$(get_media_root 2>/dev/null)" || {
+		json_error "media path is invalid or inaccessible"
+		return
+	}
+	path="$(resolve_under_root "$root" "$rel" 2>/dev/null)" || {
+		json_error "invalid or inaccessible path"
+		return
+	}
+	[ -f "$path" ] || {
+		json_error "not a file"
+		return
+	}
+	is_allowed_ext "$path" || {
+		json_error "unsupported media type"
+		return
+	}
+
+	canonical_rel="$(relative_from_root "$root" "$path")"
+	parent="${canonical_rel%/*}"
+	[ "$parent" != "$canonical_rel" ] || parent=""
+	depth="$(path_depth "$parent")"
+	max_depth="$(get_max_depth)"
+	if [ "$depth" -gt "$max_depth" ]; then
+		json_error "maximum directory depth exceeded"
+		return
+	fi
+
+	get_file_metadata "$path" "$root" || {
+		json_error "cannot stat media file"
+		return
+	}
+	[ "$FILE_SIZE" -gt 0 ] || {
+		json_error "empty file"
+		return
+	}
+
+	token="$(create_token "$path")" || {
+		json_error "cannot create stream token"
+		return
+	}
+
+	name="${path##*/}"
+	mime="$(mime_for "$path")"
+
+	json_init
+	json_add_string "name" "$name"
+	json_add_string "path" "$canonical_rel"
+	json_add_int "size" "$FILE_SIZE"
+	json_add_string "stream_url" "/cgi-bin/videoplayer-stream?token=$token"
+	json_add_string "mime" "$mime"
+	json_add_int "expires_in" "$TOKEN_TTL"
+	json_dump
+}
+
+# --- rpcd entry point ---
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "get_status"
+		json_close_object
+		json_add_object "list"
+			json_add_string "path" "String"
+			json_add_string "offset" "Integer"
+			json_add_string "limit" "Integer"
+		json_close_object
+		json_add_object "resolve"
+			json_add_string "path" "String"
+		json_close_object
+		json_dump
+		;;
+	call)
+		# Keep a non-newline sentinel at the end of command substitution so
+		# trailing JSON whitespace is retained and counted toward the limit.
+		input="$(
+			{
+				head -c $((MAX_REQUEST_BYTES + 1)) 2>/dev/null || true
+				printf x
+			}
+		)"
+		input="${input%x}"
+		if [ "${#input}" -gt "$MAX_REQUEST_BYTES" ]; then
+			case "$2" in
+				list) json_list_error "request is too large" ;;
+				*) json_error "request is too large" ;;
+			esac
+			exit 0
+		fi
+		[ -n "$input" ] || input="{}"
+		case "$2" in
+			get_status) cmd_get_status ;;
+			list) cmd_list "$input" ;;
+			resolve) cmd_resolve "$input" ;;
+			*) json_error "unknown method" ;;
+		esac
+		;;
+esac
