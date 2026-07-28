@@ -37,7 +37,14 @@ PKG_MAINTAINER = "openwrt-video-player contributors"
 PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
 PKG_ARCH_IPK = "all"
 PKG_ARCH_APK = "noarch"
-DEPENDS = ["luci-base", "uhttpd", "jshn", "coreutils-stat", "ffmpeg"]
+DEPENDS = [
+    "luci-base",
+    "uhttpd",
+    "jshn",
+    "coreutils-stat",
+    "coreutils-timeout",
+    "ffmpeg",
+]
 CONFFILES = ["/etc/config/videoplayer"]
 REQUIRED_PACKAGE_FILES = {
     "etc/config/videoplayer",

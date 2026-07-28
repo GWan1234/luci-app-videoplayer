@@ -9,6 +9,7 @@
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export LC_ALL=C
+unset LD_PRELOAD LD_LIBRARY_PATH
 
 RUNTIME_DIR="/tmp/videoplayer-render-v1"
 RUNTIME_MARKER="$RUNTIME_DIR/.snapshot-v1"
@@ -26,6 +27,13 @@ MAX_FRAME_BYTES=4194304
 FFMPEG_LOG_MAX_BYTES=65536
 FFMPEG_LOG_HEAD_BYTES=16384
 FFMPEG_LOG_TAIL_BYTES=49151
+PRIVATE_FFMPEG_BIN="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
+PRIVATE_FFMPEG_LIB_DIR="/usr/lib/videoplayer-ffmpeg"
+
+FFMPEG_BIN=""
+FFMPEG_LIBRARY_PATH=""
+FFMPEG_SELECTION_REASON=""
+FFMPEG_PROBE_REASON=""
 
 string_has_control() {
 	printf '%s' "$1" | grep -q '[[:cntrl:]]'
@@ -450,50 +458,176 @@ load_heartbeat() {
 	return 0
 }
 
-probe_renderer() {
-	local output
+fixed_root_directory_is_safe() {
+	local path="$1" canonical metadata
 
-	command -v ffmpeg >/dev/null 2>&1 || {
-		printf 'ffmpeg is not installed\n'
+	[ -d "$path" ] && [ ! -L "$path" ] || return 1
+	canonical="$(readlink -f -- "$path" 2>/dev/null)" || return 1
+	[ "$canonical" = "$path" ] || return 1
+	metadata="$(stat -c '%u:%a' -- "$path" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:755" ]
+}
+
+private_ffmpeg_runtime_is_safe() {
+	local bin_dir entry resolved metadata
+
+	bin_dir="${PRIVATE_FFMPEG_BIN%/*}"
+	fixed_root_directory_is_safe "$bin_dir" || return 1
+
+	[ -f "$PRIVATE_FFMPEG_BIN" ] && [ ! -L "$PRIVATE_FFMPEG_BIN" ] ||
 		return 1
-	}
-	output="$(ffmpeg -hide_banner -encoders 2>/dev/null)" || {
-		printf 'ffmpeg encoder probe failed\n'
+	resolved="$(readlink -f -- "$PRIVATE_FFMPEG_BIN" 2>/dev/null)" ||
+		return 1
+	[ "$resolved" = "$PRIVATE_FFMPEG_BIN" ] || return 1
+	metadata="$(stat -c '%u:%a' -- "$PRIVATE_FFMPEG_BIN" 2>/dev/null)" ||
+		return 1
+	[ "$metadata" = "0:755" ] || return 1
+
+	# A static companion does not need a library directory. If a package ships
+	# one, validate it before adding the path to the dynamic loader search.
+	if [ ! -e "$PRIVATE_FFMPEG_LIB_DIR" ] &&
+	   [ ! -L "$PRIVATE_FFMPEG_LIB_DIR" ]; then
+		return 0
+	fi
+	fixed_root_directory_is_safe "$PRIVATE_FFMPEG_LIB_DIR" || return 1
+
+	# The fixed, root-owned directory prevents unprivileged replacement. Also
+	# reject unexpected entries and writable library targets before adding it
+	# to the dynamic loader's search path.
+	for entry in "$PRIVATE_FFMPEG_LIB_DIR"/*; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		resolved="$(readlink -f -- "$entry" 2>/dev/null)" || return 1
+		case "$resolved" in
+			"$PRIVATE_FFMPEG_LIB_DIR"/*) ;;
+			*) return 1 ;;
+		esac
+		[ -f "$resolved" ] || return 1
+		metadata="$(stat -L -c '%u:%a' -- "$entry" 2>/dev/null)" ||
+			return 1
+		case "$metadata" in
+			0:444|0:555|0:644|0:755) ;;
+			*) return 1 ;;
+		esac
+	done
+	return 0
+}
+
+select_private_ffmpeg() {
+	private_ffmpeg_runtime_is_safe || return 1
+	FFMPEG_BIN="$PRIVATE_FFMPEG_BIN"
+	if [ -d "$PRIVATE_FFMPEG_LIB_DIR" ] &&
+	   [ ! -L "$PRIVATE_FFMPEG_LIB_DIR" ]; then
+		FFMPEG_LIBRARY_PATH="$PRIVATE_FFMPEG_LIB_DIR"
+	else
+		FFMPEG_LIBRARY_PATH=""
+	fi
+	return 0
+}
+
+select_system_ffmpeg() {
+	command -v ffmpeg >/dev/null 2>&1 || return 1
+	FFMPEG_BIN="ffmpeg"
+	FFMPEG_LIBRARY_PATH=""
+	return 0
+}
+
+invoke_selected_ffmpeg() {
+	if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
+		LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
+			"$FFMPEG_BIN" "$@"
+	else
+		"$FFMPEG_BIN" "$@"
+	fi
+}
+
+probe_selected_ffmpeg() {
+	local label="$1" output
+
+	output="$(invoke_selected_ffmpeg -hide_banner -encoders 2>/dev/null)" || {
+		FFMPEG_PROBE_REASON="$label encoder probe failed"
 		return 1
 	}
 	printf '%s\n' "$output" |
 		grep -Eq '^[[:space:]]*V[^[:space:]]*[[:space:]]+mjpeg([[:space:]]|$)' || {
-			printf 'ffmpeg has no MJPEG encoder\n'
+			FFMPEG_PROBE_REASON="$label has no MJPEG encoder"
 			return 1
 		}
-	output="$(ffmpeg -hide_banner -muxers 2>/dev/null)" || {
-		printf 'ffmpeg muxer probe failed\n'
+	output="$(invoke_selected_ffmpeg -hide_banner -muxers 2>/dev/null)" || {
+		FFMPEG_PROBE_REASON="$label muxer probe failed"
 		return 1
 	}
 	printf '%s\n' "$output" |
 		grep -Eq '^[[:space:]]*E[[:space:]]+image2([[:space:]]|$)' || {
-			printf 'ffmpeg has no image2 muxer\n'
+			FFMPEG_PROBE_REASON="$label has no image2 muxer"
 			return 1
 		}
-	output="$(ffmpeg -hide_banner -filters 2>/dev/null)" || {
-		printf 'ffmpeg filter probe failed\n'
+	output="$(invoke_selected_ffmpeg -hide_banner -filters 2>/dev/null)" || {
+		FFMPEG_PROBE_REASON="$label filter probe failed"
 		return 1
 	}
 	printf '%s\n' "$output" |
 		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+fps[[:space:]]' || {
-			printf 'ffmpeg has no fps filter\n'
+			FFMPEG_PROBE_REASON="$label has no fps filter"
 			return 1
 		}
 	printf '%s\n' "$output" |
 		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+scale[[:space:]]' || {
-			printf 'ffmpeg has no scale filter\n'
+			FFMPEG_PROBE_REASON="$label has no scale filter"
 			return 1
 		}
 	printf '%s\n' "$output" |
 		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+format[[:space:]]' || {
-			printf 'ffmpeg has no format filter\n'
+			FFMPEG_PROBE_REASON="$label has no format filter"
 			return 1
 		}
+	FFMPEG_PROBE_REASON=""
+	return 0
+}
+
+select_usable_ffmpeg() {
+	local private_reason="" private_seen=0 system_reason=""
+
+	FFMPEG_BIN=""
+	FFMPEG_LIBRARY_PATH=""
+	FFMPEG_SELECTION_REASON=""
+	FFMPEG_PROBE_REASON=""
+
+	if [ -e "$PRIVATE_FFMPEG_BIN" ] || [ -L "$PRIVATE_FFMPEG_BIN" ]; then
+		private_seen=1
+	fi
+	if select_private_ffmpeg; then
+		if probe_selected_ffmpeg "Private FFmpeg"; then
+			return 0
+		fi
+		private_reason="$FFMPEG_PROBE_REASON"
+	elif [ "$private_seen" -eq 1 ]; then
+		private_reason="Private FFmpeg runtime failed its safety checks"
+	fi
+
+	if select_system_ffmpeg; then
+		if probe_selected_ffmpeg "ffmpeg"; then
+			return 0
+		fi
+		system_reason="$FFMPEG_PROBE_REASON"
+	else
+		system_reason="ffmpeg is not installed"
+	fi
+
+	FFMPEG_BIN=""
+	FFMPEG_LIBRARY_PATH=""
+	if [ -n "$private_reason" ]; then
+		FFMPEG_SELECTION_REASON="$private_reason; $system_reason"
+	else
+		FFMPEG_SELECTION_REASON="$system_reason"
+	fi
+	return 1
+}
+
+probe_renderer() {
+	if ! select_usable_ffmpeg; then
+		printf '%s\n' "$FFMPEG_SELECTION_REASON"
+		return 1
+	fi
 	printf 'available\n'
 	return 0
 }
@@ -765,7 +899,7 @@ process_matches_ffmpeg() {
 	[ -r "/proc/$pid/cmdline" ] || return 1
 	arg1="$(tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n '1p')"
 	case "$arg1" in
-		ffmpeg|/usr/bin/ffmpeg) ;;
+		ffmpeg|/usr/bin/ffmpeg|"$PRIVATE_FFMPEG_BIN") ;;
 		*) return 1 ;;
 	esac
 	frame="$RUNTIME_DIR/s-$token/frame.jpg"
@@ -970,6 +1104,14 @@ cmd_worker() {
 		write_status "$token" error "Source file is no longer safe or readable" 2>/dev/null || :
 		exit 1
 	}
+	if ! select_usable_ffmpeg; then
+		write_status \
+			"$token" error \
+			"${FFMPEG_SELECTION_REASON:-FFmpeg renderer is unavailable}" \
+			2>/dev/null || :
+		exec 3<&-
+		exit 1
+	fi
 	dir="$RUNTIME_DIR/s-$token"
 	frame="$dir/frame.jpg"
 	log_pipe="$dir/ffmpeg-log.pipe"
@@ -1147,7 +1289,7 @@ cmd_worker() {
 	log_pid=$!
 	log_launching=0
 	log_start="$(process_start_time "$log_pid" 2>/dev/null)" || log_start=""
-	nice -n 10 ffmpeg \
+	set -- \
 		-y \
 		-hide_banner \
 		-loglevel error \
@@ -1172,7 +1314,15 @@ cmd_worker() {
 		-f image2 \
 		-update 1 \
 		-atomic_writing 1 \
-		"$frame" 8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
+		"$frame"
+	if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
+		LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
+			nice -n 10 "$FFMPEG_BIN" "$@" \
+			8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
+	else
+		nice -n 10 "$FFMPEG_BIN" "$@" \
+			8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
+	fi
 	ffmpeg_pid=$!
 	exec 7>&-
 	log_anchor_open=0

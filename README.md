@@ -71,7 +71,7 @@ absolute expiry.
 ## Requirements
 
 The package directly depends on `luci-base`, `uhttpd`, `jshn`,
-`coreutils-stat`, and `ffmpeg`. The application itself contains no
+`coreutils-stat`, `coreutils-timeout`, and `ffmpeg`. The application itself contains no
 CPU-specific binaries, so its architecture remains `all` for IPK and `noarch`
 for APK; the package manager selects the architecture-specific FFmpeg
 dependencies.
@@ -91,6 +91,15 @@ built for the router's exact OpenWrt release and architecture with the needed
 decoders enabled. Do not install libraries built for another release or ABI.
 The user is responsible for checking codec patent and distribution rules in
 their jurisdiction.
+
+This repository also builds an optional architecture-specific companion named
+`luci-videoplayer-codec-runtime`. Unlike a replacement system FFmpeg package,
+it installs one private executable at
+`/usr/libexec/videoplayer-ffmpeg/ffmpeg`. It does not overwrite
+`/usr/bin/ffmpeg` or install global `libav*.so` files. The renderer prefers the
+private executable when it is present and passes all capability and filesystem
+safety checks, then falls back to the normal system FFmpeg if it is absent or
+unusable.
 
 If the player reports that the installed FFmpeg has no usable decoder for a
 video, inspect the installed decoder list:
@@ -201,6 +210,48 @@ published-release installer above on OpenWrt versions that still use `opkg`.
 OpenWrt 25.12.1 and newer can force a reinstall when two snapshots share the
 same package version. On 25.12.0, the first installation works, but an existing
 copy must be removed manually before installing another same-version snapshot.
+
+### Optional Codec Runtime for OpenWrt 25.12.5 `mediatek/filogic`
+
+The first private codec-runtime build targets the exact system reported by an
+ASUS RT-AX52 running OpenWrt `25.12.5` revision
+`r33051-f5dae5ece4`, target `mediatek/filogic`, and package architecture
+`aarch64_cortex-a53`. It is an APK-only package. Do not try to install it on a
+different OpenWrt release, revision, target, or architecture.
+
+Install the current `main` APK first, select **Router CPU rendering** in LuCI,
+and then run:
+
+```sh
+(
+	set -e
+	installer="$(mktemp /tmp/install-videoplayer-codecs.XXXXXX)"
+	trap 'rm -f "$installer"' 0
+	trap 'exit 129' 1
+	trap 'exit 130' 2
+	trap 'exit 143' 15
+	(
+		ulimit -f 1024
+		wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-codec-runtime.sh'
+	)
+	sh "$installer"
+)
+```
+
+The installer checks `DISTRIB_RELEASE`, `DISTRIB_REVISION`,
+`DISTRIB_TARGET`, `DISTRIB_ARCH`, `uname -m`, and `apk --print-arch` before
+downloading anything. It resolves the generated `codec-snapshot` branch to an
+immutable commit, verifies the package SHA-256 checksum, installs the unsigned
+APK with `apk --allow-untrusted`, and confirms that the private runtime exposes
+the native H.264, HEVC, and VC-1 decoders plus every component required by the
+JPEG renderer.
+
+The runtime is built from the official OpenWrt 25.12.5
+`mediatek/filogic` SDK with `CONFIG_BUILD_PATENTED=y`. Its native FFmpeg
+decoders cover substantially more formats than the official patent-disabled
+package, but this is not a promise of literally every existing or future
+codec. DRM, encryption, damaged media, unsupported codecs, available memory,
+CPU performance, heat, and storage throughput can still prevent playback.
 
 ## Building and Verifying Packages Locally
 
@@ -335,10 +386,15 @@ treats it as user configuration during upgrades.
 ```sh
 # OpenWrt with apk
 apk del luci-app-videoplayer
+apk del luci-videoplayer-codec-runtime
 
 # OpenWrt with opkg
 opkg remove luci-app-videoplayer
 ```
+
+Removing only `luci-videoplayer-codec-runtime` restores the normal system
+FFmpeg fallback and does not remove the LuCI application, its configuration,
+or any videos.
 
 The post-removal script clears LuCI caches and temporary player state
 (stream tokens, renderer sessions, and locks), then reloads rpcd. Videos are
@@ -395,18 +451,33 @@ scoped repository write access rebuilds the APK and updates the generated
 `snapshot` branch. It never uploads files to a router or changes GitHub
 Releases.
 
+The separate codec-runtime workflow downloads the checksum-pinned official
+OpenWrt SDK, pins the release's packages-feed commit, applies that feed's
+FFmpeg patches, cross-compiles the private AArch64 executable, verifies that
+its only dynamic dependency is the target `libc`, checks its codec and renderer
+feature lists under emulation, and decodes an H.264 sample to JPEG. Only that
+validated architecture-specific APK is published to the generated
+`codec-snapshot` branch.
+
 ## Repository Structure
 
 ```text
 openwrt-video-player/
-├── .github/workflows/package-check.yml
+├── .github/workflows/
+│   ├── codec-runtime.yml
+│   └── package-check.yml
 ├── README.md
 ├── LICENSE
+├── codec-runtime/
+│   ├── README.md
+│   ├── validate-runtime.sh
+│   └── package/
 ├── tests/
 │   ├── local-listing.sh
 │   └── renderer-behavior.sh
 ├── scripts/
 │   ├── build-packages.py
+│   ├── install-codec-runtime.sh
 │   ├── install-from-github.sh
 │   ├── install-main-apk.sh
 │   ├── install-to-router.sh

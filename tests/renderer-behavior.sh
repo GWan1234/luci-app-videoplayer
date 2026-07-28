@@ -26,6 +26,9 @@ work="$(mktemp -d /tmp/videoplayer-renderer-ci.XXXXXX)"
 bin="$work/bin"
 runtime="$work/runtime"
 helper="$bin/videoplayer-renderer"
+private_exec_dir="$work/private-libexec/videoplayer-ffmpeg"
+private_lib_dir="$work/private-lib/videoplayer-ffmpeg"
+private_ffmpeg="$private_exec_dir/ffmpeg"
 
 mkdir -m 0755 -- "$bin" "$work/media"
 
@@ -86,11 +89,17 @@ grep -Fq '/tmp/videoplayer-render-v1' "$source_helper" ||
 	fail "unexpected runtime declaration"
 grep -Fq '/usr/libexec/videoplayer-renderer' "$source_helper" ||
 	fail "unexpected self path"
+grep -Fq '/usr/libexec/videoplayer-ffmpeg/ffmpeg' "$source_helper" ||
+	fail "unexpected private FFmpeg path"
+grep -Fq '/usr/lib/videoplayer-ffmpeg' "$source_helper" ||
+	fail "unexpected private FFmpeg library path"
 
 sed \
 	-e "s|export PATH=\"/usr/sbin:/usr/bin:/sbin:/bin\"|export PATH=\"$bin:/usr/sbin:/usr/bin:/sbin:/bin\"|" \
 	-e "s|/tmp/videoplayer-render-v1|$runtime|g" \
 	-e "s|/usr/libexec/videoplayer-renderer|$helper|g" \
+	-e "s|/usr/libexec/videoplayer-ffmpeg/ffmpeg|$private_ffmpeg|g" \
+	-e "s|/usr/lib/videoplayer-ffmpeg|$private_lib_dir|g" \
 	"$source_helper" > "$helper"
 
 chmod 0755 "$helper"
@@ -99,6 +108,10 @@ chmod 0755 "$helper"
 	fail "runtime transform incomplete"
 ! grep -Fq '/usr/libexec/videoplayer-renderer' "$helper" ||
 	fail "self-path transform incomplete"
+! grep -Fq '/usr/libexec/videoplayer-ffmpeg/ffmpeg' "$helper" ||
+	fail "private FFmpeg transform incomplete"
+! grep -Fq '/usr/lib/videoplayer-ffmpeg' "$helper" ||
+	fail "private FFmpeg library transform incomplete"
 
 cat > "$bin/uci" <<'SH'
 #!/bin/sh
@@ -254,6 +267,20 @@ int main(int argc, char **argv)
 	int fail_after_first_frame;
 	int line;
 	ssize_t marker_size;
+	const char *expected_private_lib;
+	const char *library_path;
+
+	expected_private_lib = getenv("VIDEOPLAYER_EXPECT_PRIVATE_LIB");
+	library_path = getenv("LD_LIBRARY_PATH");
+	if (expected_private_lib != NULL) {
+		if (expected_private_lib[0] == '\0') {
+			if (library_path != NULL && library_path[0] != '\0')
+				return 79;
+		} else if (library_path == NULL ||
+			   strcmp(library_path, expected_private_lib) != 0) {
+			return 79;
+		}
+	}
 
 	if (has_arg(argc, argv, "-encoders")) {
 		puts(" V..... mjpeg CI stub");
@@ -512,7 +539,89 @@ runtime_failure=33333333333333333333333333333333
 stale=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 media="$work/media/bad apple.mp4"
 
-assert_eq "$("$helper" probe)" available "probe"
+assert_eq "$("$helper" probe)" available "system FFmpeg fallback probe"
+
+mkdir -m 0755 -- "$work/private-libexec"
+mkdir -m 0755 -- "$private_exec_dir"
+cp -- "$bin/ffmpeg" "$private_ffmpeg"
+chmod 0755 "$private_ffmpeg"
+
+# A static or mostly static companion is usable without an artificial empty
+# private library directory, and takes precedence over a broken system FFmpeg.
+export VIDEOPLAYER_EXPECT_PRIVATE_LIB=""
+mv -- "$bin/ffmpeg" "$bin/ffmpeg.good"
+cat > "$bin/ffmpeg" <<'SH'
+#!/bin/sh
+: > "$VIDEOPLAYER_SYSTEM_FAIL_MARKER"
+exit 81
+SH
+chmod 0755 "$bin/ffmpeg"
+export VIDEOPLAYER_SYSTEM_FAIL_MARKER="$work/static-system-probe-used"
+rm -f -- "$VIDEOPLAYER_SYSTEM_FAIL_MARKER"
+assert_eq "$("$helper" probe)" available "static private FFmpeg preference"
+[[ ! -e "$VIDEOPLAYER_SYSTEM_FAIL_MARKER" ]] ||
+	fail "system FFmpeg was probed despite a usable static private runtime"
+mv -f -- "$bin/ffmpeg.good" "$bin/ffmpeg"
+
+mkdir -m 0755 -- "$work/private-lib"
+mkdir -m 0755 -- "$private_lib_dir"
+printf 'private library fixture\n' > "$private_lib_dir/libfixture.so"
+chmod 0644 "$private_lib_dir/libfixture.so"
+
+# A valid but unusable private runtime is tried first, then the system FFmpeg
+# remains available as a capability-checked fallback.
+mv -- "$private_ffmpeg" "$private_ffmpeg.good"
+cat > "$private_ffmpeg" <<'SH'
+#!/bin/sh
+: > "$VIDEOPLAYER_PRIVATE_FAIL_MARKER"
+exit 80
+SH
+chmod 0755 "$private_ffmpeg"
+export VIDEOPLAYER_PRIVATE_FAIL_MARKER="$work/private-probe-failed"
+export VIDEOPLAYER_EXPECT_PRIVATE_LIB=""
+assert_eq "$("$helper" probe)" available "private FFmpeg probe fallback"
+[[ -f "$VIDEOPLAYER_PRIVATE_FAIL_MARKER" ]] ||
+	fail "private FFmpeg was not probed before system fallback"
+mv -f -- "$private_ffmpeg.good" "$private_ffmpeg"
+
+# Once the private runtime passes its probes, a broken system executable must
+# not be touched.
+mv -- "$bin/ffmpeg" "$bin/ffmpeg.good"
+cat > "$bin/ffmpeg" <<'SH'
+#!/bin/sh
+: > "$VIDEOPLAYER_SYSTEM_FAIL_MARKER"
+exit 81
+SH
+chmod 0755 "$bin/ffmpeg"
+export VIDEOPLAYER_SYSTEM_FAIL_MARKER="$work/system-probe-used"
+export VIDEOPLAYER_EXPECT_PRIVATE_LIB="$private_lib_dir"
+rm -f -- "$VIDEOPLAYER_SYSTEM_FAIL_MARKER"
+assert_eq "$("$helper" probe)" available "private FFmpeg preference"
+[[ ! -e "$VIDEOPLAYER_SYSTEM_FAIL_MARKER" ]] ||
+	fail "system FFmpeg was probed despite a usable private runtime"
+mv -f -- "$bin/ffmpeg.good" "$bin/ffmpeg"
+
+# An unsafe private library directory is ignored instead of being added to the
+# root renderer's loader path.
+mv -- "$private_ffmpeg" "$private_ffmpeg.good"
+cat > "$private_ffmpeg" <<'SH'
+#!/bin/sh
+: > "$VIDEOPLAYER_UNSAFE_PRIVATE_MARKER"
+exit 82
+SH
+chmod 0755 "$private_ffmpeg"
+chmod 0777 "$private_lib_dir"
+export VIDEOPLAYER_UNSAFE_PRIVATE_MARKER="$work/unsafe-private-used"
+export VIDEOPLAYER_EXPECT_PRIVATE_LIB=""
+rm -f -- "$VIDEOPLAYER_UNSAFE_PRIVATE_MARKER"
+assert_eq "$("$helper" probe)" available "unsafe private FFmpeg fallback"
+[[ ! -e "$VIDEOPLAYER_UNSAFE_PRIVATE_MARKER" ]] ||
+	fail "unsafe private FFmpeg runtime was executed"
+chmod 0755 "$private_lib_dir"
+mv -f -- "$private_ffmpeg.good" "$private_ffmpeg"
+
+export VIDEOPLAYER_EXPECT_PRIVATE_LIB="$private_lib_dir"
+assert_eq "$("$helper" probe)" available "final private FFmpeg probe"
 
 set +e
 missing_output="$("$helper" start "$missing_decoder" "$work/media/h264.mp4" 2>&1)"
@@ -672,6 +781,10 @@ worker1="$(session_pid "$token1" worker)"
 ffmpeg1="$(session_pid "$token1" ffmpeg)"
 kill -0 "$worker1"
 kill -0 "$ffmpeg1"
+assert_eq \
+	"$(tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" | sed -n '1p')" \
+	"$private_ffmpeg" \
+	"private FFmpeg process identity"
 
 heartbeat="$runtime/s-$token1/heartbeat"
 before="$(< "$heartbeat")"

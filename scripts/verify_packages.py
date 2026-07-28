@@ -30,7 +30,14 @@ PKG_DESCRIPTION = "LuCI video player with browser and router CPU rendering"
 PKG_MAINTAINER = "openwrt-video-player contributors"
 PKG_ORIGIN = f"feeds/luci/applications/{PKG_NAME}"
 PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
-DEPENDENCIES = ("luci-base", "uhttpd", "jshn", "coreutils-stat", "ffmpeg")
+DEPENDENCIES = (
+    "luci-base",
+    "uhttpd",
+    "jshn",
+    "coreutils-stat",
+    "coreutils-timeout",
+    "ffmpeg",
+)
 REQUIRED_DEPENDS = set(DEPENDENCIES)
 CONFFILES = ["/etc/config/videoplayer"]
 REQUIRED_PACKAGE_FILES = {

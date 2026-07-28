@@ -14,3 +14,4 @@ __pycache__/
 # the generated snapshot branch after successful checks.
 dist/*.apk
 dist/*.ipk
+dist/codec-runtime/

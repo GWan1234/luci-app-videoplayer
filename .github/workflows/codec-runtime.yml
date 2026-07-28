@@ -1,0 +1,349 @@
+name: Build private codec runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "codec-runtime/**"
+      - ".github/workflows/codec-runtime.yml"
+  pull_request:
+    paths:
+      - "codec-runtime/**"
+      - ".github/workflows/codec-runtime.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codec-runtime-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDK_FILE: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic/openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_SHA256: ff4a38a397caa2cfe1c39e18f84ddede14878221b3593c3f2c4cfe24e3ec4c25
+  FEEDS_BUILDINFO_URL: https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic/feeds.buildinfo
+  FEEDS_BUILDINFO_SHA256: e11279b01e7fea7f7d399e25e969d9382be6891071cbc1225804195224b27b52
+  PACKAGES_FEED_COMMIT: 5caa62e0bc9f7fb9b0c12a23267bceb7724214dd
+  OPENWRT_RELEASE: "25.12.5"
+  OPENWRT_REVISION: r33051-f5dae5ece4
+  OPENWRT_TARGET: mediatek/filogic
+  OPENWRT_ARCH: aarch64_cortex-a53
+  CODEC_APK: luci-videoplayer-codec-runtime-6.1.4-r1.apk
+  CODEC_ARTIFACT_DIR: targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53
+
+jobs:
+  build:
+    name: OpenWrt 25.12.5 mediatek/filogic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install build and emulation tools
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            bzip2 \
+            file \
+            gawk \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            qemu-user-static \
+            rsync \
+            unzip \
+            wget \
+            xz-utils \
+            zlib1g-dev \
+            zstd \
+            ffmpeg
+
+      - name: Download and verify the official SDK metadata
+        id: sdk
+        run: |
+          set -eu
+          sdk_archive="$RUNNER_TEMP/$SDK_FILE"
+          feeds_buildinfo="$RUNNER_TEMP/feeds.buildinfo"
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            --connect-timeout 30 --output "$sdk_archive" "$SDK_URL"
+          printf '%s  %s\n' "$SDK_SHA256" "$sdk_archive" |
+            sha256sum --check --strict -
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            --connect-timeout 30 --output "$feeds_buildinfo" \
+            "$FEEDS_BUILDINFO_URL"
+          printf '%s  %s\n' "$FEEDS_BUILDINFO_SHA256" "$feeds_buildinfo" |
+            sha256sum --check --strict -
+          grep -Fx \
+            "src-git packages https://git.openwrt.org/feed/packages.git^$PACKAGES_FEED_COMMIT" \
+            "$feeds_buildinfo"
+
+          sdk_parent="$RUNNER_TEMP/openwrt-sdk"
+          mkdir -p "$sdk_parent"
+          tar --use-compress-program=unzstd -xf "$sdk_archive" -C "$sdk_parent"
+          sdk_dir="$(find "$sdk_parent" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          [ -n "$sdk_dir" ] && [ -x "$sdk_dir/scripts/feeds" ]
+          printf 'sdk_dir=%s\n' "$sdk_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Pin feeds and add the private package
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          set -eu
+          printf '%s\n' \
+            "src-git packages https://git.openwrt.org/feed/packages.git^$PACKAGES_FEED_COMMIT" \
+            > feeds.conf.default
+          ./scripts/feeds update packages
+          actual_commit="$(git -C feeds/packages rev-parse HEAD)"
+          [ "$actual_commit" = "$PACKAGES_FEED_COMMIT" ]
+
+          package_dir="package/luci-videoplayer-codec-runtime"
+          mkdir -p "$package_dir"
+          cp -a "$GITHUB_WORKSPACE/codec-runtime/package/." "$package_dir/"
+          official_ffmpeg="feeds/packages/multimedia/ffmpeg/Makefile"
+          for field in \
+            'PKG_VERSION:=6.1.4' \
+            'PKG_RELEASE:=1' \
+            'PKG_HASH:=a231e3d5742c44b1cdaebfb98ad7b6200d12763e0b6db9e1e2c5891f2c083a18'
+          do
+            grep -Fx "$field" "$official_ffmpeg"
+            grep -Fx "$field" "$package_dir/Makefile"
+          done
+
+          official_patches="feeds/packages/multimedia/ffmpeg/patches"
+          [ -d "$official_patches" ]
+          find "$official_patches" -mindepth 1 -maxdepth 1 -type f \
+            -printf '%f\n' | LC_ALL=C sort > "$RUNNER_TEMP/ffmpeg-patches.txt"
+          printf '%s\n' \
+            '010-pkgconfig.patch' \
+            '020-libavcodec-fix-Wint-conversion-in-vulkan.patch' \
+            '030-avformat-file-guard-fd_dup-by-FD_PROTOCOL-or-PIPE_PR.patch' \
+            '040-vulkan_decode-fix-the-print-format-of-VkDeviceSize.patch' \
+            '050-avcodec-dct-Make-declarations-and-definitions-match.patch' \
+            '060-avutil-tx-fix-GCC-memset-warning.patch' \
+            '070-avformat-rawdec-guard-by-CONFIG_DATA_DEMUXER.patch' \
+            '080-avcodec-pcm-bluray-dvd-Use-correct-pointer-types-on-.patch' \
+            '090-avcodec-tiff-Suppress-unused-variable-warnings.patch' \
+            '100-avcodec-tableprint_vlc-Unbreak-hardcoded-tables.patch' \
+            '120-avfilter-af_channelsplit-fix-mixed-declaration-and-c.patch' \
+            > "$RUNNER_TEMP/expected-ffmpeg-patches.txt"
+          diff -u \
+            "$RUNNER_TEMP/expected-ffmpeg-patches.txt" \
+            "$RUNNER_TEMP/ffmpeg-patches.txt"
+          cp -a "$official_patches" "$package_dir/patches"
+
+      - name: Configure the exact target
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          set -eu
+          touch .config
+          sed -i \
+            -e '/^CONFIG_BUILD_PATENTED=/d' \
+            -e '/^# CONFIG_BUILD_PATENTED is not set$/d' \
+            -e '/^CONFIG_PACKAGE_luci-videoplayer-codec-runtime=/d' \
+            -e '/^# CONFIG_PACKAGE_luci-videoplayer-codec-runtime is not set$/d' \
+            .config
+          printf '%s\n' \
+            'CONFIG_BUILD_PATENTED=y' \
+            'CONFIG_PACKAGE_luci-videoplayer-codec-runtime=y' \
+            >> .config
+          make defconfig
+
+          grep -Fx 'CONFIG_TARGET_mediatek=y' .config
+          grep -Fx 'CONFIG_TARGET_mediatek_filogic=y' .config
+          grep -Fx 'CONFIG_BUILD_PATENTED=y' .config
+          grep -Fx 'CONFIG_PACKAGE_luci-videoplayer-codec-runtime=y' .config
+
+      - name: Build the private codec runtime APK
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          set -eu
+          make -j2 package/luci-videoplayer-codec-runtime/compile V=s
+
+      - name: Validate package isolation and codec features
+        id: package
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          set -eu
+          binary="$(find build_dir -type f \
+            -path '*/.pkgdir/luci-videoplayer-codec-runtime/usr/libexec/videoplayer-ffmpeg/ffmpeg' \
+            -print -quit)"
+          [ -n "$binary" ] && [ -x "$binary" ]
+          suffix="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
+          package_root="${binary%$suffix}"
+
+          find "$package_root" \( -type f -o -type l \) \
+            -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/package-files.txt"
+          printf '%s\n' \
+            'usr/libexec/videoplayer-ffmpeg/ffmpeg' \
+            'usr/share/luci-videoplayer-codec-runtime/build-info' \
+            > "$RUNNER_TEMP/expected-package-files.txt"
+          diff -u \
+            "$RUNNER_TEMP/expected-package-files.txt" \
+            "$RUNNER_TEMP/package-files.txt"
+
+          build_info="$package_root/usr/share/luci-videoplayer-codec-runtime/build-info"
+          grep -Fx "openwrt_release=$OPENWRT_RELEASE" "$build_info"
+          grep -Fx "openwrt_revision=$OPENWRT_REVISION" "$build_info"
+          grep -Fx "openwrt_target=$OPENWRT_TARGET" "$build_info"
+          grep -Fx "openwrt_arch=$OPENWRT_ARCH" "$build_info"
+          grep -Fx "sdk_sha256=$SDK_SHA256" "$build_info"
+          grep -Fx "packages_feed_commit=$PACKAGES_FEED_COMMIT" "$build_info"
+          grep -Fx 'build_patented=y' "$build_info"
+
+          target_staging="$(find staging_dir -mindepth 1 -maxdepth 1 -type d \
+            -name 'target-aarch64_cortex-a53_musl*' -print -quit)"
+          [ -n "$target_staging" ]
+          sysroot="$target_staging/root-mediatek"
+          [ -x "$sysroot/lib/ld-musl-aarch64.so.1" ]
+          chmod +x "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh"
+          "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh" \
+            "$binary" "$sysroot" "$RUNNER_TEMP/codec-validation"
+
+          apk_dir="bin/packages/$OPENWRT_ARCH"
+          apk="$(find "$apk_dir" -type f \
+            -name 'luci-videoplayer-codec-runtime-*.apk' -print -quit)"
+          [ -n "$apk" ] && [ -s "$apk" ]
+          count="$(find "$apk_dir" -type f \
+            -name 'luci-videoplayer-codec-runtime-*.apk' | wc -l)"
+          [ "$count" -eq 1 ]
+          [ "$(basename "$apk")" = "$CODEC_APK" ]
+
+          artifact_dir="$RUNNER_TEMP/codec-runtime-artifact"
+          artifact_target="$artifact_dir/$CODEC_ARTIFACT_DIR"
+          mkdir -p "$artifact_target"
+          cp "$apk" "$artifact_target/$CODEC_APK"
+          cp "$build_info" "$artifact_target/BUILD_INFO"
+          (
+            cd "$artifact_target"
+            sha256sum "$CODEC_APK" > "$CODEC_APK.sha256"
+          )
+          printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload validated APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: luci-videoplayer-codec-runtime-25.12.5-mediatek-filogic
+          path: ${{ steps.package.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish current codec snapshot
+    needs: build
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'communism420/luci-app-videoplayer'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Download validated codec artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: luci-videoplayer-codec-runtime-25.12.5-mediatek-filogic
+          path: ${{ runner.temp }}/codec-runtime-publish
+
+      - name: Publish to the generated codec-snapshot branch
+        env:
+          SNAPSHOT_BRANCH: codec-snapshot
+          PUBLISH_DIR: ${{ runner.temp }}/codec-runtime-publish
+        run: |
+          set -euo pipefail
+
+          artifact_target="$PUBLISH_DIR/$CODEC_ARTIFACT_DIR"
+          apk="$artifact_target/$CODEC_APK"
+          checksum="$apk.sha256"
+          build_info="$artifact_target/BUILD_INFO"
+          [ -s "$apk" ] && [ -s "$checksum" ] && [ -s "$build_info" ]
+          [ -z "$(find "$PUBLISH_DIR" -type l -print -quit)" ]
+
+          mapfile -t artifact_files < <(
+            find "$PUBLISH_DIR" -type f -printf '%P\n' | LC_ALL=C sort
+          )
+          expected_files=(
+            "$CODEC_ARTIFACT_DIR/BUILD_INFO"
+            "$CODEC_ARTIFACT_DIR/$CODEC_APK"
+            "$CODEC_ARTIFACT_DIR/$CODEC_APK.sha256"
+          )
+          if (( ${#artifact_files[@]} != ${#expected_files[@]} )); then
+            echo "Validated artifact contains unexpected files." >&2
+            printf '  %s\n' "${artifact_files[@]}" >&2
+            exit 1
+          fi
+          for index in "${!expected_files[@]}"; do
+            [ "${artifact_files[$index]}" = "${expected_files[$index]}" ]
+          done
+
+          (
+            cd "$artifact_target"
+            sha256sum --check --strict "$CODEC_APK.sha256"
+          )
+          printf '%s\n' "$GITHUB_SHA" > "$PUBLISH_DIR/SOURCE_COMMIT"
+          printf '%s\n' \
+            '# Current private codec runtime' \
+            '' \
+            'This branch is generated after the pinned OpenWrt SDK build and codec validation pass.' \
+            "The APK was built from main commit \`$GITHUB_SHA\`." \
+            'Do not edit this branch manually.' \
+            > "$PUBLISH_DIR/README.md"
+
+          previous_snapshot="$(
+            git ls-remote origin "refs/heads/$SNAPSHOT_BRANCH" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          parent_args=()
+          if [[ -n "$previous_snapshot" ]]; then
+            if [[ ! "$previous_snapshot" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "The codec snapshot branch returned an invalid commit." >&2
+              exit 1
+            fi
+            git fetch --no-tags --depth=1 origin "refs/heads/$SNAPSHOT_BRANCH"
+            fetched_snapshot="$(git rev-parse FETCH_HEAD)"
+            if [[ "$fetched_snapshot" != "$previous_snapshot" ]]; then
+              echo "The codec snapshot branch changed while it was fetched." >&2
+              exit 1
+            fi
+            parent_args=(-p "$previous_snapshot")
+          fi
+
+          index_file="$RUNNER_TEMP/codec-snapshot-index-$GITHUB_RUN_ID"
+          trap 'rm -f -- "$index_file"' EXIT
+          GIT_INDEX_FILE="$index_file" \
+            git --work-tree="$PUBLISH_DIR" add --all
+          snapshot_tree="$(
+            GIT_INDEX_FILE="$index_file" git write-tree
+          )"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          snapshot_commit="$(
+            printf 'Publish codec runtime built from %s\n' "$GITHUB_SHA" |
+              git commit-tree "$snapshot_tree" "${parent_args[@]}"
+          )"
+
+          current_snapshot="$(
+            git ls-remote origin "refs/heads/$SNAPSHOT_BRANCH" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ "$current_snapshot" != "$previous_snapshot" ]]; then
+            echo "The codec snapshot branch changed before it could be published." >&2
+            exit 1
+          fi
+
+          git push origin "$snapshot_commit:refs/heads/$SNAPSHOT_BRANCH"
