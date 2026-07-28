@@ -1,6 +1,6 @@
 # luci-app-videoplayer
 
-A playful but functional video player for **OpenWrt**, integrated into **LuCI**.
+A joke but functional video player for **OpenWrt**, integrated into **LuCI**.
 Videos are played by the client browser through the HTML5 `<video>` element;
 the router only lists the media library and serves files over HTTP. It does not
 use HDMI, a framebuffer, or video decoding on the router itself.
