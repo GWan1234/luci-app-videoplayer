@@ -345,7 +345,9 @@ generate_random_token() {
 	: > "$renderer_token_marker"
 	printf '22222222222222222222222222222222\n'
 }
-for fps_case in 5:200 8:125 12:83 15:67 20:50 24:42 30:33; do
+for fps_case in \
+	5:200 8:125 12:83 15:67 20:50 24:42 30:33 48:21 50:20 60:17
+do
 	test_router_fps="${fps_case%%:*}"
 	expected_interval="${fps_case##*:}"
 	VIDEOPLAYER_TEST_ROUTER_FPS="$test_router_fps"
@@ -355,9 +357,12 @@ for fps_case in 5:200 8:125 12:83 15:67 20:50 24:42 30:33; do
 		"$expected_interval" \
 		"frame interval for $test_router_fps FPS"
 done
-VIDEOPLAYER_TEST_ROUTER_FPS=31
-assert_eq "$(get_router_fps)" "8" "out-of-range router FPS fallback"
-VIDEOPLAYER_TEST_ROUTER_FPS=30
+for invalid_router_fps in 31 61; do
+	VIDEOPLAYER_TEST_ROUTER_FPS="$invalid_router_fps"
+	assert_eq "$(get_router_fps)" "8" \
+		"unsupported router FPS $invalid_router_fps fallback"
+done
+VIDEOPLAYER_TEST_ROUTER_FPS=60
 cmd_resolve '{}' router >/dev/null
 [[ ! -e "$stream_token_marker" ]] ||
 	fail "router mode allocated a browser stream token"
@@ -379,8 +384,8 @@ assert_eq "${json_fields[audio_sample_rate]:-}" "48000" \
 assert_eq "${json_fields[audio_channels]:-}" "2" "router audio channels"
 assert_eq "${json_fields[audio_frames_per_chunk]:-}" "12000" \
 	"router audio chunk frames"
-assert_eq "${json_fields[router_fps]:-}" "30" "router FPS"
-assert_eq "${json_fields[frame_interval_ms]:-}" "33" \
+assert_eq "${json_fields[router_fps]:-}" "60" "router FPS"
+assert_eq "${json_fields[frame_interval_ms]:-}" "17" \
 	"router frame interval"
 
 test_request_path="movie.mp4"

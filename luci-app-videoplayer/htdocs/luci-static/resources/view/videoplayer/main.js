@@ -19,9 +19,9 @@ const callStopRenderer   = rpc.declare({
 	nobatch: true
 });
 const PAGE_SIZE = 100;
-const CPU_ROUTER_FPS_OPTIONS = [ 5, 8, 12, 15, 20, 24, 30 ];
+const CPU_ROUTER_FPS_OPTIONS = [ 5, 8, 12, 15, 20, 24, 30, 48, 50, 60 ];
 const CPU_DEFAULT_FRAME_INTERVAL_MS = 125;
-const CPU_MIN_FRAME_INTERVAL_MS = 33;
+const CPU_MIN_FRAME_INTERVAL_MS = 17;
 const CPU_MAX_FRAME_INTERVAL_MS = 200;
 const CPU_HIDDEN_INTERVAL_MS = 2000;
 const CPU_FRAME_REQUEST_TIMEOUT_MS = 2500;
@@ -376,7 +376,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-router-fps-desc',
 								class: 'cbi-value-description'
-							}, _('Used only for router CPU rendering. 8 FPS is the balanced default and 5 reduces load. Higher settings are progressively heavier; 30 FPS is the maximum and may overload many routers.'))
+							}, _('Used only for router CPU rendering. 8 FPS is the balanced default and 5 reduces load. Higher settings are progressively heavier; 60 FPS is the maximum target, may overload even fast routers, and is not guaranteed.'))
 						])
 					]),
 					E('div', { class: 'cbi-value' }, [

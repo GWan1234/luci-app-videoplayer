@@ -99,7 +99,7 @@ get_router_fps() {
 
 	value="$(uci -q get videoplayer.main.router_fps 2>/dev/null)" || value=""
 	case "$value" in
-		5|8|12|15|20|24|30) printf '%s\n' "$value" ;;
+		5|8|12|15|20|24|30|48|50|60) printf '%s\n' "$value" ;;
 		*) printf '8\n' ;;
 	esac
 }

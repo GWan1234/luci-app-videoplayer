@@ -38,8 +38,8 @@ mkdir -m 0755 -- "$bin" "$work/media"
 
 export VIDEOPLAYER_TEST_MEDIA_ROOT="$work/media"
 export VIDEOPLAYER_TEST_RUNTIME="$runtime"
-export VIDEOPLAYER_TEST_ROUTER_FPS=30
-export VIDEOPLAYER_EXPECT_FPS=30
+export VIDEOPLAYER_TEST_ROUTER_FPS=60
+export VIDEOPLAYER_EXPECT_FPS=60
 
 terminate_owned_pid() {
 	local pid="${1:-}" cmdline

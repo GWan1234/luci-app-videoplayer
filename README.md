@@ -18,7 +18,7 @@ while a separate APK-only installer follows the latest successfully tested
 | Mode | How it works |
 |---|---|
 | Browser decoding | Browse local storage and stream the original file to the HTML5 `<video>` element with HTTP Range support |
-| Router CPU rendering | FFmpeg decodes a local file on the router and publishes JPEG frames at selectable presets from 5 to 30 FPS; audio uses router-generated PCM when available and otherwise the original protected stream in a hidden browser audio element |
+| Router CPU rendering | FFmpeg decodes a local file on the router and publishes JPEG frames at selectable presets from 5 to 60 FPS; audio uses router-generated PCM when available and otherwise the original protected stream in a hidden browser audio element |
 | Remote URLs | Play `http://` and `https://` URLs directly in the browser; remote URLs are never fetched by FFmpeg on the router |
 | Interface | **Services → Video Player** page in LuCI |
 
@@ -460,7 +460,7 @@ config videoplayer 'main'
 | `media_path` | Root directory of the local media library |
 | `allow_remote` | Show the remote URL field in the interface |
 | `render_mode` | Local playback mode: `browser` or `router`; unknown values safely fall back to `browser` |
-| `router_fps` | Router CPU output frame rate: `5`, `8` (default), `12`, `15`, `20`, `24`, or `30` (maximum); unknown values safely fall back to `8` |
+| `router_fps` | Router CPU output frame rate: `5`, `8` (default), `12`, `15`, `20`, `24`, `30`, `48`, `50`, or `60` (maximum); unknown values safely fall back to `8` |
 | `max_depth` | Maximum traversal depth for nested directories |
 
 The `uci-defaults` script is idempotent: it restores a missing section and adds
@@ -494,10 +494,12 @@ on the package manager and whether the file has been modified.
 - This is a web interface, not a hardware HDMI player.
 - Browser mode codec support depends on the client browser.
 - Router CPU mode is experimental and capped at 640×360. Its frame rate is
-  selectable at 5, 8, 12, 15, 20, 24, or 30 FPS. The default is 8 FPS; higher
-  settings progressively increase CPU and network load, and 30 FPS may overload
-  many routers. Actual playback can be slower when the router or browser cannot
-  decode, publish, transfer, and display a frame every 33 milliseconds.
+  selectable at 5, 8, 12, 15, 20, 24, 30, 48, 50, or 60 FPS. The default is
+  8 FPS; higher settings progressively increase CPU and network load, and
+  60 FPS may overload even fast routers. Actual playback can be slower when the
+  router or browser cannot decode, publish, transfer, and display a frame every
+  17 milliseconds. Selecting a rate above the source video's frame rate
+  duplicates frames; it does not perform motion interpolation.
 - Router CPU audio first uses signed 16-bit stereo PCM chunks at 48 kHz and the
   browser Web Audio API. If PCM is unavailable or fails, video remains
   router-rendered while a hidden HTML media element decodes the original audio
