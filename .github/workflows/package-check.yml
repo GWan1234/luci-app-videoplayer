@@ -59,6 +59,8 @@ jobs:
           shellcheck -s sh codec-runtime/validate-runtime.sh
           bash -n tests/local-listing.sh
           shellcheck -s bash tests/local-listing.sh
+          bash -n tests/installer-entrypoints.sh
+          shellcheck -s bash tests/installer-entrypoints.sh
           bash -n tests/renderer-behavior.sh
           shellcheck -s bash tests/renderer-behavior.sh
           node --check tests/web-audio.js
@@ -115,6 +117,10 @@ jobs:
       - name: Exercise local media listing
         shell: bash
         run: bash tests/local-listing.sh "$GITHUB_WORKSPACE"
+
+      - name: Exercise remote installer entry points
+        shell: bash
+        run: bash tests/installer-entrypoints.sh "$GITHUB_WORKSPACE"
 
       - name: Exercise renderer lifecycle
         shell: bash

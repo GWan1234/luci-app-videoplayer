@@ -15,6 +15,8 @@ IPK_SHA256="045ac25a604175c9a793e4a50509ccad4155dd46d81ef1deac360479aa40aa24"
 
 # POSIX ulimit -f counts 512-byte blocks. This caps a download at 4 MiB.
 MAX_PACKAGE_BLOCKS="8192"
+DOWNLOAD_TIMEOUT_SECONDS="30"
+DOWNLOAD_DEADLINE_SECONDS="180"
 WORK_DIR=""
 
 die() {
@@ -35,6 +37,28 @@ cleanup() {
 	esac
 }
 
+run_with_download_deadline() {
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "$DOWNLOAD_DEADLINE_SECONDS" "$@"
+	else
+		"$@"
+	fi
+}
+
+check_download_size() {
+	download_path="$1"
+	max_bytes=$((MAX_PACKAGE_BLOCKS * 512))
+	download_size="$(wc -c < "$download_path" | tr -d '[:space:]')"
+
+	case "$download_size" in
+		''|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$download_size" -gt 0 ] &&
+		[ "$download_size" -le "$max_bytes" ]
+}
+
 download_file() (
 	url="$1"
 	destination="$2"
@@ -44,25 +68,52 @@ download_file() (
 	fi
 
 	if command -v uclient-fetch >/dev/null 2>&1; then
-		uclient-fetch -O "$destination" "$url"
+		if ! run_with_download_deadline \
+			uclient-fetch -T "$DOWNLOAD_TIMEOUT_SECONDS" \
+			-O "$destination" "$url"; then
+			exit 1
+		fi
 	elif command -v wget >/dev/null 2>&1; then
-		wget -O "$destination" "$url"
+		if ! run_with_download_deadline \
+			wget -T "$DOWNLOAD_TIMEOUT_SECONDS" \
+			-O "$destination" "$url"; then
+			exit 1
+		fi
 	elif command -v curl >/dev/null 2>&1; then
-		curl -fL --retry 3 --connect-timeout 20 -o "$destination" "$url"
+		if ! run_with_download_deadline \
+			curl -fL --retry 2 --retry-delay 1 \
+			--connect-timeout "$DOWNLOAD_TIMEOUT_SECONDS" \
+			--max-time "$DOWNLOAD_DEADLINE_SECONDS" \
+			--proto '=https' --proto-redir '=https' \
+			-o "$destination" "$url"; then
+			exit 1
+		fi
 	else
 		die "No HTTPS downloader found (uclient-fetch, wget, or curl is required)."
 	fi
+
+	check_download_size "$destination"
 )
 
-case "${1:-}" in
-	"")
+# Keep all side effects behind the final entry-point call so the installer is
+# inert until a complete script has been parsed.
+main() {
+case "$#" in
+	0)
 		;;
-	-h|--help)
-		printf '%s\n' \
-			"Usage: sh install-from-github.sh" \
-			"" \
-			"Downloads, verifies, and installs luci-app-videoplayer $RELEASE_VERSION on OpenWrt."
-		exit 0
+	1)
+		case "$1" in
+			-h|--help)
+				printf '%s\n' \
+					"Usage: sh install-from-github.sh" \
+					"" \
+					"Downloads, verifies, and installs luci-app-videoplayer $RELEASE_VERSION on OpenWrt."
+				exit 0
+				;;
+			*)
+				die "This installer does not accept arguments."
+				;;
+		esac
 		;;
 	*)
 		die "This installer does not accept arguments."
@@ -71,12 +122,14 @@ esac
 
 [ -r /etc/openwrt_release ] ||
 	die "This installer must be run on OpenWrt."
+command -v id >/dev/null 2>&1 ||
+	die "Required command is missing: id"
 [ "$(id -u)" = "0" ] ||
 	die "Run this installer as root."
-command -v sha256sum >/dev/null 2>&1 ||
-	die "The sha256sum command is required to verify the package."
-command -v mktemp >/dev/null 2>&1 ||
-	die "The mktemp command is required."
+for required_command in mktemp sha256sum tr wc; do
+	command -v "$required_command" >/dev/null 2>&1 ||
+		die "Required command is missing: $required_command"
+done
 
 HAS_APK="0"
 HAS_OPKG="0"
@@ -151,3 +204,6 @@ printf '%s\n' \
 	"Installation complete." \
 	"Sign out of LuCI and sign in again if the menu item is not visible." \
 	"Open LuCI -> Services -> Video Player."
+}
+
+main "$@"

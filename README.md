@@ -166,20 +166,13 @@ After preparing the storage, connect to the router over SSH as `root`. The
 router must have working HTTPS access to GitHub:
 
 ```sh
-(
-	set -e
-	installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"
-	trap 'rm -f "$installer"' 0
-	trap 'exit 129' 1
-	trap 'exit 130' 2
-	trap 'exit 143' 15
-	(
-		ulimit -f 1024
-		wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-from-github.sh'
-	)
-	sh "$installer"
-)
+(set -eu; installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-from-github.sh'); [ -s "$installer" ]; sh "$installer")
 ```
+
+This one-line bootstrap downloads the complete installer into a private,
+size-limited temporary file before executing it and removes that file on exit.
+It deliberately does not pipe partially downloaded network content into a
+shell.
 
 The installer currently installs the latest published release, not the newer
 1.1.0 source tree. It detects whether the router uses `apk` or `opkg`,
@@ -196,20 +189,11 @@ To install the newest successfully tested `main` source instead of Release
 1.0.0, use the separate APK-only installer:
 
 ```sh
-(
-	set -e
-	installer="$(mktemp /tmp/install-videoplayer-main.XXXXXX)"
-	trap 'rm -f "$installer"' 0
-	trap 'exit 129' 1
-	trap 'exit 130' 2
-	trap 'exit 143' 15
-	(
-		ulimit -f 1024
-		wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-main-apk.sh'
-	)
-	sh "$installer"
-)
+(set -eu; installer="$(mktemp /tmp/install-videoplayer-main.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-main-apk.sh'); [ -s "$installer" ]; sh "$installer")
 ```
+
+This command uses the same download-first, size-limited bootstrap described
+above.
 
 After every successful package-check run for a push to `main`, GitHub Actions
 rebuilds the current source package and publishes the architecture-scoped

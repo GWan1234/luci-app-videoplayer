@@ -154,16 +154,26 @@ read_commit_sha() {
 	printf '%s\n' "$sha_value"
 }
 
-case "${1:-}" in
-	"")
+# Keep all side effects behind the final entry-point call so the installer is
+# inert until a complete script has been parsed.
+main() {
+case "$#" in
+	0)
 		;;
-	-h|--help)
-		printf '%s\n' \
-			"Usage: sh install-main-apk.sh" \
-			"" \
-			"Downloads, verifies, and installs the APK built from the current main branch." \
-			"This installer supports only OpenWrt versions that use apk."
-		exit 0
+	1)
+		case "$1" in
+			-h|--help)
+				printf '%s\n' \
+					"Usage: sh install-main-apk.sh" \
+					"" \
+					"Downloads, verifies, and installs the APK built from the current main branch." \
+					"This installer supports only OpenWrt versions that use apk."
+				exit 0
+				;;
+			*)
+				die "This installer does not accept arguments."
+				;;
+		esac
 		;;
 	*)
 		die "This installer does not accept arguments."
@@ -172,6 +182,8 @@ esac
 
 [ -r /etc/openwrt_release ] ||
 	die "This installer must be run on OpenWrt."
+command -v id >/dev/null 2>&1 ||
+	die "The id command is required."
 [ "$(id -u)" = "0" ] ||
 	die "Run this installer as root."
 command -v apk >/dev/null 2>&1 ||
@@ -338,3 +350,6 @@ printf '%s\n' \
 	"Installation complete." \
 	"Sign out of LuCI and sign in again if the menu item is not visible." \
 	"Open LuCI -> Services -> Video Player."
+}
+
+main "$@"
