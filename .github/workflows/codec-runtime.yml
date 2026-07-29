@@ -493,6 +493,16 @@ jobs:
             echo "The codec snapshot branch changed before publication." >&2
             exit 1
           fi
+
+          remote_main="$(
+            git ls-remote origin refs/heads/main |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
+            echo "Main changed before publication; refusing stale codec packages." >&2
+            exit 1
+          fi
+
           git push origin \
             "$snapshot_commit:refs/heads/$SNAPSHOT_BRANCH" \
             "--force-with-lease=refs/heads/$SNAPSHOT_BRANCH:$previous_snapshot"
