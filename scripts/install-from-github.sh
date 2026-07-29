@@ -17,6 +17,7 @@ IPK_SHA256="045ac25a604175c9a793e4a50509ccad4155dd46d81ef1deac360479aa40aa24"
 MAX_PACKAGE_BLOCKS="8192"
 DOWNLOAD_TIMEOUT_SECONDS="30"
 DOWNLOAD_DEADLINE_SECONDS="180"
+HAS_WORKING_TIMEOUT="0"
 WORK_DIR=""
 
 die() {
@@ -37,8 +38,16 @@ cleanup() {
 	esac
 }
 
+detect_working_timeout() {
+	HAS_WORKING_TIMEOUT="0"
+	if command -v timeout >/dev/null 2>&1 &&
+		timeout 1 /bin/sh -c ':' >/dev/null 2>&1; then
+		HAS_WORKING_TIMEOUT="1"
+	fi
+}
+
 run_with_download_deadline() {
-	if command -v timeout >/dev/null 2>&1; then
+	if [ "$HAS_WORKING_TIMEOUT" = "1" ]; then
 		timeout "$DOWNLOAD_DEADLINE_SECONDS" "$@"
 	else
 		"$@"
@@ -130,6 +139,7 @@ for required_command in mktemp sha256sum tr wc; do
 	command -v "$required_command" >/dev/null 2>&1 ||
 		die "Required command is missing: $required_command"
 done
+detect_working_timeout
 
 HAS_APK="0"
 HAS_OPKG="0"

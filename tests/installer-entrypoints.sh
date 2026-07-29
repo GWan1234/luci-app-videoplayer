@@ -15,6 +15,58 @@ cleanup() {
 }
 trap cleanup EXIT
 
+broken_timeout_bin="$tmp/broken-timeout-bin"
+mkdir "$broken_timeout_bin"
+cat > "$broken_timeout_bin/timeout" <<'EOF'
+#!/bin/sh
+: "${TIMEOUT_PROBE_LOG:?}"
+printf x >> "$TIMEOUT_PROBE_LOG"
+printf '%s\n' 'timeout: applet not found' >&2
+exit 127
+EOF
+chmod 0755 "$broken_timeout_bin/timeout"
+
+working_timeout_bin="$tmp/working-timeout-bin"
+mkdir "$working_timeout_bin"
+cat > "$working_timeout_bin/timeout" <<'EOF'
+#!/bin/sh
+: "${TIMEOUT_PROBE_LOG:?}"
+printf x >> "$TIMEOUT_PROBE_LOG"
+shift
+exec "$@"
+EOF
+chmod 0755 "$working_timeout_bin/timeout"
+
+cat > "$tmp/probe-timeout-fallback.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+fallback_marker="$2"
+
+# shellcheck disable=SC1090
+. "$installer_without_main"
+detect_working_timeout
+[ "$HAS_WORKING_TIMEOUT" = "0" ]
+run_with_download_deadline \
+	/bin/sh -c 'printf fallback > "$1"' sh "$fallback_marker"
+EOF
+
+cat > "$tmp/probe-working-timeout.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+deadline_marker="$2"
+
+# shellcheck disable=SC1090
+. "$installer_without_main"
+detect_working_timeout
+[ "$HAS_WORKING_TIMEOUT" = "1" ]
+run_with_download_deadline \
+	/bin/sh -c 'printf deadline > "$1"' sh "$deadline_marker"
+EOF
+
 mapfile -t bootstrap_commands < <(
 	grep -E '^\(set -eu; installer=' "$root/README.md"
 )
@@ -59,12 +111,48 @@ do
 		exit 1
 	}
 
+	loaded_installer="$tmp/${relative_path##*/}.without-main"
+	sed '$d' "$installer" > "$loaded_installer"
 	: > "$tmp/truncated.stdout"
 	: > "$tmp/truncated.stderr"
-	sed '$d' "$installer" |
-		sh >"$tmp/truncated.stdout" 2>"$tmp/truncated.stderr"
+	sh "$loaded_installer" \
+		>"$tmp/truncated.stdout" 2>"$tmp/truncated.stderr"
 	[[ ! -s "$tmp/truncated.stdout" && ! -s "$tmp/truncated.stderr" ]] || {
 		printf '%s performed work without its final entry point.\n' \
+			"$relative_path" >&2
+		exit 1
+	}
+
+	timeout_probe_log="$tmp/${relative_path##*/}.timeout-probe"
+	fallback_marker="$tmp/${relative_path##*/}.fallback"
+	PATH="$broken_timeout_bin:$PATH" \
+		TIMEOUT_PROBE_LOG="$timeout_probe_log" \
+		sh "$tmp/probe-timeout-fallback.sh" \
+		"$loaded_installer" "$fallback_marker"
+	[[ "$(cat "$timeout_probe_log")" == "x" ]] || {
+		printf '%s retried an unusable timeout command.\n' \
+			"$relative_path" >&2
+		exit 1
+	}
+	[[ "$(cat "$fallback_marker")" == "fallback" ]] || {
+		printf '%s did not bypass an unusable timeout command.\n' \
+			"$relative_path" >&2
+		exit 1
+	}
+
+	working_timeout_log="$tmp/${relative_path##*/}.working-timeout"
+	deadline_marker="$tmp/${relative_path##*/}.deadline"
+	PATH="$working_timeout_bin:$PATH" \
+		TIMEOUT_PROBE_LOG="$working_timeout_log" \
+		sh "$tmp/probe-working-timeout.sh" \
+		"$loaded_installer" "$deadline_marker"
+	[[ "$(cat "$working_timeout_log")" == "xx" ]] || {
+		printf '%s did not reuse a validated timeout command.\n' \
+			"$relative_path" >&2
+		exit 1
+	}
+	[[ "$(cat "$deadline_marker")" == "deadline" ]] || {
+		printf '%s did not use a validated timeout command.\n' \
 			"$relative_path" >&2
 		exit 1
 	}

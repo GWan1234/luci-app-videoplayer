@@ -19,6 +19,7 @@ MAX_METADATA_BLOCKS="128"
 MAX_PACKAGE_BLOCKS="8192"
 DOWNLOAD_TIMEOUT_SECONDS="30"
 DOWNLOAD_DEADLINE_SECONDS="180"
+HAS_WORKING_TIMEOUT="0"
 WORK_DIR=""
 
 die() {
@@ -39,8 +40,16 @@ cleanup() {
 	esac
 }
 
+detect_working_timeout() {
+	HAS_WORKING_TIMEOUT="0"
+	if command -v timeout >/dev/null 2>&1 &&
+		timeout 1 /bin/sh -c ':' >/dev/null 2>&1; then
+		HAS_WORKING_TIMEOUT="1"
+	fi
+}
+
 run_with_download_deadline() {
-	if command -v timeout >/dev/null 2>&1; then
+	if [ "$HAS_WORKING_TIMEOUT" = "1" ]; then
 		timeout "$DOWNLOAD_DEADLINE_SECONDS" "$@"
 	else
 		"$@"
@@ -199,6 +208,7 @@ command -v tr >/dev/null 2>&1 ||
 	die "The tr command is required."
 command -v wc >/dev/null 2>&1 ||
 	die "The wc command is required."
+detect_working_timeout
 
 # shellcheck disable=SC1091
 . /etc/openwrt_release
@@ -227,7 +237,8 @@ SNAPSHOT_REF_PATH="$WORK_DIR/snapshot-ref"
 SNAPSHOT_REF_URL="$API_BASE_URL/commits/$SNAPSHOT_BRANCH"
 printf 'Resolving the latest successful main APK...\n'
 if ! download_commit_sha "$SNAPSHOT_REF_URL" "$SNAPSHOT_REF_PATH"; then
-	die "No published main APK was found. Wait for the GitHub package checks and retry."
+	die \
+		"Could not resolve the published main APK snapshot. Check the downloader error above and GitHub HTTPS connectivity, then retry."
 fi
 SNAPSHOT_COMMIT="$(read_commit_sha "$SNAPSHOT_REF_PATH")" ||
 	die "GitHub returned an invalid snapshot commit identifier."

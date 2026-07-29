@@ -223,10 +223,15 @@ command -v id >/dev/null 2>&1 ||
 [ "$(id -u)" = "0" ] ||
 	die "Run this installer as root."
 
-for required_command in grep mktemp sed sha256sum timeout tr wc; do
+for required_command in grep mktemp sed sha256sum tr wc; do
 	command -v "$required_command" >/dev/null 2>&1 ||
 		die "Required command is missing: $required_command"
 done
+if ! command -v timeout >/dev/null 2>&1 ||
+	! timeout 1 /bin/sh -c ':' >/dev/null 2>&1; then
+	die \
+		"Required command is missing or unusable: timeout (install coreutils-timeout)."
+fi
 if ! command -v uclient-fetch >/dev/null 2>&1 &&
 	! command -v wget >/dev/null 2>&1 &&
 	! command -v curl >/dev/null 2>&1; then
@@ -277,7 +282,8 @@ SNAPSHOT_REF_PATH="$WORK_DIR/codec-snapshot-ref"
 SNAPSHOT_REF_URL="$API_BASE_URL/commits/$SNAPSHOT_BRANCH"
 printf 'Resolving the published codec snapshot...\n'
 if ! download_commit_sha "$SNAPSHOT_REF_URL" "$SNAPSHOT_REF_PATH"; then
-	die "No published codec snapshot was found. Wait for its GitHub build and retry."
+	die \
+		"Could not resolve the published codec snapshot. Check the downloader error above and GitHub HTTPS connectivity, then retry."
 fi
 SNAPSHOT_COMMIT="$(read_commit_sha "$SNAPSHOT_REF_PATH")" ||
 	die "GitHub returned an invalid codec snapshot commit identifier."
