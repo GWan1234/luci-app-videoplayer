@@ -1314,7 +1314,9 @@ audio_sequence_bounds() {
 	dir="$RUNTIME_DIR/s-$token"
 	for path in "$dir"/audio-????????.pcm; do
 		[ -e "$path" ] || [ -L "$path" ] || continue
-		[ -f "$path" ] && [ ! -L "$path" ] || continue
+		if [ ! -f "$path" ] || [ -L "$path" ]; then
+			continue
+		fi
 		name="${path##*/}"
 		sequence="${name#audio-}"
 		sequence="${sequence%.pcm}"
@@ -1403,7 +1405,9 @@ cmd_audio_chunker() {
 			kill -TERM "$watchdog_pid" 2>/dev/null || :
 			wait "$watchdog_pid" 2>/dev/null || :
 		fi
-		[ -n "${tmp:-}" ] && rm -f -- "$tmp" 2>/dev/null || :
+		if [ -n "${tmp:-}" ]; then
+			rm -f -- "$tmp" 2>/dev/null || :
+		fi
 		exit 1
 	}
 	trap stop_chunker HUP INT TERM
@@ -1465,7 +1469,9 @@ cmd_audio_chunker() {
 			rm -f -- "$tmp" 2>/dev/null || :
 			break
 		}
-		[ -f "$tmp" ] && [ ! -L "$tmp" ] || break
+		if [ ! -f "$tmp" ] || [ -L "$tmp" ]; then
+			break
+		fi
 		size="$(stat -L -c '%s' -- "$tmp" 2>/dev/null)" || size=""
 		if [ "$size" = "0" ]; then
 			rm -f -- "$tmp" 2>/dev/null || :
@@ -1562,7 +1568,9 @@ cmd_worker() {
 		"$dir/audio-state" "$dir/audio" "$dir/chunker" "$audio_pipe" \
 		2>/dev/null || :
 	for audio_file in "$dir"/audio-????????.pcm; do
-		[ -f "$audio_file" ] && [ ! -L "$audio_file" ] || continue
+		if [ ! -f "$audio_file" ] || [ -L "$audio_file" ]; then
+			continue
+		fi
 		rm -f -- "$audio_file" 2>/dev/null || :
 	done
 	if probe_selected_audio && open_audio_source_fd "$SESSION_PATH"; then
