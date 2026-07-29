@@ -337,6 +337,7 @@ def verify_elf(data: bytes, architecture: str) -> None:
     )
 
     executable_load = False
+    entry_in_executable_load = False
     executable_payload = bytearray()
     load_count = 0
     dynamic_count = 0
@@ -363,11 +364,14 @@ def verify_elf(data: bytes, architecture: str) -> None:
                 memory_size,
             ) = struct.unpack_from(f"{endian}QQQQQ", data, offset + 8)
         require(
-            file_size <= memory_size
-            and segment_offset <= len(data)
-            and file_size <= len(data) - segment_offset,
+            segment_offset <= len(data) and file_size <= len(data) - segment_offset,
             "Private FFmpeg ELF segment exceeds the file",
         )
+        if segment_type in {1, 7}:
+            require(
+                file_size <= memory_size,
+                "Private FFmpeg ELF load/TLS file size exceeds memory size",
+            )
         if segment_type == 1:
             load_count += 1
             if flags & 1 and file_size:
@@ -375,9 +379,8 @@ def verify_elf(data: bytes, architecture: str) -> None:
                 executable_payload.extend(
                     data[segment_offset : segment_offset + file_size]
                 )
-                require(
-                    virtual_address <= entry_point < virtual_address + memory_size,
-                    "Private FFmpeg ELF entry point is outside its executable segment",
+                entry_in_executable_load |= (
+                    virtual_address <= entry_point < virtual_address + memory_size
                 )
         elif segment_type == 2:
             dynamic_count += 1
@@ -386,6 +389,10 @@ def verify_elf(data: bytes, architecture: str) -> None:
             interpreter = data[segment_offset : segment_offset + file_size]
 
     require(executable_load, "Private FFmpeg ELF has no executable PT_LOAD segment")
+    require(
+        entry_in_executable_load,
+        "Private FFmpeg ELF entry point is outside its executable segments",
+    )
     require(load_count >= 2, "Private FFmpeg ELF has too few PT_LOAD segments")
     require(dynamic_count == 1, "Private FFmpeg ELF must have one PT_DYNAMIC segment")
     require(
@@ -499,7 +506,7 @@ def verify_payload(
     architecture: str,
     external_build_info: bytes,
     expected_binary: bytes | None,
-) -> None:
+) -> bytes:
     expected_paths = {FFMPEG_PATH, BUILD_INFO_PATH}
     if package_format == "apk":
         expected_paths.add(APK_LIST_PATH)
@@ -528,6 +535,7 @@ def verify_payload(
         expected_list = f"/{FFMPEG_PATH}\n/{BUILD_INFO_PATH}\n".encode()
         require(list_mode == MODE_FILE, "APK package-list mode must be 0644")
         require(package_list == expected_list, "APK package-list content is incorrect")
+    return ffmpeg
 
 
 def verify_ipk(
@@ -537,7 +545,7 @@ def verify_ipk(
     external_build_info: bytes,
     build_info_values: dict[str, str],
     expected_binary: bytes | None,
-) -> None:
+) -> bytes:
     outer, outer_directories, _ = verify_packages.parse_tar_gz(
         verify_packages.read_limited_file(
             package_path, MAX_CODEC_PACKAGE_BYTES, "codec IPK"
@@ -616,7 +624,7 @@ def verify_ipk(
         max_members=MAX_CODEC_PAYLOAD_FILES + 32,
     )
     payload = {name: (body, mode) for name, (body, mode, _) in data_members.items()}
-    verify_payload(
+    return verify_payload(
         payload,
         package_format="ipk",
         architecture=architecture,
@@ -750,7 +758,7 @@ def verify_apk(
     external_build_info: bytes,
     build_info_values: dict[str, str],
     expected_binary: bytes | None,
-) -> None:
+) -> bytes:
     adb_data, data_blocks = verify_packages.parse_apk_blocks(
         verify_packages.read_limited_file(
             package_path, MAX_CODEC_PACKAGE_BYTES, "codec APK"
@@ -818,7 +826,7 @@ def verify_apk(
         reader.integer(info[12]) == sum(len(body) for body, _ in payload.values()),
         "Codec APK installed-size does not match its payload",
     )
-    verify_payload(
+    return verify_payload(
         payload,
         package_format="apk",
         architecture=architecture,
@@ -834,7 +842,7 @@ def verify_codec_package(
     architecture: str,
     build_info_path: Path,
     expected_binary_path: Path | None = None,
-) -> None:
+) -> bytes:
     require(package_format in {"apk", "ipk"}, "Package format must be apk or ipk")
     require(
         architecture in codec_matrix.EXPECTED_ARCHITECTURES,
@@ -872,7 +880,7 @@ def verify_codec_package(
         verify_elf(expected_binary, architecture)
     try:
         if package_format == "ipk":
-            verify_ipk(
+            packaged_binary = verify_ipk(
                 package_path,
                 architecture=architecture,
                 external_build_info=external_build_info,
@@ -880,7 +888,7 @@ def verify_codec_package(
                 expected_binary=expected_binary,
             )
         else:
-            verify_apk(
+            packaged_binary = verify_apk(
                 package_path,
                 architecture=architecture,
                 external_build_info=external_build_info,
@@ -889,6 +897,31 @@ def verify_codec_package(
             )
     except verify_packages.PackageVerificationError as exc:
         raise CodecPackageVerificationError(str(exc)) from exc
+    return packaged_binary
+
+
+def write_verified_binary(destination: Path, packaged_binary: bytes) -> None:
+    require(
+        destination.parent.is_dir() and not destination.parent.is_symlink(),
+        f"Extracted-binary parent is missing or unsafe: {destination.parent}",
+    )
+    require(
+        not destination.exists() and not destination.is_symlink(),
+        f"Refusing to overwrite extracted-binary path: {destination}",
+    )
+    created = False
+    try:
+        with destination.open("xb") as output:
+            created = True
+            output.write(packaged_binary)
+        destination.chmod(MODE_EXEC)
+    except OSError:
+        if created and destination.is_file() and not destination.is_symlink():
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def parse_args() -> argparse.Namespace:
@@ -898,18 +931,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--build-info", type=Path, required=True)
     parser.add_argument("--expected-binary", type=Path)
+    parser.add_argument(
+        "--extract-binary",
+        type=Path,
+        help="write the verified FFmpeg ELF from the package to a new file",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    verify_codec_package(
+    packaged_binary = verify_codec_package(
         args.package,
         package_format=args.format,
         architecture=args.architecture,
         build_info_path=args.build_info,
         expected_binary_path=args.expected_binary,
     )
+    if args.extract_binary is not None:
+        write_verified_binary(args.extract_binary, packaged_binary)
     print(
         f"Codec package verified: {args.format.upper()} "
         f"{PACKAGE_VERSION} for {args.architecture}"

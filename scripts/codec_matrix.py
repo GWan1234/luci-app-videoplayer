@@ -93,10 +93,13 @@ SMOKE_BUILD_IDS = {
     "ipk-riscv64_riscv64",
     "ipk-x86_64",
 }
-# QEMU user mode cannot faithfully execute Octeon-specific userspace binaries.
-# This entry still receives strict package, ELF, linkage, and FFmpeg component
-# validation; only the decode/encode execution smoke test is skipped.
+# QEMU user mode cannot faithfully execute Octeon-specific userspace binaries,
+# the selected embedded PowerPC variants, or armeb userspace affected by QEMU's
+# big-endian ARM VDSO crash (qemu-project/qemu#2333). These entries still
+# receive strict package, ELF, linkage, and FFmpeg component validation; only
+# the decode/encode execution smoke test is skipped.
 STATIC_VALIDATION_ARCHITECTURES = {
+    "armeb_xscale",
     "mips64_octeonplus",
     "powerpc64_e5500",
     "powerpc_464fp",

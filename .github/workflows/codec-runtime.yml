@@ -281,12 +281,20 @@ jobs:
         working-directory: ${{ steps.sdk.outputs.sdk_dir }}
         run: |
           set -euo pipefail
-          binary="$(find build_dir -type f \
-            -path '*/.pkgdir/luci-videoplayer-codec-runtime/usr/libexec/videoplayer-ffmpeg/ffmpeg' \
-            -print -quit)"
-          [ -n "$binary" ] && [ -x "$binary" ]
+          mapfile -t package_source_binaries < <(
+            find build_dir -type f \
+              -path '*/.pkgdir/luci-videoplayer-codec-runtime/usr/libexec/videoplayer-ffmpeg/ffmpeg' \
+              -print
+          )
+          if (( ${#package_source_binaries[@]} != 1 )); then
+            echo "Expected one package-source FFmpeg, found ${#package_source_binaries[@]}." >&2
+            printf '  %s\n' "${package_source_binaries[@]}" >&2
+            exit 1
+          fi
+          package_source_binary="${package_source_binaries[0]}"
+          [ -x "$package_source_binary" ]
           suffix="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
-          package_root="${binary%$suffix}"
+          package_root="${package_source_binary%$suffix}"
 
           find "$package_root" \( -type f -o -type l \) \
             -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/package-files.txt"
@@ -332,12 +340,6 @@ jobs:
           if [[ "$VALIDATION_MODE" == qemu ]]; then
             command -v "$QEMU_EXECUTABLE"
           fi
-          chmod +x "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh"
-          VALIDATION_TIMEOUT=300 \
-            "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh" \
-            "$binary" "$sysroot" "$RUNNER_TEMP/codec-validation" \
-            "$QEMU_EXECUTABLE" "$VALIDATION_MODE" \
-            "$config_h" "$component_config"
 
           mapfile -t packages < <(
             find bin -type f -name "$CODEC_FILE" -print
@@ -350,12 +352,20 @@ jobs:
           package="${packages[0]}"
           [ -s "$package" ]
           file "$package"
+          packaged_binary="$RUNNER_TEMP/packaged-videoplayer-ffmpeg"
           python "$GITHUB_WORKSPACE/scripts/verify_codec_package.py" \
             "$package" \
             --format "$PACKAGE_FORMAT" \
             --architecture "$OPENWRT_ARCH" \
             --build-info "$build_info" \
-            --expected-binary "$binary"
+            --extract-binary "$packaged_binary"
+
+          chmod +x "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh"
+          VALIDATION_TIMEOUT=300 \
+            "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh" \
+            "$packaged_binary" "$sysroot" "$RUNNER_TEMP/codec-validation" \
+            "$QEMU_EXECUTABLE" "$VALIDATION_MODE" \
+            "$config_h" "$component_config"
 
           artifact_root="$RUNNER_TEMP/codec-runtime-artifact"
           artifact_target="$artifact_root/$ARTIFACT_DIR"
