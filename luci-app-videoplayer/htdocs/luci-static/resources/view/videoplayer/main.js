@@ -10,6 +10,7 @@ const callList    = rpc.declare({ object: 'luci.videoplayer', method: 'list', pa
 const callRendererList = rpc.declare({ object: 'luci.videoplayer', method: 'list_renderer', params: [ 'path', 'offset', 'limit' ] });
 const callResolve = rpc.declare({ object: 'luci.videoplayer', method: 'resolve', params: [ 'path' ] });
 const callStartRenderer = rpc.declare({ object: 'luci.videoplayer', method: 'start_renderer', params: [ 'path' ] });
+const callResolveAudio = rpc.declare({ object: 'luci.videoplayer', method: 'resolve_audio', params: [ 'token' ] });
 const callRendererStatus = rpc.declare({ object: 'luci.videoplayer', method: 'renderer_status', params: [ 'token' ] });
 const callStopRenderer   = rpc.declare({
 	object: 'luci.videoplayer',
@@ -37,6 +38,7 @@ const CPU_AUDIO_INITIAL_LEAD_SECONDS = 0.12;
 const CPU_AUDIO_MAX_LEAD_SECONDS = 0.75;
 const CPU_VIDEO_AUDIO_DELAY_MS =
 	CPU_AUDIO_CHUNK_MS + Math.round(CPU_AUDIO_INITIAL_LEAD_SECONDS * 1000);
+const CPU_MAX_MEDIA_OFFSET_MS = 21605000;
 
 function formatSize(bytes) {
 	const n = Number(bytes) || 0;
@@ -168,6 +170,8 @@ return view.extend({
 			self._stopRendererBestEffort(previousCpuSession);
 		if (typeof self._clearVideoElement === 'function')
 			self._clearVideoElement();
+		if (typeof self._clearCpuBrowserAudioElement === 'function')
+			self._clearCpuBrowserAudioElement();
 		if (self._pageHideHandler)
 			window.removeEventListener('pagehide', self._pageHideHandler);
 
@@ -338,7 +342,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-render-mode-desc',
 								class: 'cbi-value-description'
-							}, _('Local files only. Router mode uses FFmpeg for video and, when an audio track is supported, streams short PCM chunks to Web Audio in this page. It has no pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build. If video decoding cannot start, the player falls back to browser decoding; an audio failure only makes router playback silent. Remote URLs always use browser decoding.')),
+							}, _('Local files only. Router mode uses FFmpeg for video and, when possible, streams short PCM audio chunks to Web Audio in this page. If router-side audio is unavailable, the browser plays the original audio track while the router continues rendering video frames. This mode has no pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build and browser. If video decoding cannot start, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
 							E('div', {
 								id: 'vp-render-mode-status',
 								class: rendererAvailable === false
@@ -476,6 +480,12 @@ return view.extend({
 							playing: function (ev) { self._handleVideoPlaying(ev); },
 							volumechange: function (ev) { self._handleVolumeChange(ev); }
 						}, _('Your browser does not support HTML5 video.')),
+						E('audio', {
+							id: 'videoplayer-cpu-audio',
+							hidden: 'hidden',
+							preload: 'auto',
+							'aria-hidden': 'true'
+						}),
 						E('img', {
 							id: 'videoplayer-cpu-frame',
 							hidden: 'hidden',
@@ -512,7 +522,7 @@ return view.extend({
 						id: 'vp-cpu-player-note',
 						class: 'cbi-value-description',
 						hidden: 'hidden'
-					}, _('Router CPU mode uses approximate PCM audio synchronisation and has no pause, seeking, or timeline. Audio availability and smoothness depend on the file, codec runtime, and router performance.'))
+					}, _('Router CPU mode has no pause, seeking, or timeline. Video frames are rendered by the router. Audio uses router-decoded PCM when available and otherwise falls back to browser decoding.'))
 				])
 			]),
 
@@ -888,25 +898,124 @@ return view.extend({
 		const button = document.getElementById('vp-mute-btn');
 
 		if (this._currentRenderMode === 'router') {
+			const self = this;
 			const session = this._cpuSession;
 			const audio = session && session.audio;
-			if (!audio || !audio.active || !audio.gain) {
+			const browserAudio = session && session.browserAudio;
+			if (audio && audio.active && audio.gain) {
+				const suspended = audio.resumeFailed ||
+					(audio.context && audio.context.state &&
+					 audio.context.state !== 'running');
+				if (!audio.muted && !suspended) {
+					audio.muted = true;
+					try {
+						audio.gain.gain.setValueAtTime(
+							0,
+							audio.context.currentTime
+						);
+					}
+					catch (err) {
+						audio.gain.gain.value = 0;
+					}
+					self._syncCpuMuteControl();
+					notify(null, _('Muted'), 2000);
+					return Promise.resolve();
+				}
+
+				const resumeAttempt = (Number(audio.resumeAttempt) || 0) + 1;
+				let resumeResult;
+				audio.resumeAttempt = resumeAttempt;
+				if (suspended)
+					audio.resumeRebasePending = true;
+				try {
+					resumeResult = audio.context &&
+						typeof audio.context.resume === 'function'
+						? audio.context.resume()
+						: undefined;
+				}
+				catch (err) {
+					resumeResult = Promise.reject(err);
+				}
+				return Promise.resolve(resumeResult).then(function () {
+					if (!self._isCurrentCpuSession(session) ||
+					    session.audio !== audio || !audio.active ||
+					    audio.resumeAttempt !== resumeAttempt)
+						return false;
+					if (audio.context && audio.context.state &&
+					    audio.context.state !== 'running')
+						throw new Error(_('Audio output is still suspended.'));
+					audio.resumeFailed = false;
+					audio.muted = false;
+					if (suspended && audio.resumeRebasePending) {
+						audio.resumeRebasePending = false;
+						self._rebaseCpuAudio(session, audio);
+					}
+					try {
+						audio.gain.gain.setValueAtTime(
+							1,
+							audio.context.currentTime
+						);
+					}
+					catch (err) {
+						audio.gain.gain.value = 1;
+					}
+					self._syncCpuMuteControl();
+					notify(null, _('Unmuted'), 2000);
+					return true;
+				}).catch(function (err) {
+					if (!self._isCurrentCpuSession(session) ||
+					    session.audio !== audio || !audio.active ||
+					    audio.resumeAttempt !== resumeAttempt)
+						return false;
+					audio.resumeFailed = true;
+					audio.muted = true;
+					try { audio.gain.gain.value = 0; }
+					catch (gainError) {}
+					self._syncCpuMuteControl();
+					notify(null, E('p', {},
+						_('The browser blocked audio output: %s')
+							.format(errorText(err))),
+					5000, 'warning');
+					return false;
+				});
+			}
+			if (browserAudio && browserAudio.active &&
+			    browserAudio.element) {
+				if (!browserAudio.muted && !browserAudio.needsGesture &&
+				    (browserAudio.playing || browserAudio.playPending)) {
+					browserAudio.playAttempt =
+						(Number(browserAudio.playAttempt) || 0) + 1;
+					browserAudio.playPending = false;
+					browserAudio.muted = true;
+					browserAudio.element.muted = true;
+					self._updateCpuAudioPresentation(session);
+					notify(null, _('Muted'), 2000);
+					return Promise.resolve();
+				}
+				if (browserAudio.waitingForVideo) {
+					notify(null, _('Browser audio will start with the first video frame.'), 2000, 'info');
+					return Promise.resolve();
+				}
+				browserAudio.muted = false;
+				browserAudio.needsGesture = false;
+				browserAudio.element.muted = false;
+				browserAudio.playPromise = self._playCpuBrowserAudio(
+					session, browserAudio, true
+				);
+				return browserAudio.playPromise.then(function (started) {
+					if (started)
+						notify(null, _('Unmuted'), 2000);
+				});
+			}
+			if (browserAudio && browserAudio.active &&
+			    browserAudio.resolving) {
+				notify(null, _('Browser audio is still being prepared.'), 2000, 'info');
+				return Promise.resolve();
+			}
+			{
 				notify(null, _('Audio is unavailable for this router-rendered video.'), 3000, 'warning');
 				return Promise.resolve();
 			}
-			audio.muted = !audio.muted;
-			try {
-				audio.gain.gain.setValueAtTime(
-					audio.muted ? 0 : 1,
-					audio.context.currentTime
-				);
-			}
-			catch (err) {
-				audio.gain.gain.value = audio.muted ? 0 : 1;
-			}
-			this._syncCpuMuteControl();
-			notify(null, audio.muted ? _('Muted') : _('Unmuted'), 2000);
-			return Promise.resolve();
 		}
 
 		if (v) {
@@ -1102,7 +1211,7 @@ return view.extend({
 			);
 		}
 		else if (this._rendererAvailable === true && this._renderMode === 'router') {
-			statusEl.textContent = _('The FFmpeg output pipeline is available. Router playback uses %d FPS and Web Audio when the file has a supported audio track. Expect high CPU usage; video startup failures fall back to browser decoding, while audio failures continue silently.').format(this._routerFps);
+			statusEl.textContent = _('The FFmpeg output pipeline is available. Router playback uses %d FPS. Audio uses router-decoded PCM when available and otherwise falls back to browser decoding. Expect high CPU usage; video startup failures fall back to full browser decoding.').format(this._routerFps);
 		}
 		else {
 			statusEl.textContent = '';
@@ -1410,7 +1519,8 @@ return view.extend({
 
 	_createCpuAudio: function () {
 		const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-		let context, gain, resumeResult;
+		const self = this;
+		let context, gain, resumeResult, audio;
 
 		if (typeof AudioContextClass !== 'function')
 			return null;
@@ -1423,11 +1533,72 @@ return view.extend({
 			unlock.buffer = context.createBuffer(1, 1, context.sampleRate);
 			unlock.connect(gain);
 			unlock.start(0);
+			audio = {
+				active: true,
+				context: context,
+				gain: gain,
+				muted: false,
+				resumeFailed: false,
+				resumeAttempt: 0,
+				resumeRebasePending: !!context.state &&
+					context.state !== 'running',
+				pollGeneration: 0,
+				timer: null,
+				inFlight: false,
+				inFlightGeneration: null,
+				sequence: null,
+				startedAt: Date.now(),
+				hasDecoded: false,
+				ended: false,
+				nextPlayTime: 0,
+				errors: 0,
+				warned: false,
+				sources: []
+			};
+			context.onstatechange = function () {
+				const session = self._cpuSession &&
+					self._cpuSession.audio === audio
+					? self._cpuSession
+					: null;
+
+				if (!audio.active)
+					return;
+				audio.resumeFailed = !!context.state &&
+					context.state !== 'running';
+				if (audio.resumeFailed) {
+					audio.resumeRebasePending = true;
+				}
+				else if (context.state === 'running' &&
+				         audio.resumeRebasePending) {
+					audio.resumeRebasePending = false;
+					if (session && !session.finishing)
+						self._rebaseCpuAudio(session, audio);
+				}
+				if (session)
+					self._updateCpuAudioPresentation(session);
+			};
 			/* This runs synchronously from the Play click, before the RPC
 			 * promise, so browser autoplay policy can unlock the context. */
+			const resumeAttempt = ++audio.resumeAttempt;
 			resumeResult = context.resume();
-			if (resumeResult && typeof resumeResult.catch === 'function')
-				resumeResult.catch(function () {});
+			if (resumeResult && typeof resumeResult.then === 'function') {
+				resumeResult.then(function () {
+					if (!audio.active || audio.resumeAttempt !== resumeAttempt)
+						return;
+					audio.resumeFailed = !!context.state &&
+						context.state !== 'running';
+					if (self._cpuSession &&
+					    self._cpuSession.audio === audio)
+						self._updateCpuAudioPresentation(self._cpuSession);
+				}, function () {
+					if (!audio.active || audio.resumeAttempt !== resumeAttempt)
+						return;
+					audio.resumeFailed = context.state !== 'running';
+					if (self._cpuSession &&
+					    self._cpuSession.audio === audio)
+						self._updateCpuAudioPresentation(self._cpuSession);
+				});
+			}
 		}
 		catch (err) {
 			if (context && typeof context.close === 'function') {
@@ -1437,22 +1608,7 @@ return view.extend({
 			return null;
 		}
 
-		return {
-			active: true,
-			context: context,
-			gain: gain,
-			muted: false,
-			timer: null,
-			inFlight: false,
-			sequence: null,
-			startedAt: Date.now(),
-			hasDecoded: false,
-			ended: false,
-			nextPlayTime: 0,
-			errors: 0,
-			warned: false,
-			sources: []
-		};
+		return audio;
 	},
 
 	_disposeCpuAudio: function (audio) {
@@ -1463,6 +1619,7 @@ return view.extend({
 			window.clearTimeout(audio.timer);
 		audio.timer = null;
 		audio.inFlight = false;
+		audio.inFlightGeneration = null;
 		(audio.sources || []).forEach(function (source) {
 			try { source.onended = null; source.stop(); }
 			catch (err) {}
@@ -1476,6 +1633,7 @@ return view.extend({
 		}
 		if (audio.context && typeof audio.context.close === 'function') {
 			try {
+				audio.context.onstatechange = null;
 				const result = audio.context.close();
 				if (result && typeof result.catch === 'function')
 					result.catch(function () {});
@@ -1484,24 +1642,451 @@ return view.extend({
 		}
 	},
 
+	_clearCpuBrowserAudioElement: function (element) {
+		element = element || document.getElementById('videoplayer-cpu-audio');
+		if (!element)
+			return;
+
+		element.onloadedmetadata = null;
+		element.onplaying = null;
+		element.onpause = null;
+		element.onended = null;
+		element.onerror = null;
+		try { element.pause(); }
+		catch (err) {}
+		element.muted = false;
+		try { element.removeAttribute('src'); }
+		catch (err) { element.src = ''; }
+		try { element.load(); }
+		catch (err) {}
+		if (this._cpuBrowserAudioOwner &&
+		    this._cpuBrowserAudioOwner.element === element)
+			this._cpuBrowserAudioOwner = null;
+	},
+
+	_disposeCpuBrowserAudio: function (browserAudio) {
+		if (!browserAudio)
+			return;
+		browserAudio.active = false;
+		browserAudio.resolving = false;
+		browserAudio.playing = false;
+		browserAudio.ended = true;
+		browserAudio.playAttempt = (Number(browserAudio.playAttempt) || 0) + 1;
+		if (this._cpuBrowserAudioOwner === browserAudio) {
+			this._clearCpuBrowserAudioElement(browserAudio.element);
+			this._cpuBrowserAudioOwner = null;
+		}
+		browserAudio.element = null;
+	},
+
+	_updateCpuAudioPresentation: function (session) {
+		const note = document.getElementById('vp-cpu-player-note');
+		const pcm = session && session.audio && session.audio.active
+			? session.audio
+			: null;
+		const pcmSuspended = pcm && (
+			pcm.resumeFailed ||
+			(pcm.context && pcm.context.state &&
+			 pcm.context.state !== 'running')
+		);
+		const browserAudio = session && session.browserAudio &&
+			session.browserAudio.active
+			? session.browserAudio
+			: null;
+
+		this._syncCpuMuteControl();
+		if (note && session) {
+			if (pcm) {
+				note.textContent = pcmSuspended
+					? _('Video frames are rendered by the router CPU. PCM audio is ready; press Unmute to allow browser audio output.')
+					: _('Video frames are rendered by the router CPU. Audio is decoded to PCM by the router and played by this browser.');
+			}
+			else if (browserAudio) {
+				if (browserAudio.resolving || browserAudio.waitingForVideo) {
+					note.textContent = _('Video frames are rendered by the router CPU. Preparing browser-decoded audio…');
+				}
+				else {
+					note.textContent = browserAudio.needsGesture || browserAudio.muted
+						? _('Video frames are rendered by the router CPU. Audio is decoded by the browser; press Unmute to enable sound.')
+						: _('Video frames are rendered by the router CPU while audio is decoded and played by the browser.');
+				}
+			}
+			else if (session.audioFailureReason) {
+				note.textContent = _('Audio is unavailable: %s').format(
+					session.audioFailureReason
+				);
+			}
+		}
+		if (!session || !session.firstFrameSeen ||
+		    !this._isCurrentCpuSession(session))
+			return;
+		if (pcm) {
+			this._setNowPlaying(
+				_('Router CPU playback: %s (%d FPS, PCM audio)')
+					.format(session.label, session.fps)
+			);
+		}
+		else if (browserAudio) {
+			this._setNowPlaying(
+				_('Router CPU playback: %s (%d FPS, browser audio)')
+					.format(session.label, session.fps)
+			);
+		}
+		else {
+			this._setNowPlaying(
+				_('Router CPU playback: %s (%d FPS, silent)')
+					.format(session.label, session.fps)
+			);
+		}
+	},
+
+	_positionCpuBrowserAudio: function (session, browserAudio) {
+		const element = browserAudio && browserAudio.element;
+		const startedAt = session && session.firstFrameAt;
+		const offsetReceivedAt = browserAudio &&
+			browserAudio.offsetReceivedAt;
+		const mediaOffsetMs = browserAudio &&
+			browserAudio.mediaOffsetMs;
+		let target;
+
+		if (!element)
+			return;
+		if (Number.isFinite(offsetReceivedAt) &&
+		    Number.isFinite(mediaOffsetMs)) {
+			target = Math.max(
+				0,
+				(mediaOffsetMs +
+				 Date.now() - offsetReceivedAt -
+				 Math.max(0, Number(session && session.videoDelayMs) || 0)) /
+					1000
+			);
+		}
+		else if (Number.isFinite(startedAt)) {
+			target = Math.max(0, (Date.now() - startedAt) / 1000);
+		}
+		else {
+			return;
+		}
+		if (Number.isFinite(element.duration) && element.duration > 0)
+			target = Math.min(target, Math.max(0, element.duration - 0.05));
+		if (target < 0.25)
+			return;
+		try {
+			if (!Number.isFinite(element.currentTime) ||
+			    Math.abs(element.currentTime - target) > 0.75)
+				element.currentTime = target;
+		}
+		catch (err) {
+			/* loadedmetadata retries this for browsers that reject early seeks. */
+		}
+	},
+
+	_failCpuBrowserAudio: function (session, browserAudio, message) {
+		if (!session || !browserAudio ||
+		    session.browserAudio !== browserAudio)
+			return;
+		session.browserAudio = null;
+		session.audioFailureReason = String(
+			message || _('The browser could not play this audio track.')
+		);
+		this._disposeCpuBrowserAudio(browserAudio);
+		if (!this._isCurrentCpuSession(session))
+			return;
+		this._updateCpuAudioPresentation(session);
+		if (!session.browserAudioWarned) {
+			session.browserAudioWarned = true;
+			notify(null, E('p', {}, session.audioFailureReason), 7000, 'warning');
+		}
+		if (session.finishing) {
+			const finishing = session.finishing;
+			session.finishing = null;
+			if (session.finishTimer != null)
+				window.clearTimeout(session.finishTimer);
+			session.finishTimer = null;
+			this._finishCpuPlayback(
+				session, finishing.message, finishing.isError, true);
+		}
+	},
+
+	_playCpuBrowserAudio: function (session, browserAudio, fromGesture) {
+		const self = this;
+		const element = browserAudio && browserAudio.element;
+		const attempt = browserAudio
+			? (Number(browserAudio.playAttempt) || 0) + 1
+			: 0;
+		let playResult;
+
+		if (!self._isCurrentCpuSession(session) || !browserAudio ||
+		    session.browserAudio !== browserAudio || !browserAudio.active ||
+		    !element)
+			return Promise.resolve(false);
+		browserAudio.playAttempt = attempt;
+		browserAudio.playPending = true;
+		self._positionCpuBrowserAudio(session, browserAudio);
+		const attemptIsCurrent = function () {
+			return self._isCurrentCpuSession(session) &&
+				session.browserAudio === browserAudio &&
+				browserAudio.active &&
+				browserAudio.playAttempt === attempt;
+		};
+		try {
+			playResult = element.play();
+		}
+		catch (err) {
+			playResult = Promise.reject(err);
+		}
+		return Promise.resolve(playResult).then(function () {
+			if (!attemptIsCurrent())
+				return false;
+			browserAudio.playPending = false;
+			browserAudio.playing = true;
+			browserAudio.resolving = false;
+			if (fromGesture) {
+				browserAudio.needsGesture = false;
+				browserAudio.muted = false;
+				element.muted = false;
+			}
+			self._updateCpuAudioPresentation(session);
+			return true;
+		}, function (err) {
+			if (!attemptIsCurrent())
+				return false;
+			browserAudio.playPending = false;
+			browserAudio.playing = false;
+			browserAudio.needsGesture = true;
+			browserAudio.muted = true;
+			element.muted = true;
+			self._updateCpuAudioPresentation(session);
+
+			if (fromGesture) {
+				notify(null, E('p', {},
+					_('The browser still blocked audio playback: %s')
+						.format(errorText(err))),
+				5000, 'warning');
+				return false;
+			}
+
+			/* Muted media is allowed to start in browsers that block delayed
+			 * audible playback. Keeping its clock running lets the user's
+			 * later Unmute click enable sound without restarting the video. */
+			if (!attemptIsCurrent())
+				return false;
+			browserAudio.playPending = true;
+			try {
+				playResult = element.play();
+			}
+			catch (mutedError) {
+				playResult = Promise.reject(mutedError);
+			}
+			return Promise.resolve(playResult).then(function () {
+				if (!attemptIsCurrent())
+					return null;
+				browserAudio.playPending = false;
+				browserAudio.playing = true;
+				return true;
+			}, function () {
+				if (!attemptIsCurrent())
+					return null;
+				browserAudio.playPending = false;
+				browserAudio.playing = false;
+				return false;
+			}).then(function (mutedStarted) {
+				if (attemptIsCurrent() && mutedStarted !== null &&
+				    !session.browserAudioPrompted) {
+					session.browserAudioPrompted = true;
+					notify(null,
+						mutedStarted
+							? _('Browser audio is ready. Press Unmute to enable sound.')
+							: _('Automatic audio playback was blocked. Press Unmute to start it.'),
+						5000, mutedStarted ? 'info' : 'warning');
+				}
+				return false;
+			});
+		});
+	},
+
+	_startCpuBrowserAudioFallback: function (session, message) {
+		const self = this;
+		let browserAudio;
+
+		if (!self._isCurrentCpuSession(session) || session.finishing)
+			return Promise.resolve(false);
+		if (session.browserAudio && session.browserAudio.active)
+			return session.browserAudio.promise || Promise.resolve(true);
+
+		browserAudio = {
+			active: true,
+			resolving: true,
+			waitingForVideo: false,
+			playing: false,
+			playPending: false,
+			playAttempt: 0,
+			playPromise: null,
+			ended: false,
+			muted: false,
+			needsGesture: false,
+			mediaOffsetMs: null,
+			offsetReceivedAt: null,
+			element: null,
+			promise: null
+		};
+		session.browserAudio = browserAudio;
+		session.audioFailureReason = String(
+			message || _('Router-decoded audio is unavailable.')
+		);
+		self._updateCpuAudioPresentation(session);
+
+		browserAudio.promise = callResolveAudio(session.token).then(function (res) {
+			const url = String(res && res.stream_url || '');
+			const element = document.getElementById('videoplayer-cpu-audio');
+			const urlMatch = url.match(
+				/^\/cgi-bin\/videoplayer-stream\?renderer=([0-9a-f]{32})&audio=([0-9a-f]{32})$/
+			);
+			const mediaOffsetMs = Number(res && res.media_offset_ms);
+
+			if (!self._isCurrentCpuSession(session) ||
+			    session.browserAudio !== browserAudio || !browserAudio.active)
+				return false;
+			if (!res || res.error)
+				throw new Error(String(res && res.error || _('Unable to create an audio stream.')));
+			if (normalizeRenderMode(res.render_mode) !== 'browser' ||
+			    res.stream_type !== 'html5-video' ||
+			    !urlMatch ||
+			    urlMatch[1] !== session.token ||
+			    urlMatch[2] === session.token ||
+			    !Number.isInteger(mediaOffsetMs) ||
+			    mediaOffsetMs < 0 ||
+			    mediaOffsetMs > CPU_MAX_MEDIA_OFFSET_MS)
+				throw new Error(_('The router returned an invalid browser-audio stream.'));
+			if (!element || typeof element.play !== 'function')
+				throw new Error(_('This browser has no usable audio element.'));
+
+			self._clearCpuBrowserAudioElement(element);
+			self._cpuBrowserAudioOwner = browserAudio;
+			browserAudio.element = element;
+			browserAudio.resolving = false;
+			browserAudio.mediaOffsetMs = mediaOffsetMs;
+			browserAudio.offsetReceivedAt = Date.now();
+			element.preload = 'auto';
+			element.muted = false;
+			element.onloadedmetadata = function () {
+				if (self._isCurrentCpuSession(session) &&
+				    session.browserAudio === browserAudio)
+					self._positionCpuBrowserAudio(session, browserAudio);
+			};
+			element.onplaying = function () {
+				if (!self._isCurrentCpuSession(session) ||
+				    session.browserAudio !== browserAudio)
+					return;
+				browserAudio.playing = true;
+				self._updateCpuAudioPresentation(session);
+			};
+			element.onpause = function () {
+				if (!self._isCurrentCpuSession(session) ||
+				    session.browserAudio !== browserAudio ||
+				    browserAudio.ended)
+					return;
+				browserAudio.playAttempt =
+					(Number(browserAudio.playAttempt) || 0) + 1;
+				browserAudio.playPending = false;
+				browserAudio.playing = false;
+				browserAudio.needsGesture = true;
+				self._updateCpuAudioPresentation(session);
+			};
+			element.onended = function () {
+				if (!self._isCurrentCpuSession(session) ||
+				    session.browserAudio !== browserAudio)
+					return;
+				browserAudio.ended = true;
+				browserAudio.playing = false;
+				session.browserAudio = null;
+				self._disposeCpuBrowserAudio(browserAudio);
+				if (session.finishing) {
+					const finishing = session.finishing;
+					session.finishing = null;
+					if (session.finishTimer != null)
+						window.clearTimeout(session.finishTimer);
+					session.finishTimer = null;
+					self._finishCpuPlayback(
+						session, finishing.message, finishing.isError, true);
+				}
+				else {
+					self._updateCpuAudioPresentation(session);
+				}
+			};
+			element.onerror = function () {
+				self._failCpuBrowserAudio(
+					session,
+					browserAudio,
+					_('The browser could not decode the audio track; video continues silently.')
+				);
+			};
+			element.src = url;
+			try { element.load(); }
+			catch (err) {}
+			self._positionCpuBrowserAudio(session, browserAudio);
+			browserAudio.waitingForVideo = !session.firstFrameSeen;
+			self._updateCpuAudioPresentation(session);
+			if (!browserAudio.waitingForVideo)
+				browserAudio.playPromise = self._playCpuBrowserAudio(
+					session, browserAudio, false
+				);
+			return true;
+		}).catch(function (err) {
+			if (self._isCurrentCpuSession(session) &&
+			    session.browserAudio === browserAudio && browserAudio.active)
+				self._failCpuBrowserAudio(
+					session,
+					browserAudio,
+					_('Browser audio fallback failed: %s').format(errorText(err))
+				);
+			return false;
+		});
+		return browserAudio.promise;
+	},
+
 	_syncCpuMuteControl: function () {
 		const button = document.getElementById('vp-mute-btn');
 		const session = this._cpuSession;
 		const audio = session && session.audio;
+		const browserAudio = session && session.browserAudio;
 
 		if (!button)
 			return;
-		if (!audio || !audio.active) {
+		if (audio && audio.active) {
+			const suspended = audio.resumeFailed ||
+				(audio.context && audio.context.state &&
+				 audio.context.state !== 'running');
+			button.textContent = audio.muted || suspended ? _('Unmute') : _('Mute');
+			button.setAttribute(
+				'aria-pressed',
+				audio.muted || suspended ? 'true' : 'false'
+			);
+			button.disabled = false;
+			button.title = suspended
+				? _('Press Unmute to allow browser audio output.')
+				: '';
+			return;
+		}
+		if (browserAudio && browserAudio.active) {
+			const muted = browserAudio.muted || browserAudio.needsGesture;
+			button.textContent = muted ? _('Unmute') : _('Mute');
+			button.setAttribute('aria-pressed', muted ? 'true' : 'false');
+			button.disabled = browserAudio.resolving ||
+				browserAudio.waitingForVideo || !browserAudio.element;
+			button.title = browserAudio.resolving
+				? _('Preparing browser audio…')
+				: (browserAudio.waitingForVideo
+					? _('Browser audio will start with the first video frame.')
+					: (muted ? _('Press Unmute to enable browser audio.') : ''));
+			return;
+		}
+		{
 			button.textContent = _('Mute');
 			button.setAttribute('aria-pressed', 'false');
 			button.disabled = true;
 			button.title = _('Audio is unavailable for this router-rendered video.');
-			return;
 		}
-		button.textContent = audio.muted ? _('Unmute') : _('Mute');
-		button.setAttribute('aria-pressed', audio.muted ? 'true' : 'false');
-		button.disabled = false;
-		button.title = '';
 	},
 
 	_disableCpuAudio: function (session, message) {
@@ -1509,9 +2094,12 @@ return view.extend({
 		const finishing = session && session.finishing;
 
 		if (!audio)
-			return;
+			return Promise.resolve(false);
 		session.audio = null;
 		this._disposeCpuAudio(audio);
+		session.audioFailureReason = String(
+			message || _('Router-decoded PCM audio is unavailable.')
+		);
 		if (this._isCurrentCpuSession(session)) {
 			if (finishing) {
 				if (session.finishTimer != null)
@@ -1520,19 +2108,19 @@ return view.extend({
 				session.finishing = null;
 				this._finishCpuPlayback(
 					session, finishing.message, finishing.isError, true);
-				return;
+				return Promise.resolve(false);
 			}
-			this._syncCpuMuteControl();
-			if (session.firstFrameSeen)
-				this._setNowPlaying(
-					_('Router CPU playback: %s (%d FPS, silent)')
-						.format(session.label, session.fps)
-				);
 			if (message && !session.audioWarned) {
 				session.audioWarned = true;
-				notify(null, E('p', {}, message), 7000, 'warning');
+				notify(null, E('p', {},
+					_('%s Switching to browser audio.').format(message)),
+				5000, 'info');
 			}
+			return this._startCpuBrowserAudioFallback(
+				session, session.audioFailureReason
+			);
 		}
+		return Promise.resolve(false);
 	},
 
 	_finishCpuAudioDrain: function (session, audio) {
@@ -1556,12 +2144,7 @@ return view.extend({
 			return;
 		}
 
-		this._syncCpuMuteControl();
-		if (session.firstFrameSeen)
-			this._setNowPlaying(
-				_('Router CPU playback: %s (%d FPS, silent)')
-					.format(session.label, session.fps)
-			);
+		this._updateCpuAudioPresentation(session);
 	},
 
 	_endCpuAudioGracefully: function (session) {
@@ -1658,6 +2241,10 @@ return view.extend({
 			this._disposeCpuAudio(session.audio);
 			session.audio = null;
 		}
+		if (session.browserAudio) {
+			this._disposeCpuBrowserAudio(session.browserAudio);
+			session.browserAudio = null;
+		}
 	},
 
 	_detachCpuSession: function (clearFrame) {
@@ -1685,6 +2272,7 @@ return view.extend({
 		const session = this._detachCpuSession(true);
 		this._stopRendererBestEffort(session);
 		this._clearVideoElement();
+		this._clearCpuBrowserAudioElement();
 		this._currentSrc = null;
 		this._currentKind = null;
 		this._currentRenderMode = null;
@@ -1701,6 +2289,7 @@ return view.extend({
 
 		this._stopRendererBestEffort(session);
 		this._clearVideoElement();
+		this._clearCpuBrowserAudioElement();
 		this._currentSrc = null;
 		this._currentRenderMode = null;
 		this._setPlayerSurface('none');
@@ -1791,13 +2380,17 @@ return view.extend({
 		this._revokeObjectUrl(previous);
 		if (!session.firstFrameSeen) {
 			session.firstFrameSeen = true;
-			this._setNowPlaying(
-				session.audio
-					? _('Router CPU playback: %s (%d FPS, PCM audio)').format(
-						session.label, session.fps)
-					: _('Router CPU playback: %s (%d FPS, silent)').format(
-						session.label, session.fps)
-			);
+			session.firstFrameAt = Date.now();
+			if (session.browserAudio &&
+			    session.browserAudio.active &&
+			    session.browserAudio.waitingForVideo) {
+				session.browserAudio.waitingForVideo = false;
+				session.browserAudio.playPromise =
+					this._playCpuBrowserAudio(
+						session, session.browserAudio, false
+					);
+			}
+			this._updateCpuAudioPresentation(session);
 		}
 	},
 
@@ -1812,7 +2405,7 @@ return view.extend({
 				session.pendingFrames.splice(index, 1);
 			queued.timer = null;
 			self._presentCpuFrame(session, objectUrl);
-		}, session.audio ? CPU_VIDEO_AUDIO_DELAY_MS : 0);
+		}, Math.max(0, Number(session.videoDelayMs) || 0));
 	},
 
 	_installCpuFrame: function (session, blob) {
@@ -1882,8 +2475,16 @@ return view.extend({
 		if (!this._isCurrentCpuSession(session))
 			return Promise.resolve();
 
-		if (!isError && !force && session.audio &&
-		    (session.audio.active || (session.audio.sources || []).length)) {
+		if (!isError && !force &&
+		    (((session.pendingFrames || []).length > 0) ||
+		     (session.audio &&
+		      (session.audio.active || (session.audio.sources || []).length)) ||
+		     (session.browserAudio && session.browserAudio.active &&
+		      !session.browserAudio.ended &&
+		      (session.browserAudio.playing ||
+		       session.browserAudio.playPending ||
+		       session.browserAudio.resolving ||
+		       session.browserAudio.waitingForVideo)))) {
 			if (!session.finishing) {
 				const self = this;
 				session.finishing = {
@@ -2056,6 +2657,20 @@ return view.extend({
 		audio.nextPlayTime = 0;
 	},
 
+	_rebaseCpuAudio: function (session, audio) {
+		if (!session || !audio || !audio.active || session.audio !== audio)
+			return;
+		audio.pollGeneration =
+			(Number(audio.pollGeneration) || 0) + 1;
+		audio.sequence = null;
+		audio.rebased = true;
+		audio.inFlight = false;
+		audio.inFlightGeneration = null;
+		this._resetCpuAudioQueue(audio);
+		if (this._isCurrentCpuSession(session))
+			this._scheduleCpuAudioPoll(session, 0);
+	},
+
 	_decodeCpuAudioChunk: function (session, arrayBuffer, sequence) {
 		const self = this;
 		const audio = session.audio;
@@ -2108,6 +2723,9 @@ return view.extend({
 	_pollCpuAudio: function (session) {
 		const self = this;
 		const audio = session && session.audio;
+		const pollGeneration = audio
+			? Number(audio.pollGeneration) || 0
+			: 0;
 		const requestedChunk = audio && audio.sequence == null
 			? 'live'
 			: String(audio && audio.sequence);
@@ -2119,7 +2737,7 @@ return view.extend({
 		if (audio.context.state === 'closed') {
 			self._disableCpuAudio(
 				session,
-				_('The browser closed the audio output; video continues silently.')
+				_('The browser closed the router-decoded PCM output.')
 			);
 			return Promise.resolve();
 		}
@@ -2130,6 +2748,7 @@ return view.extend({
 			return Promise.resolve();
 		}
 		audio.inFlight = true;
+		audio.inFlightGeneration = pollGeneration;
 
 		return request.get(audio.url, {
 			responseType: 'blob',
@@ -2138,14 +2757,15 @@ return view.extend({
 			query: { chunk: requestedChunk }
 		}).then(function (res) {
 			if (!self._isCurrentCpuSession(session) ||
-			    session.audio !== audio || !audio.active)
+			    session.audio !== audio || !audio.active ||
+			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
 				return { done: true };
 			if (res.status === 202) {
 				if (!audio.hasDecoded &&
 				    Date.now() - audio.startedAt > CPU_AUDIO_START_TIMEOUT_MS) {
 					self._disableCpuAudio(
 						session,
-						_('The audio track did not become ready in time; video continues silently.')
+						_('The router-decoded PCM track did not become ready in time.')
 					);
 					return { done: true };
 				}
@@ -2164,7 +2784,7 @@ return view.extend({
 			if (res.status === 409 || res.status === 404 || res.status === 410) {
 				self._disableCpuAudio(
 					session,
-					_('Router-rendered audio is unavailable; video continues silently.')
+					_('Router-decoded PCM audio is unavailable.')
 				);
 				return { done: true };
 			}
@@ -2206,7 +2826,8 @@ return view.extend({
 				throw new Error(_('The router returned an invalid audio chunk.'));
 			return blobToArrayBuffer(blob).then(function (arrayBuffer) {
 				if (!self._isCurrentCpuSession(session) ||
-				    session.audio !== audio || !audio.active || audio.ended)
+				    session.audio !== audio || !audio.active || audio.ended ||
+				    (Number(audio.pollGeneration) || 0) !== pollGeneration)
 					return { done: true };
 				self._decodeCpuAudioChunk(session, arrayBuffer, sequence);
 				audio.rebased = false;
@@ -2221,12 +2842,14 @@ return view.extend({
 		}).then(function (result) {
 			if (!result || result.done ||
 			    !self._isCurrentCpuSession(session) ||
-			    session.audio !== audio || !audio.active || audio.ended)
+			    session.audio !== audio || !audio.active || audio.ended ||
+			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
 				return;
 			self._scheduleCpuAudioPoll(session, result.delay || 0);
 		}).catch(function (err) {
 			if (!self._isCurrentCpuSession(session) ||
-			    session.audio !== audio || !audio.active || audio.ended)
+			    session.audio !== audio || !audio.active || audio.ended ||
+			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
 				return;
 			audio.errors++;
 			if (audio.errors < 3) {
@@ -2238,11 +2861,14 @@ return view.extend({
 			}
 			self._disableCpuAudio(
 				session,
-				_('Router-rendered audio failed: %s. Video continues silently.')
+				_('Router-decoded PCM audio failed: %s.')
 					.format(errorText(err))
 			);
 		}).finally(function () {
-			audio.inFlight = false;
+			if (audio.inFlightGeneration === pollGeneration) {
+				audio.inFlight = false;
+				audio.inFlightGeneration = null;
+			}
 		});
 	},
 
@@ -2297,6 +2923,7 @@ return view.extend({
 			label: label,
 			fps: normalizeRouterFps(res.router_fps),
 			frameIntervalMs: normalizeFrameInterval(res.frame_interval_ms),
+			videoDelayMs: pendingAudio ? CPU_VIDEO_AUDIO_DELAY_MS : 0,
 			active: true,
 			timer: null,
 			sequence: 0,
@@ -2304,6 +2931,7 @@ return view.extend({
 			warned: false,
 			startedAt: Date.now(),
 			firstFrameSeen: false,
+			firstFrameAt: null,
 			objectUrl: null,
 			nextObjectUrl: null,
 			pendingFrames: [],
@@ -2312,6 +2940,10 @@ return view.extend({
 			decodeTimer: null,
 			audio: pendingAudio,
 			audioWarned: false,
+			audioFailureReason: '',
+			browserAudio: null,
+			browserAudioWarned: false,
+			browserAudioPrompted: false,
 			finishing: null,
 			finishTimer: null
 		};
@@ -2323,15 +2955,18 @@ return view.extend({
 		self._setPlayerSurface('cpu');
 		self._setNowPlaying(_('Starting router CPU renderer: %s').format(label));
 		self._scheduleCpuFramePoll(session, 0);
-		if (session.audio)
+		if (session.audio) {
 			self._scheduleCpuAudioPoll(session, 0);
-		else if (hasAudio && !pendingAudio) {
-			session.audioWarned = true;
-			notify(null,
-				_('This browser could not start Web Audio; router playback will continue silently.'),
-				6000, 'warning');
+			return Promise.resolve();
 		}
-		return Promise.resolve();
+		let fallbackReason;
+		if (!hasAudio)
+			fallbackReason = _('Router FFmpeg could not provide a usable PCM audio track.');
+		else if (!audioMetadataValid)
+			fallbackReason = _('The router returned invalid PCM audio metadata.');
+		else
+			fallbackReason = _('This browser could not start the PCM Web Audio output.');
+		return self._startCpuBrowserAudioFallback(session, fallbackReason);
 	},
 
 	_playLocal: function (relPath, name) {

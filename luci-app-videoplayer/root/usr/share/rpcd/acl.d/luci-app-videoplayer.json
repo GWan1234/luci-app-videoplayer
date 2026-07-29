@@ -10,7 +10,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.videoplayer": [ "list_renderer", "start_renderer", "stop_renderer" ],
+				"luci.videoplayer": [ "list_renderer", "start_renderer", "resolve_audio", "stop_renderer" ],
 				"uci": [ "set", "add", "delete", "rename", "order", "apply", "confirm", "rollback" ]
 			},
 			"uci": [ "videoplayer" ]

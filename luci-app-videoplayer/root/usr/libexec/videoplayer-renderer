@@ -22,6 +22,9 @@ TOKEN_TTL=21600
 HEARTBEAT_TIMEOUT=12
 FRAME_STALL_TIMEOUT=8
 STARTUP_TIMEOUT=15
+STARTUP_POLL_INTERVAL=0.1
+SHORT_MEDIA_START_GRACE=5
+SHORT_MEDIA_GRACE_POLL_INTERVAL=0.25
 STOP_TIMEOUT=6
 MAX_PATH_LENGTH=4096
 MAX_FRAME_BYTES=4194304
@@ -538,6 +541,67 @@ load_audio_state() {
 		*) return 1 ;;
 	esac
 	AUDIO_STATE="$state"
+	return 0
+}
+
+write_browser_audio_capability() {
+	local token="$1" capability="$2"
+	local dir="$RUNTIME_DIR/s-$token" tmp
+
+	valid_token "$token" && valid_token "$capability" &&
+		[ "$capability" != "$token" ] || return 1
+	session_dir_is_safe "$token" || return 1
+	tmp="$dir/.browser-audio-capability.$$"
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n' "$LAYOUT" "$token" "$capability" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/browser-audio-capability"
+}
+
+load_browser_audio_capability() {
+	local token="$1" expected="${2:-}" dir
+	local version stored_token capability extra
+
+	BROWSER_AUDIO_CAPABILITY=""
+	valid_token "$token" || return 1
+	[ -z "$expected" ] || valid_token "$expected" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/browser-audio-capability" 600 || return 1
+	exec 7< "$dir/browser-audio-capability" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_token <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r capability <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	[ "$version" = "$LAYOUT" ] && [ "$stored_token" = "$token" ] ||
+		return 1
+	valid_token "$capability" || return 1
+	[ "$capability" != "$token" ] || return 1
+	[ -z "$expected" ] || [ "$capability" = "$expected" ] || return 1
+	BROWSER_AUDIO_CAPABILITY="$capability"
 	return 0
 }
 
@@ -1525,6 +1589,71 @@ worker_current() {
 	return 0
 }
 
+monotonic_centiseconds() {
+	local value
+
+	value="$(awk 'NR == 1 { printf "%.0f\n", $1 * 100; exit }' \
+		/proc/uptime 2>/dev/null)" || return 1
+	valid_decimal "$value" 18 || return 1
+	printf '%s\n' "$value"
+}
+
+write_video_clock() {
+	local token="$1" started="$2" dir tmp
+
+	valid_token "$token" && valid_decimal "$started" 18 || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	tmp="$dir/.video-clock.$$"
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n' "$LAYOUT" "$token" "$started" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/video-clock"
+}
+
+load_video_clock() {
+	local token="$1" dir version stored_token started extra
+
+	VIDEO_STARTED_CS=""
+	valid_token "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/video-clock" 600 || return 1
+	exec 7< "$dir/video-clock" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_token <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r started <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	[ "$version" = "$LAYOUT" ] && [ "$stored_token" = "$token" ] ||
+		return 1
+	valid_decimal "$started" 18 || return 1
+	VIDEO_STARTED_CS="$started"
+	return 0
+}
+
 cmd_worker() {
 	local token="$1" dir frame log_pipe log_file log_pid="" log_start=""
 	local now pid start ffmpeg_pid ffmpeg_start candidate_pid rc=1
@@ -1537,6 +1666,7 @@ cmd_worker() {
 	local frame_mtime="" last_frame_mtime="" last_frame_change=""
 	local running_written=0 stopping=0 failure_reason=""
 	local log_anchor_open=0 log_launching=0
+	local video_started_cs="" short_media_deadline_cs="" current_cs=""
 	local _audio_wait _chunker_wait
 
 	valid_token "$token" || exit 2
@@ -1566,6 +1696,7 @@ cmd_worker() {
 	log_file="$dir/ffmpeg.log"
 	rm -f -- "$frame" "$frame.tmp" "$log_pipe" "$log_file" \
 		"$dir/audio-state" "$dir/audio" "$dir/chunker" "$audio_pipe" \
+		"$dir/video-clock" "$dir/browser-audio-capability" \
 		2>/dev/null || :
 	for audio_file in "$dir"/audio-????????.pcm; do
 		if [ ! -f "$audio_file" ] || [ -L "$audio_file" ]; then
@@ -1656,6 +1787,43 @@ cmd_worker() {
 		fi
 	}
 
+	observe_video_frame() {
+		local observed_now="$1" observed_size
+
+		[ -f "$frame" ] && [ ! -L "$frame" ] || return 0
+		safe_regular_file "$frame" 600 || return 0
+		observed_size="$(stat -L -c '%s' -- "$frame" 2>/dev/null)" ||
+			return 0
+		valid_decimal "$observed_size" 18 &&
+			[ "$observed_size" -gt 0 ] &&
+			[ "$observed_size" -le "$MAX_FRAME_BYTES" ] ||
+			return 0
+		frame_mtime="$(stat -L -c '%Y' -- "$frame" 2>/dev/null)" ||
+			frame_mtime=""
+		valid_decimal "$frame_mtime" 12 &&
+			[ "$frame_mtime" -le "$observed_now" ] ||
+			return 0
+		if [ "$frame_mtime" != "$last_frame_mtime" ]; then
+			last_frame_mtime="$frame_mtime"
+			last_frame_change="$observed_now"
+		fi
+		if [ "$running_written" -eq 0 ]; then
+			video_started_cs="$(monotonic_centiseconds 2>/dev/null)" || {
+				failure_reason="Cannot initialize renderer clock"
+				return 1
+			}
+			if ! refresh_heartbeat "$token" "$observed_now" ||
+			   ! write_video_clock "$token" "$video_started_cs" ||
+			   ! write_status "$token" running ""; then
+				rm -f -- "$dir/video-clock" 2>/dev/null || :
+				failure_reason="Cannot publish renderer state"
+				return 1
+			fi
+			running_written=1
+		fi
+		return 0
+	}
+
 	# Invoked indirectly by the signal trap below.
 	# shellcheck disable=SC2317
 	stop_child() {
@@ -1737,7 +1905,11 @@ cmd_worker() {
 		rm -f -- "$log_pipe" "$log_file" "$dir/ffmpeg" "$dir/audio" \
 			"$dir/chunker" "$audio_pipe" 2>/dev/null || :
 		if worker_current "$token" 2>/dev/null; then
-			write_status "$token" stopped "Renderer stopped" 2>/dev/null || :
+			if [ -n "${failure_reason:-}" ]; then
+				write_status "$token" error "$failure_reason" 2>/dev/null || :
+			else
+				write_status "$token" stopped "Renderer stopped" 2>/dev/null || :
+			fi
 		fi
 		exit 0
 	}
@@ -1970,8 +2142,11 @@ cmd_worker() {
 	exec 7>&-
 	log_anchor_open=0
 	ffmpeg_start="$(process_start_time "$ffmpeg_pid" 2>/dev/null)" || ffmpeg_start=""
-	if [ -z "$ffmpeg_start" ] ||
-	   ! write_worker_identity "$token" "$ffmpeg_pid" "$ffmpeg_start" ffmpeg; then
+	if { [ -z "$ffmpeg_start" ] &&
+	     process_is_running "$ffmpeg_pid"; } ||
+	   { [ -n "$ffmpeg_start" ] &&
+	     ! write_worker_identity \
+			"$token" "$ffmpeg_pid" "$ffmpeg_start" ffmpeg; }; then
 		stop_direct_child_bounded "$ffmpeg_pid" "$ffmpeg_start" || :
 		if [ -n "$audio_pid" ]; then
 			stop_direct_child_bounded "$audio_pid" "$audio_start" || :
@@ -1987,6 +2162,9 @@ cmd_worker() {
 		exec 3<&-
 		exit 1
 	fi
+	# A short-lived child may already be a zombie before /proc yields its
+	# start time. It is still our unreaped direct child, so the common wait,
+	# final-frame observation, and diagnostic classification below are safe.
 
 	while process_is_running "$ffmpeg_pid"; do
 		now="$(date +%s 2>/dev/null)" || now=""
@@ -2080,25 +2258,9 @@ cmd_worker() {
 			fi
 		fi
 
-		if [ -f "$frame" ] && [ ! -L "$frame" ]; then
-			frame_mtime="$(stat -L -c '%Y' -- "$frame" 2>/dev/null)" ||
-				frame_mtime=""
-			if valid_decimal "$frame_mtime" 12 &&
-			   [ "$frame_mtime" -le "$now" ]; then
-				if [ "$frame_mtime" != "$last_frame_mtime" ]; then
-					last_frame_mtime="$frame_mtime"
-					last_frame_change="$now"
-				fi
-				if [ "$running_written" -eq 0 ]; then
-					if ! refresh_heartbeat "$token" "$now" ||
-					   ! write_status "$token" running ""; then
-						kill -TERM "$ffmpeg_pid" 2>/dev/null || :
-						failure_reason="Cannot publish renderer state"
-						break
-					fi
-					running_written=1
-				fi
-			fi
+		if ! observe_video_frame "$now"; then
+			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+			break
 		fi
 		if [ "$running_written" -eq 1 ] &&
 		   valid_decimal "$last_frame_change" 12 &&
@@ -2107,7 +2269,14 @@ cmd_worker() {
 			failure_reason="FFmpeg stopped producing video frames"
 			break
 		fi
-		sleep 1
+		if [ "$running_written" -eq 0 ]; then
+			# Observe the first frame closely enough that the browser-audio
+			# clock neither includes decoder startup nor trails media time by
+			# a full one-second steady-state polling interval.
+			sleep "$STARTUP_POLL_INTERVAL"
+		else
+			sleep 1
+		fi
 	done
 
 	if [ -n "$audio_pid" ]; then
@@ -2129,6 +2298,40 @@ cmd_worker() {
 		wait "$ffmpeg_pid" 2>/dev/null
 		rc=$?
 		wait "$log_pid" 2>/dev/null || :
+	fi
+	if [ "$stopping" -eq 0 ] &&
+	   [ -z "$failure_reason" ] &&
+	   [ "$rc" -eq 0 ] &&
+	   [ "$running_written" -eq 0 ]; then
+		now="$(date +%s 2>/dev/null)" || now=""
+		if valid_decimal "$now" 12 &&
+		   worker_current "$token" &&
+		   load_heartbeat "$token" &&
+		   [ "$HEARTBEAT_TIME" -le "$now" ] &&
+		   [ $((now - HEARTBEAT_TIME)) -le $((STARTUP_TIMEOUT + 3)) ]; then
+			observe_video_frame "$now" || :
+		fi
+	fi
+	if [ "$stopping" -eq 0 ] &&
+	   [ -z "$failure_reason" ] &&
+	   [ "$rc" -eq 0 ] &&
+	   [ "$running_written" -eq 1 ] &&
+	   valid_decimal "$video_started_cs" 18; then
+		# Keep every successful short input observable for a bounded interval
+		# after its first frame. This covers both an FFmpeg process that exits
+		# before the first monitor pass and one that exits immediately after
+		# that pass, while giving the UI time to open its protected streams.
+		short_media_deadline_cs=$((video_started_cs +
+			SHORT_MEDIA_START_GRACE * 100))
+		while :; do
+			current_cs="$(monotonic_centiseconds 2>/dev/null)" || break
+			[ "$current_cs" -lt "$short_media_deadline_cs" ] || break
+			worker_current "$token" || {
+				stopping=1
+				break
+			}
+			sleep "$SHORT_MEDIA_GRACE_POLL_INTERVAL"
+		done
 	fi
 	if [ "$stopping" -eq 0 ] &&
 	   [ -z "$failure_reason" ] &&
@@ -2357,6 +2560,94 @@ cmd_status() {
 		fi
 	fi
 	printf '%s\n' "$SESSION_STATUS"
+}
+
+load_live_source() {
+	local token="$1" metadata device inode size
+
+	LIVE_SOURCE_FD=""
+	LIVE_SOURCE_ID=""
+	valid_token "$token" || return 1
+	worker_current "$token" || return 1
+	load_status "$token" || return 1
+	[ "$SESSION_STATUS" = "running" ] || return 1
+	load_worker_identity "$token" worker || return 1
+	process_matches_worker "$WORKER_PID" "$WORKER_START" "$token" || return 1
+	load_session_request "$token" || return 1
+	[ "$SESSION_EXPIRY" = "$CURRENT_EXPIRY" ] || return 1
+	LIVE_SOURCE_FD="/proc/$WORKER_PID/fd/3"
+	[ -r "$LIVE_SOURCE_FD" ] || return 1
+	[ "$(stat -L -c '%F' -- "$LIVE_SOURCE_FD" 2>/dev/null)" = \
+		"regular file" ] || return 1
+	metadata="$(stat -L -c '%d:%i:%s' -- "$LIVE_SOURCE_FD" 2>/dev/null)" ||
+		return 1
+	device="${metadata%%:*}"
+	metadata="${metadata#*:}"
+	inode="${metadata%%:*}"
+	size="${metadata#*:}"
+	case "$size" in *:*) return 1 ;; esac
+	valid_decimal "$device" 20 &&
+		valid_decimal "$inode" 20 &&
+		valid_decimal "$size" 18 &&
+		[ "$size" -gt 0 ] || return 1
+	process_matches_worker "$WORKER_PID" "$WORKER_START" "$token" || return 1
+	worker_current "$token" || return 1
+	LIVE_SOURCE_ID="$device:$inode:$size"
+	return 0
+}
+
+cmd_source() {
+	load_live_source "$1" || return 1
+	printf '%s\n' "$SESSION_PATH"
+}
+
+cmd_authorize_browser_audio() {
+	local token="$1" proposed="$2"
+
+	valid_token "$token" && valid_token "$proposed" &&
+		[ "$proposed" != "$token" ] || return 1
+	ensure_lock_file "$CONTROL_LOCK" || return 1
+	exec 9< "$CONTROL_LOCK" || return 1
+	flock -x 9 || return 1
+	ensure_runtime || return 1
+	load_live_source "$token" || return 1
+	if load_browser_audio_capability "$token" 2>/dev/null; then
+		load_live_source "$token" || return 1
+		printf '%s\n' "$BROWSER_AUDIO_CAPABILITY"
+		return 0
+	fi
+	write_browser_audio_capability "$token" "$proposed" || return 1
+	if ! load_live_source "$token"; then
+		rm -f -- "$RUNTIME_DIR/s-$token/browser-audio-capability" \
+			2>/dev/null || :
+		return 1
+	fi
+	printf '%s\n' "$proposed"
+}
+
+cmd_source_info() {
+	local token="$1" capability="$2"
+
+	valid_token "$capability" || return 1
+	load_live_source "$token" || return 1
+	load_browser_audio_capability "$token" "$capability" || return 1
+	load_live_source "$token" || return 1
+	printf '%s\t%s\t%s\n' "$SESSION_PATH" "$LIVE_SOURCE_FD" "$LIVE_SOURCE_ID"
+}
+
+cmd_position_ms() {
+	local token="$1" capability="$2" now elapsed
+
+	valid_token "$capability" || return 1
+	load_live_source "$token" || return 1
+	load_browser_audio_capability "$token" "$capability" || return 1
+	load_video_clock "$token" || return 1
+	now="$(monotonic_centiseconds 2>/dev/null)" || return 1
+	[ "$now" -ge "$VIDEO_STARTED_CS" ] || return 1
+	elapsed=$((now - VIDEO_STARTED_CS))
+	[ "$elapsed" -le $((TOKEN_TTL * 100 + 500)) ] || return 1
+	load_live_source "$token" || return 1
+	printf '%s\n' "$((elapsed * 10))"
 }
 
 cmd_reason() {
@@ -2786,6 +3077,22 @@ case "${1:-}" in
 	status)
 		[ "$#" -eq 2 ] || exit 2
 		cmd_status "$2"
+		;;
+	source)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_source "$2"
+		;;
+	authorize-browser-audio)
+		[ "$#" -eq 3 ] || exit 2
+		cmd_authorize_browser_audio "$2" "$3"
+		;;
+	source-info)
+		[ "$#" -eq 3 ] || exit 2
+		cmd_source_info "$2" "$3"
+		;;
+	position-ms)
+		[ "$#" -eq 3 ] || exit 2
+		cmd_position_ms "$2" "$3"
 		;;
 	reason)
 		[ "$#" -eq 2 ] || exit 2

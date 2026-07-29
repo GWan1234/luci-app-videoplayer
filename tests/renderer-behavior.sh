@@ -16,7 +16,9 @@ assert_eq() {
 
 repo_root="$(readlink -f -- "${1:-$PWD}")"
 source_helper="$repo_root/luci-app-videoplayer/root/usr/libexec/videoplayer-renderer"
+source_stream="$repo_root/luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream"
 [[ -f "$source_helper" ]] || fail "renderer helper not found"
+[[ -f "$source_stream" ]] || fail "stream CGI not found"
 
 for tool in cc flock python3 readlink sed stat; do
 	command -v "$tool" >/dev/null || fail "$tool is required"
@@ -26,6 +28,8 @@ work="$(mktemp -d /tmp/videoplayer-renderer-ci.XXXXXX)"
 bin="$work/bin"
 runtime="$work/runtime"
 helper="$bin/videoplayer-renderer"
+stream_helper="$bin/videoplayer-stream"
+stream_token_dir="$work/stream-tokens"
 private_exec_dir="$work/private-libexec/videoplayer-ffmpeg"
 private_lib_dir="$work/private-lib/videoplayer-ffmpeg"
 private_ffmpeg="$private_exec_dir/ffmpeg"
@@ -67,6 +71,7 @@ cleanup() {
 		"${worker2:-}" "${ffmpeg2:-}" "${audio2:-}" "${chunker2:-}" \
 		"${finite_worker:-}" "${finite_ffmpeg:-}" \
 		"${finite_media_worker:-}" "${finite_media_ffmpeg:-}" \
+		"${instant_worker:-}" "${delayed_worker:-}" \
 		"${chunker_failure_worker:-}" "${chunker_failure_ffmpeg:-}" \
 		"${chunker_failure_audio:-}" "${chunker_failure_chunker:-}"
 	do
@@ -87,6 +92,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Transform only environment-bound paths in a disposable copy.
+# The inserted post-spawn pause deterministically simulates a heavily
+# preempted shell whose very short FFmpeg child exits before /proc can expose
+# its start time.
 grep -Fq 'export PATH="/usr/sbin:/usr/bin:/sbin:/bin"' "$source_helper" ||
 	fail "unexpected PATH declaration"
 grep -Fq '/tmp/videoplayer-render-v1' "$source_helper" ||
@@ -104,9 +112,22 @@ sed \
 	-e "s|/usr/libexec/videoplayer-renderer|$helper|g" \
 	-e "s|/usr/libexec/videoplayer-ffmpeg/ffmpeg|$private_ffmpeg|g" \
 	-e "s|/usr/lib/videoplayer-ffmpeg|$private_lib_dir|g" \
+	-e '/^[[:space:]]*ffmpeg_pid=\$!$/a\
+	sleep 0.05' \
 	"$source_helper" > "$helper"
 
 chmod 0755 "$helper"
+
+grep -Fq 'export PATH="/usr/sbin:/usr/bin:/sbin:/bin"' "$source_stream" ||
+	fail "unexpected stream PATH declaration"
+grep -Fq 'RENDERER_HELPER="/usr/libexec/videoplayer-renderer"' "$source_stream" ||
+	fail "unexpected stream renderer path"
+sed \
+	-e "s|export PATH=\"/usr/sbin:/usr/bin:/sbin:/bin\"|export PATH=\"$bin:/usr/sbin:/usr/bin:/sbin:/bin\"|" \
+	-e "s|TOKEN_DIR=\"/tmp/videoplayer-tokens\"|TOKEN_DIR=\"$stream_token_dir\"|" \
+	-e "s|RENDERER_HELPER=\"/usr/libexec/videoplayer-renderer\"|RENDERER_HELPER=\"$helper\"|" \
+	"$source_stream" > "$stream_helper"
+chmod 0755 "$stream_helper"
 
 ! grep -Fq '/tmp/videoplayer-render-v1' "$helper" ||
 	fail "runtime transform incomplete"
@@ -297,8 +318,10 @@ int main(int argc, char **argv)
 	int audio_fail;
 	int audio_finite;
 	int audio_output_fd;
+	int delayed_video;
 	int fail_after_first_frame;
 	int finite_video;
+	int instant_video;
 	int line;
 	unsigned int audio_sequence = 0;
 	unsigned int video_sequence = 0;
@@ -394,9 +417,12 @@ int main(int argc, char **argv)
 	marker_size = pread(input_fd, marker, sizeof(marker) - 1, 0);
 	if (marker_size < 0)
 		return 67;
+	delayed_video = marker_is(marker, marker_size, "delayed-start");
 	finite_video = marker_is(marker, marker_size, "finite-media");
+	instant_video = marker_is(marker, marker_size, "instant-media");
 	if (is_audio) {
-		if (marker_is(marker, marker_size, "no-audio")) {
+		if (marker_is(marker, marker_size, "no-audio") ||
+		    delayed_video || instant_video) {
 			fputs("Stream map '0:a:0' matches no streams\n", stderr);
 			return 81;
 		}
@@ -521,10 +547,14 @@ int main(int argc, char **argv)
 	signal(SIGINT, stop);
 	signal(SIGHUP, stop);
 
+	if (delayed_video)
+		sleep(4);
 	while (running) {
 		if (publish(output) != 0)
 			return 66;
 		video_sequence++;
+		if (instant_video)
+			return 0;
 		if (finite_video && video_sequence >= 4)
 			return 0;
 		if (fail_after_first_frame) {
@@ -555,9 +585,27 @@ printf 'sanitized-failure fixture\n' > "$work/media/sanitized.mp4"
 printf 'noisy-diagnostics fixture\n' > "$work/media/noisy.mp4"
 printf 'runtime-failure fixture\n' > "$work/media/runtime.mp4"
 printf 'no-audio fixture\n' > "$work/media/no-audio.mp4"
+printf 'no-audio extensionless fixture\n' > "$work/media/no-audio-extensionless"
 printf 'audio-runtime-failure fixture\n' > "$work/media/audio-runtime.mp4"
 printf 'audio-finite fixture\n' > "$work/media/audio-finite.mp4"
 printf 'finite-media fixture\n' > "$work/media/finite-media.mp4"
+printf 'instant-media fixture\n' > "$work/media/instant-media.mp4"
+printf 'delayed-start fixture\n' > "$work/media/delayed-start.mp4"
+
+mkdir -m 0700 -- "$stream_token_dir"
+printf 'bucket-v1\n' > "$stream_token_dir/.bucket-v1"
+chmod 0600 "$stream_token_dir/.bucket-v1"
+normal_stream_token=abababababababababababababababab
+extensionless_stream_token=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+stream_expiry=$(( $(date +%s) + 300 ))
+printf '%s\n%s\n%s\n' \
+	"$normal_stream_token" "$stream_expiry" "$work/media/bad apple.mp4" \
+	> "$stream_token_dir/t-aba"
+printf '%s\n%s\n%s\n' \
+	"$extensionless_stream_token" "$stream_expiry" \
+	"$work/media/no-audio-extensionless" \
+	> "$stream_token_dir/t-cdc"
+chmod 0600 "$stream_token_dir/t-aba" "$stream_token_dir/t-cdc"
 
 check_response() {
 	python3 - "$1" "$2" <<'PY'
@@ -704,6 +752,48 @@ run_audio_cgi() {
 		"$helper" cgi-audio > "$4"
 }
 
+run_stream_cgi() {
+	REQUEST_METHOD="$1" \
+	QUERY_STRING="renderer=$2&audio=$3" \
+	HTTP_RANGE="${5:-}" \
+		"$stream_helper" > "$4"
+}
+
+run_token_stream_cgi() {
+	REQUEST_METHOD="$1" \
+	QUERY_STRING="token=$2" \
+	HTTP_RANGE="${4:-}" \
+		"$stream_helper" > "$3"
+}
+
+check_stream_body_file() {
+	python3 - "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+
+response = Path(sys.argv[1]).read_bytes()
+expected = Path(sys.argv[2]).read_bytes()
+parts = response.split(b"\r\n\r\n", 1)
+assert len(parts) == 2, "missing CGI header delimiter"
+assert parts[1] == expected, (parts[1], expected)
+PY
+}
+
+check_stream_body_slice() {
+	python3 - "$1" "$2" "$3" "$4" <<'PY'
+from pathlib import Path
+import sys
+
+response = Path(sys.argv[1]).read_bytes()
+source = Path(sys.argv[2]).read_bytes()
+start = int(sys.argv[3])
+end = int(sys.argv[4])
+parts = response.split(b"\r\n\r\n", 1)
+assert len(parts) == 2, "missing CGI header delimiter"
+assert parts[1] == source[start : end + 1], (parts[1], source[start : end + 1])
+PY
+}
+
 token1=0123456789abcdef0123456789abcdef
 token2=fedcba9876543210fedcba9876543210
 missing_decoder=11111111111111111111111111111111
@@ -719,12 +809,29 @@ sanitized_failure=19191919191919191919191919191919
 noisy_diagnostics=22222222222222222222222222222222
 runtime_failure=33333333333333333333333333333333
 no_audio=34343434343434343434343434343434
+no_audio_capability=45454545454545454545454545454545
 audio_failure=35353535353535353535353535353535
 finite_audio=36363636363636363636363636363636
 chunker_failure=37373737373737373737373737373737
 finite_media=38383838383838383838383838383838
+instant_media=39393939393939393939393939393939
+delayed_start=40404040404040404040404040404040
+delayed_capability=41414141414141414141414141414141
 stale=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 media="$work/media/bad apple.mp4"
+
+run_token_stream_cgi GET "$normal_stream_token" "$work/token-stream"
+check_status_line "$work/token-stream" "200 OK"
+grep -Fq $'Content-Type: video/mp4\r' "$work/token-stream" ||
+	fail "normal browser stream used an unexpected MIME type"
+check_stream_body_file "$work/token-stream" "$work/media/bad apple.mp4"
+run_token_stream_cgi GET "$extensionless_stream_token" \
+	"$work/token-extensionless"
+check_status_line "$work/token-extensionless" "415 Unsupported Media Type"
+REQUEST_METHOD=GET \
+	QUERY_STRING="token=$normal_stream_token&renderer=$no_audio&audio=$no_audio_capability" \
+	"$stream_helper" > "$work/token-mixed-query"
+check_status_line "$work/token-mixed-query" "400 Bad Request"
 
 assert_eq "$("$helper" probe)" available "system FFmpeg fallback probe"
 
@@ -954,16 +1061,156 @@ assert_eq \
 # Missing or undecodable audio is nonfatal: video remains available and the
 # dedicated audio endpoint reports the optional track as unavailable.
 assert_eq \
-	"$("$helper" start "$no_audio" "$work/media/no-audio.mp4")" \
+	"$("$helper" start "$no_audio" "$work/media/no-audio-extensionless")" \
 	started \
 	"video-only start"
+assert_eq \
+	"$("$helper" source "$no_audio")" \
+	"$work/media/no-audio-extensionless" \
+	"active renderer source"
+assert_eq \
+	"$("$helper" authorize-browser-audio \
+		"$no_audio" "$no_audio_capability")" \
+	"$no_audio_capability" \
+	"browser-audio capability authorization"
+assert_eq \
+	"$("$helper" authorize-browser-audio \
+		"$no_audio" 56565656565656565656565656565656)" \
+	"$no_audio_capability" \
+	"browser-audio capability idempotence"
+if "$helper" authorize-browser-audio "$no_audio" "$no_audio" \
+	>/dev/null 2>&1; then
+	fail "renderer token was accepted as its own browser-audio capability"
+fi
+no_audio_worker="$(session_pid "$no_audio" worker)"
+source_info="$(
+	"$helper" source-info "$no_audio" "$no_audio_capability"
+)"
+IFS=$'\t' read -r source_path source_fd source_identity extra <<< "$source_info"
+[[ -z "${extra:-}" ]] || fail "source-info returned extra fields"
+assert_eq "$source_path" "$work/media/no-audio-extensionless" \
+	"browser-audio source path"
+assert_eq "$source_fd" "/proc/$no_audio_worker/fd/3" \
+	"browser-audio stable descriptor"
+assert_eq "$source_identity" \
+	"$(stat -L -c '%d:%i:%s' -- "$source_fd")" \
+	"browser-audio source identity"
+position_ms="$("$helper" position-ms "$no_audio" "$no_audio_capability")"
+[[ "$position_ms" =~ ^[0-9]+$ && "$position_ms" -le 21605000 ]] ||
+	fail "invalid renderer playback offset: $position_ms"
 assert_eq "$("$helper" has-audio "$no_audio")" 0 "video-only audio capability"
 run_cgi GET "$no_audio" 1 "$work/response"
 check_response "$work/response" GET
 run_audio_cgi GET "$no_audio" live "$work/audio-response"
 check_status_line "$work/audio-response" "409 Conflict"
+run_stream_cgi HEAD "$no_audio" "$no_audio_capability" \
+	"$work/stream-head"
+check_status_line "$work/stream-head" "200 OK"
+grep -Fq $'Content-Type: application/octet-stream\r' "$work/stream-head" ||
+	fail "extensionless renderer stream used an unexpected MIME type"
+run_stream_cgi GET "$no_audio" "$no_audio_capability" \
+	"$work/stream-get"
+check_status_line "$work/stream-get" "200 OK"
+check_stream_body_file \
+	"$work/stream-get" "$work/media/no-audio-extensionless"
+run_stream_cgi GET "$no_audio" "$no_audio_capability" \
+	"$work/stream-range" "bytes=3-11"
+check_status_line "$work/stream-range" "206 Partial Content"
+check_stream_body_slice \
+	"$work/stream-range" "$work/media/no-audio-extensionless" 3 11
+REQUEST_METHOD=GET \
+	QUERY_STRING="renderer=$no_audio" \
+	"$stream_helper" > "$work/stream-invalid"
+check_status_line "$work/stream-invalid" "400 Bad Request"
+REQUEST_METHOD=GET \
+	QUERY_STRING="renderer=$no_audio&audio=$no_audio" \
+	"$stream_helper" > "$work/stream-invalid"
+check_status_line "$work/stream-invalid" "403 Forbidden"
+
+# Replacing the pathname must not swap the bytes granted to an existing
+# browser-audio capability: CGI reopens the worker's original descriptor and
+# verifies its exact device/inode/size after open.
+mv -- "$work/media/no-audio-extensionless" \
+	"$work/media/no-audio-extensionless.opened"
+run_stream_cgi GET "$no_audio" "$no_audio_capability" \
+	"$work/stream-renamed"
+check_status_line "$work/stream-renamed" "200 OK"
+check_stream_body_file \
+	"$work/stream-renamed" "$work/media/no-audio-extensionless.opened"
+printf 'replacement bytes must not be streamed\n' \
+	> "$work/media/no-audio-extensionless"
+run_stream_cgi GET "$no_audio" "$no_audio_capability" \
+	"$work/stream-replaced"
+check_status_line "$work/stream-replaced" "200 OK"
+check_stream_body_file \
+	"$work/stream-replaced" "$work/media/no-audio-extensionless.opened"
 assert_eq "$("$helper" status "$no_audio")" running "video-only status"
 assert_eq "$("$helper" stop "$no_audio")" stopped "video-only stop"
+if "$helper" source "$no_audio" >/dev/null 2>&1; then
+	fail "stopped renderer exposed its source"
+fi
+if "$helper" source-info "$no_audio" "$no_audio_capability" \
+	>/dev/null 2>&1; then
+	fail "stopped renderer retained its browser-audio capability"
+fi
+run_stream_cgi GET "$no_audio" "$no_audio_capability" \
+	"$work/stream-stopped"
+check_status_line "$work/stream-stopped" "403 Forbidden"
+rm -f -- "$work/media/no-audio-extensionless"
+mv -- "$work/media/no-audio-extensionless.opened" \
+	"$work/media/no-audio-extensionless"
+
+# A one-frame input may exit before the worker's first monitoring pass. Its
+# completed frame must still make start succeed and remain fetchable long
+# enough for the web UI to observe the session.
+assert_eq \
+	"$("$helper" start "$instant_media" "$work/media/instant-media.mp4")" \
+	started \
+	"instant-media start"
+instant_worker="$(session_pid "$instant_media" worker)"
+assert_eq \
+	"$("$helper" status "$instant_media")" \
+	running \
+	"instant-media startup grace"
+run_cgi GET "$instant_media" 1 "$work/response"
+check_response "$work/response" GET
+for _ in {1..200}; do
+	[[ "$("$helper" status "$instant_media")" == ended ]] && break
+	sleep 0.05
+done
+assert_eq \
+	"$("$helper" status "$instant_media")" \
+	ended \
+	"instant-media final status"
+wait_dead "$instant_worker"
+assert_eq \
+	"$("$helper" stop "$instant_media")" \
+	stopped \
+	"instant-media stop"
+
+# Browser-audio synchronization starts at the first published frame, not when
+# a slow decoder process is spawned. Startup latency must therefore not seek
+# the audio several seconds ahead of the visible video.
+assert_eq \
+	"$("$helper" start "$delayed_start" "$work/media/delayed-start.mp4")" \
+	started \
+	"delayed-start media"
+delayed_worker="$(session_pid "$delayed_start" worker)"
+assert_eq \
+	"$("$helper" authorize-browser-audio \
+		"$delayed_start" "$delayed_capability")" \
+	"$delayed_capability" \
+	"delayed-start browser-audio capability"
+delayed_position="$(
+	"$helper" position-ms "$delayed_start" "$delayed_capability"
+)"
+[[ "$delayed_position" =~ ^[0-9]+$ && "$delayed_position" -le 2500 ]] ||
+	fail "renderer clock included decoder startup latency: $delayed_position"
+assert_eq \
+	"$("$helper" stop "$delayed_start")" \
+	stopped \
+	"delayed-start stop"
+wait_dead "$delayed_worker"
 
 # A finite audio track may close the FIFO just before its FFmpeg child exits.
 # Both zero exit codes must publish the final complete chunks as ended audio.
@@ -998,7 +1245,7 @@ assert_eq \
 	"finite-media start"
 finite_media_worker="$(session_pid "$finite_media" worker)"
 finite_media_ffmpeg="$(session_pid "$finite_media" ffmpeg)"
-for _ in {1..120}; do
+for _ in {1..200}; do
 	[[ "$("$helper" status "$finite_media")" == ended ]] && break
 	sleep 0.05
 done

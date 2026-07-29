@@ -6,7 +6,7 @@
 #
 # ubus/rpcd backend for luci-app-videoplayer
 # Methods: get_status, list, list_renderer, resolve, start_renderer,
-#          renderer_status, stop_renderer
+#          resolve_audio, renderer_status, stop_renderer
 
 . /usr/share/libubox/jshn.sh
 
@@ -248,6 +248,7 @@ mime_for() {
 	ext="$(printf '%s' "${base##*.}" |
 		tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
 	case "$ext" in
+		mp4|m4v|f4v) printf 'video/mp4\n' ;;
 		webm) printf 'video/webm\n' ;;
 		ogg|ogv) printf 'video/ogg\n' ;;
 		mov) printf 'video/quicktime\n' ;;
@@ -263,7 +264,7 @@ mime_for() {
 		h264|264) printf 'video/h264\n' ;;
 		h265|265|hevc) printf 'video/h265\n' ;;
 		rm|rmvb) printf 'application/vnd.rn-realmedia\n' ;;
-		*) printf 'video/mp4\n' ;;
+		*) printf 'application/octet-stream\n' ;;
 	esac
 }
 
@@ -1037,6 +1038,118 @@ cmd_resolve() {
 	json_dump
 }
 
+cmd_resolve_audio() {
+	local raw="$1" renderer_token root path canonical_rel parent
+	local depth max_depth name mime proposed_audio_token audio_token position_ms
+
+	[ "$(get_enabled)" = "1" ] || {
+		json_error "video player disabled"
+		return
+	}
+	[ "$(get_render_mode)" = "router" ] || {
+		json_error "router CPU rendering is not selected"
+		return
+	}
+	parse_request "$raw" || {
+		json_error "invalid JSON request"
+		return
+	}
+	renderer_token="$REQ_TOKEN"
+	valid_token "$renderer_token" || {
+		json_error "renderer token required or invalid"
+		return
+	}
+	[ -x "$RENDERER_HELPER" ] || {
+		json_error "router CPU renderer is not installed"
+		return
+	}
+
+	path="$("$RENDERER_HELPER" source "$renderer_token" 2>/dev/null)" || {
+		json_error "renderer session is inactive or its source is unavailable"
+		return
+	}
+	[ -n "$path" ] && [ "${#path}" -le "$MAX_PATH_LENGTH" ] || {
+		json_error "renderer returned an invalid source"
+		return
+	}
+	string_has_control "$path" && {
+		json_error "renderer returned an invalid source"
+		return
+	}
+
+	root="$(get_media_root 2>/dev/null)" || {
+		json_error "media path is invalid or inaccessible"
+		return
+	}
+	path_is_within_root "$root" "$path" || {
+		json_error "renderer source is outside the media directory"
+		return
+	}
+	canonical_rel="$(relative_from_root "$root" "$path")"
+	validate_relative_path "$canonical_rel" || {
+		json_error "renderer returned an invalid source"
+		return
+	}
+
+	parent="${canonical_rel%/*}"
+	[ "$parent" != "$canonical_rel" ] || parent=""
+	depth="$(path_depth "$parent")"
+	max_depth="$(get_max_depth)"
+	[ "$depth" -le "$max_depth" ] || {
+		json_error "maximum directory depth exceeded"
+		return
+	}
+	name="${path##*/}"
+	mime="$(mime_for "$path")"
+	proposed_audio_token="$(generate_random_token)" || {
+		json_error "cannot generate a browser-audio capability"
+		return
+	}
+	audio_token="$(
+		"$RENDERER_HELPER" authorize-browser-audio \
+			"$renderer_token" "$proposed_audio_token" 2>/dev/null
+	)" || {
+		json_error "renderer session ended before browser audio was authorized"
+		return
+	}
+	valid_token "$audio_token" && [ "$audio_token" != "$renderer_token" ] || {
+		json_error "renderer returned an invalid browser-audio capability"
+		return
+	}
+	position_ms="$(
+		"$RENDERER_HELPER" position-ms \
+			"$renderer_token" "$audio_token" 2>/dev/null
+	)" || {
+		json_error "renderer playback position is unavailable"
+		return
+	}
+	case "$position_ms" in
+		''|*[!0-9]*)
+			json_error "renderer returned an invalid playback position"
+			return
+			;;
+	esac
+	[ "${#position_ms}" -le 12 ] &&
+		[ "$position_ms" -le $((TOKEN_TTL * 1000 + 5000)) ] || {
+			json_error "renderer returned an invalid playback position"
+			return
+		}
+
+	json_init
+	json_add_string "name" "$name"
+	json_add_string "path" "$canonical_rel"
+	json_add_string "render_mode" "browser"
+	json_add_string "stream_url" \
+		"/cgi-bin/videoplayer-stream?renderer=$renderer_token&audio=$audio_token"
+	json_add_string "stream_type" "html5-video"
+	json_add_string "mime" "$mime"
+	json_add_boolean "has_audio" 1
+	json_add_boolean "seekable" 1
+	json_add_int "media_offset_ms" "$position_ms"
+	json_add_int "expires_in" "$TOKEN_TTL"
+	json_dump
+}
+
 cmd_renderer_status() {
 	local raw="$1" state reason=""
 
@@ -1118,6 +1231,9 @@ case "$1" in
 		json_add_object "start_renderer"
 			json_add_string "path" "String"
 		json_close_object
+		json_add_object "resolve_audio"
+			json_add_string "token" "String"
+		json_close_object
 		json_add_object "renderer_status"
 			json_add_string "token" "String"
 		json_close_object
@@ -1150,6 +1266,7 @@ case "$1" in
 			list_renderer) cmd_list "$input" router ;;
 			resolve) cmd_resolve "$input" browser ;;
 			start_renderer) cmd_resolve "$input" router ;;
+			resolve_audio) cmd_resolve_audio "$input" ;;
 			renderer_status) cmd_renderer_status "$input" ;;
 			stop_renderer) cmd_stop_renderer "$input" ;;
 			*) json_error "unknown method" ;;

@@ -50,6 +50,8 @@ read_methods = grant["read"]["ubus"]["luci.videoplayer"]
 write_methods = grant["write"]["ubus"]["luci.videoplayer"]
 assert "list_renderer" not in read_methods, read_methods
 assert "list_renderer" in write_methods, write_methods
+assert "resolve_audio" not in read_methods, read_methods
+assert "resolve_audio" in write_methods, write_methods
 PY
 
 uppercase=ABCDEFGHIJKLMNOPQRSTUVWXYZ
@@ -130,6 +132,11 @@ check_extension_helpers() {
 			"$harness uppercase MIME lookup"
 		assert_eq "$(mime_for '/mnt/video/movie.MP4')" "video/mp4" \
 			"$harness MP4 MIME lookup"
+		assert_eq "$(mime_for '/mnt/video/movie.F4V')" "video/mp4" \
+			"$harness F4V MIME lookup"
+		assert_eq "$(mime_for '/mnt/video/no-extension')" \
+			"application/octet-stream" \
+			"$harness extensionless MIME lookup"
 	)
 }
 
@@ -233,6 +240,23 @@ case "${1:-}" in
 		[ "$#" -eq 2 ] || exit 2
 		printf '1\n'
 		;;
+	source)
+		[ "$#" -eq 2 ] || exit 2
+		[ -n "${VIDEOPLAYER_TEST_AUDIO_SOURCE:-}" ] || exit 1
+		printf '%s\n' "$VIDEOPLAYER_TEST_AUDIO_SOURCE"
+		;;
+	authorize-browser-audio)
+		[ "$#" -eq 3 ] || exit 2
+		[ "$2" = "22222222222222222222222222222222" ] || exit 1
+		[ "$3" = "44444444444444444444444444444444" ] || exit 1
+		printf '%s\n' "$3"
+		;;
+	position-ms)
+		[ "$#" -eq 3 ] || exit 2
+		[ "$2" = "22222222222222222222222222222222" ] || exit 1
+		[ "$3" = "44444444444444444444444444444444" ] || exit 1
+		printf '1750\n'
+		;;
 	*) exit 2 ;;
 esac
 SH
@@ -243,10 +267,13 @@ chmod 0755 "$renderer_stub"
 # shellcheck disable=SC2034
 RENDERER_HELPER="$renderer_stub"
 test_request_path="no-extension"
+test_request_token="22222222222222222222222222222222"
 parse_request() {
 	# Consumed by cmd_resolve from the sourced rpcd backend.
 	# shellcheck disable=SC2034
 	REQ_PATH="$test_request_path"
+	# shellcheck disable=SC2034
+	REQ_TOKEN="$test_request_token"
 	return 0
 }
 get_enabled() {
@@ -353,5 +380,36 @@ cmd_resolve '{}' browser >/dev/null
 	fail "browser mode allocated a renderer token"
 [[ -e "$stream_token_marker" ]] ||
 	fail "browser mode did not allocate a stream token"
+
+# Browser-audio fallback mints a distinct nonce bound to the active renderer
+# and deliberately accepts extensionless files exposed only by CPU mode.
+export VIDEOPLAYER_TEST_AUDIO_SOURCE="$media/no-extension"
+rm -f -- "$stream_token_marker" "$renderer_token_marker"
+create_token() {
+	: > "$stream_token_marker"
+	return 1
+}
+generate_random_token() {
+	: > "$renderer_token_marker"
+	printf '44444444444444444444444444444444\n'
+}
+cmd_resolve_audio '{}' >/dev/null
+[[ ! -e "$stream_token_marker" ]] ||
+	fail "browser-audio fallback allocated a long-lived path token"
+[[ -e "$renderer_token_marker" ]] ||
+	fail "browser-audio fallback did not allocate a distinct capability"
+assert_eq "${json_fields[path]:-}" "no-extension" \
+	"browser-audio canonical path"
+assert_eq "${json_fields[render_mode]:-}" "browser" \
+	"browser-audio render mode"
+assert_eq "${json_fields[stream_type]:-}" "html5-video" \
+	"browser-audio stream type"
+assert_eq "${json_fields[stream_url]:-}" \
+	"/cgi-bin/videoplayer-stream?renderer=22222222222222222222222222222222&audio=44444444444444444444444444444444" \
+	"browser-audio stream URL"
+assert_eq "${json_fields[media_offset_ms]:-}" "1750" \
+	"browser-audio playback offset"
+assert_eq "${json_fields[mime]:-}" "application/octet-stream" \
+	"extensionless browser-audio MIME"
 
 printf 'local-listing-test: ok\n'
