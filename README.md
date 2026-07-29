@@ -6,7 +6,7 @@ by the router CPU with FFmpeg and delivered as JPEG frames plus PCM audio
 chunks. In both cases, playback stays inside the LuCI web interface. The
 application does not use HDMI or a framebuffer.
 
-Current source package version: **1.2.0**. The latest published GitHub release
+Current source package version: **1.1.0**. The latest published GitHub release
 is still **1.0.0**. The release installer below remains pinned to that release,
 while a separate APK-only installer follows the latest successfully tested
 `main` source.
@@ -174,7 +174,7 @@ router must have working HTTPS access to GitHub:
 ```
 
 The installer currently installs the latest published release, not the newer
-1.2.0 source tree. It detects whether the router uses `apk` or `opkg`,
+1.1.0 source tree. It detects whether the router uses `apk` or `opkg`,
 downloads the matching 1.0.0 package from
 [Release 1.0.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.0.0),
 verifies its pinned SHA-256 checksum, attempts to refresh the package indexes,
@@ -286,8 +286,8 @@ The resulting files are written to `dist/`:
 
 | File | Package manager | OpenWrt |
 |---|---|---|
-| `luci-app-videoplayer-1.2.0.apk` | `apk` | 25.12+ / snapshots |
-| `luci-app-videoplayer_1.2.0_all.ipk` | `opkg` | 24.10 and compatible releases that use `opkg` |
+| `luci-app-videoplayer-1.1.0.apk` | `apk` | 25.12+ / snapshots |
+| `luci-app-videoplayer_1.1.0_all.ipk` | `opkg` | 24.10 and compatible releases that use `opkg` |
 
 The IPK uses the gzip-compressed GNU tar format expected by OpenWrt 24.10.
 `Installed-Size` is calculated in the same way as by the standard
@@ -303,17 +303,17 @@ package in the format expected by the selected OpenWrt release.
 OpenWrt 25.12+:
 
 ```sh
-scp -O dist/luci-app-videoplayer-1.2.0.apk root@192.168.1.1:/tmp/
+scp -O dist/luci-app-videoplayer-1.1.0.apk root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-apk add --allow-untrusted /tmp/luci-app-videoplayer-1.2.0.apk
+apk add --allow-untrusted /tmp/luci-app-videoplayer-1.1.0.apk
 ```
 
 OpenWrt 24.10 (`opkg`):
 
 ```sh
-scp -O dist/luci-app-videoplayer_1.2.0_all.ipk root@192.168.1.1:/tmp/
+scp -O dist/luci-app-videoplayer_1.1.0_all.ipk root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-opkg install /tmp/luci-app-videoplayer_1.2.0_all.ipk
+opkg install /tmp/luci-app-videoplayer_1.1.0_all.ipk
 ```
 
 If your `scp` implementation does not support `-O`, omit that option. After
@@ -321,7 +321,7 @@ installation, sign out of LuCI and sign in again if the new menu item does not
 appear.
 
 Package managers may consider an older build with a release suffix newer than
-this suffix-free `1.2.0` build. When replacing such an installation, explicitly
+this suffix-free `1.1.0` build. When replacing such an installation, explicitly
 allow a downgrade or remove the old package before installing this one.
 
 Direct URL:

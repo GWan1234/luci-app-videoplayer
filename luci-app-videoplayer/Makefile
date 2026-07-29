@@ -10,8 +10,8 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_VERSION:=1.2.0
-# Override luci.mk's default release so the package version stays exactly 1.2.0.
+PKG_VERSION:=1.1.0
+# Override luci.mk's default release so the package version stays exactly 1.1.0.
 PKG_RELEASE:=
 
 LUCI_TITLE:=LuCI Video Player (local + remote)
