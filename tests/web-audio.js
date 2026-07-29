@@ -694,14 +694,17 @@ async function main() {
 		session_token: 'b'.repeat(32),
 		stream_url: '/cgi-bin/videoplayer-frame?token=' + 'b'.repeat(32),
 		has_audio: 0,
-		router_fps: 12,
-		frame_interval_ms: 83
+		router_fps: 30,
+		frame_interval_ms: 33
 	}, 'bad apple.mp4', 6, null);
 	app._scheduleCpuFramePoll = previousFrameScheduler;
 
 	const browserSession = app._cpuSession;
 	const browserAudio = browserSession && browserSession.browserAudio;
 	check(browserSession && browserSession.active, 'CPU session was not retained');
+	check(browserSession.fps === 30, '30 FPS was normalized to another frame rate');
+	check(browserSession.frameIntervalMs === 33,
+		'30 FPS was normalized to another polling interval');
 	check(browserAudio && browserAudio.active, 'browser audio fallback was not attached');
 	check(browserAudio.waitingForVideo,
 		'browser audio started before the first CPU-rendered frame');

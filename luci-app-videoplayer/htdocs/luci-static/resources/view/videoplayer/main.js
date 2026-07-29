@@ -19,8 +19,9 @@ const callStopRenderer   = rpc.declare({
 	nobatch: true
 });
 const PAGE_SIZE = 100;
+const CPU_ROUTER_FPS_OPTIONS = [ 5, 8, 12, 15, 20, 24, 30 ];
 const CPU_DEFAULT_FRAME_INTERVAL_MS = 125;
-const CPU_MIN_FRAME_INTERVAL_MS = 83;
+const CPU_MIN_FRAME_INTERVAL_MS = 33;
 const CPU_MAX_FRAME_INTERVAL_MS = 200;
 const CPU_HIDDEN_INTERVAL_MS = 2000;
 const CPU_FRAME_REQUEST_TIMEOUT_MS = 2500;
@@ -58,7 +59,7 @@ function normalizeRenderMode(value) {
 
 function normalizeRouterFps(value) {
 	value = Number(value);
-	return value === 5 || value === 12 ? value : 8;
+	return CPU_ROUTER_FPS_OPTIONS.indexOf(value) !== -1 ? value : 8;
 }
 
 function normalizeFrameInterval(value) {
@@ -366,7 +367,7 @@ return view.extend({
 								class: 'cbi-input-select',
 								disabled: canWriteSettings ? null : 'disabled',
 								'aria-describedby': 'vp-router-fps-desc'
-							}, [ 5, 8, 12 ].map(function (fps) {
+							}, CPU_ROUTER_FPS_OPTIONS.map(function (fps) {
 								return E('option', {
 									value: String(fps),
 									selected: routerFps === fps ? 'selected' : null
@@ -375,7 +376,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-router-fps-desc',
 								class: 'cbi-value-description'
-							}, _('Used only for router CPU rendering. 8 FPS is the balanced default; 5 reduces load and 12 is smoother but considerably heavier.'))
+							}, _('Used only for router CPU rendering. 8 FPS is the balanced default and 5 reduces load. Higher settings are progressively heavier; 30 FPS is the maximum and may overload many routers.'))
 						])
 					]),
 					E('div', { class: 'cbi-value' }, [

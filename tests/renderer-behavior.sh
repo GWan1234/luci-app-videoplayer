@@ -38,6 +38,8 @@ mkdir -m 0755 -- "$bin" "$work/media"
 
 export VIDEOPLAYER_TEST_MEDIA_ROOT="$work/media"
 export VIDEOPLAYER_TEST_RUNTIME="$runtime"
+export VIDEOPLAYER_TEST_ROUTER_FPS=30
+export VIDEOPLAYER_EXPECT_FPS=30
 
 terminate_owned_pid() {
 	local pid="${1:-}" cmdline
@@ -154,7 +156,7 @@ case "${2:-}" in
 		printf '%s\n' "$VIDEOPLAYER_TEST_MEDIA_ROOT"
 		;;
 	videoplayer.main.router_fps)
-		printf '8\n'
+		printf '%s\n' "${VIDEOPLAYER_TEST_ROUTER_FPS:-8}"
 		;;
 	*)
 		exit 1
@@ -312,6 +314,7 @@ int main(int argc, char **argv)
 {
 	struct stat input;
 	char marker[32] = {0};
+	char expected_video_filter[256];
 	const char *output;
 	int input_fd;
 	int is_audio;
@@ -327,10 +330,20 @@ int main(int argc, char **argv)
 	unsigned int video_sequence = 0;
 	ssize_t marker_size;
 	const char *expected_private_lib;
+	const char *expected_fps;
 	const char *library_path;
 
 	expected_private_lib = getenv("VIDEOPLAYER_EXPECT_PRIVATE_LIB");
+	expected_fps = getenv("VIDEOPLAYER_EXPECT_FPS");
 	library_path = getenv("LD_LIBRARY_PATH");
+	if (expected_fps == NULL || expected_fps[0] == '\0')
+		expected_fps = "8";
+	if (snprintf(
+		    expected_video_filter,
+		    sizeof(expected_video_filter),
+		    "fps=%s,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p",
+		    expected_fps) >= (int)sizeof(expected_video_filter))
+		return 78;
 	if (expected_private_lib != NULL) {
 		if (expected_private_lib[0] == '\0') {
 			if (library_path != NULL && library_path[0] != '\0')
@@ -406,7 +419,7 @@ int main(int argc, char **argv)
 		    argc,
 		    argv,
 		    "-vf",
-		    "fps=8,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p") != 1 ||
+		    expected_video_filter) != 1 ||
 	    count_pair(argc, argv, "-c:v", "mjpeg") != 1 ||
 	    count_pair(argc, argv, "-f", "image2") != 1 ||
 	    count_pair(argc, argv, "-update", "1") != 1 ||

@@ -212,7 +212,7 @@ get_router_fps() {
 
 	value="$(uci -q get videoplayer.main.router_fps 2>/dev/null)" || value=""
 	case "$value" in
-		5|8|12) printf '%s\n' "$value" ;;
+		5|8|12|15|20|24|30) printf '%s\n' "$value" ;;
 		*) printf '8\n' ;;
 	esac
 }
@@ -220,7 +220,12 @@ get_router_fps() {
 frame_interval_for_fps() {
 	case "$1" in
 		5) printf '200\n' ;;
+		8) printf '125\n' ;;
 		12) printf '83\n' ;;
+		15) printf '67\n' ;;
+		20) printf '50\n' ;;
+		24) printf '42\n' ;;
+		30) printf '33\n' ;;
 		*) printf '125\n' ;;
 	esac
 }
