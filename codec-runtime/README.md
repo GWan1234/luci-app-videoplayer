@@ -103,12 +103,15 @@ Each resulting executable is checked for:
 
 The Octeon and embedded PowerPC ABIs use static ELF, linkage, FFmpeg
 configuration, component, and package validation because QEMU user mode cannot
-faithfully execute those CPU-specific userspace ABIs. Pull requests and pushes
-run a representative eight-architecture smoke matrix. An explicit full manual
-workflow run builds all 71 entries. Publication happens only after that full
-matrix succeeds. The generated `codec-snapshot` branch contains the complete
-architecture-scoped `dist/` tree; the source branch contains only recipes, the
-pinned matrix, and verification code.
+faithfully execute those CPU-specific userspace ABIs. `armeb_xscale` uses the
+same static validation because QEMU's big-endian ARM user emulation has a known
+VDSO `SIGSEGV`
+([QEMU issue #2333](https://gitlab.com/qemu-project/qemu/-/issues/2333)).
+Pull requests and pushes run a representative eight-architecture smoke matrix.
+An explicit full manual workflow run builds all 71 entries. Publication happens
+only after that full matrix succeeds. The generated `codec-snapshot` branch
+contains the complete architecture-scoped `dist/` tree; the source branch
+contains only recipes, the pinned matrix, and verification code.
 
 Official architecture inventories are published at:
 

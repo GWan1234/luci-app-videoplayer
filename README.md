@@ -272,8 +272,12 @@ Each runtime is built from a checksum-pinned official OpenWrt SDK with
 their matching user emulator for H.264-to-JPEG and AAC-to-PCM smoke tests.
 The Octeon and embedded PowerPC ABIs receive static ELF, linkage,
 configuration, component, and package validation because QEMU user mode cannot
-faithfully execute those CPU-specific userspace ABIs. Availability of a
-package is not a promise of literally every existing or future codec.
+faithfully execute those CPU-specific userspace ABIs. `armeb_xscale` receives
+the same static validation because QEMU's big-endian ARM user emulation has a
+known VDSO `SIGSEGV`
+([QEMU issue #2333](https://gitlab.com/qemu-project/qemu/-/issues/2333)).
+Availability of a package is not a promise of literally every existing or
+future codec.
 DRM, encryption, damaged media, unsupported formats, available flash and RAM,
 CPU performance, heat, and storage throughput can still prevent playback.
 
