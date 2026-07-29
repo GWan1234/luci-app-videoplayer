@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG_DIR = ROOT / "luci-app-videoplayer"
-DIST = ROOT / "dist"
+DIST = ROOT / ".staging" / "app"
 
 PKG_NAME = "luci-app-videoplayer"
 PKG_VERSION = "1.1.0"
@@ -36,7 +36,6 @@ DEPENDENCIES = (
     "jshn",
     "coreutils-stat",
     "coreutils-timeout",
-    "ffmpeg",
 )
 REQUIRED_DEPENDS = set(DEPENDENCIES)
 CONFFILES = ["/etc/config/videoplayer"]

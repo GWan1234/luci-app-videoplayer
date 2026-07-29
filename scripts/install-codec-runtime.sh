@@ -1,9 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Install the private FFmpeg codec runtime published to the generated
-# codec-snapshot branch. This installer intentionally supports exactly one
-# OpenWrt release/target/architecture tuple.
+# Select, verify, and install the private FFmpeg runtime for the router's exact
+# OpenWrt release, revision, package manager, and DISTRIB_ARCH value.
 
 set -eu
 
@@ -12,24 +11,15 @@ SNAPSHOT_BRANCH="codec-snapshot"
 API_BASE_URL="https://api.github.com/repos/$REPOSITORY"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
-REQUIRED_RELEASE="25.12.5"
-REQUIRED_REVISION="r33051-f5dae5ece4"
-REQUIRED_TARGET="mediatek/filogic"
-REQUIRED_DISTRIB_ARCH="aarch64_cortex-a53"
-REQUIRED_DISTRIB_ID="OpenWrt"
-REQUIRED_MACHINE_ARCH="aarch64"
-REQUIRED_APK_ARCH="aarch64"
-
 PACKAGE_NAME="luci-videoplayer-codec-runtime"
-PACKAGE_FILE="luci-videoplayer-codec-runtime-6.1.4-r2.apk"
-ARTIFACT_DIRECTORY="targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53"
-ARTIFACT_PATH="$ARTIFACT_DIRECTORY/$PACKAGE_FILE"
-CHECKSUM_OBJECT="$ARTIFACT_PATH.sha256"
-SOURCE_COMMIT_OBJECT="SOURCE_COMMIT"
+CODEC_VERSION="6.1.4"
+CODEC_RELEASE="2"
+INDEX_OBJECT="dist/INDEX.tsv"
+SOURCE_COMMIT_OBJECT="dist/SOURCE_COMMIT"
 PRIVATE_FFMPEG="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
 
 # POSIX ulimit -f counts 512-byte blocks.
-MAX_METADATA_BLOCKS="64"
+MAX_METADATA_BLOCKS="256"
 MAX_PACKAGE_BLOCKS="131072"
 MAX_REPORT_BLOCKS="512"
 DOWNLOAD_TIMEOUT_SECONDS="30"
@@ -56,13 +46,14 @@ read_release_value() {
 	sed -n "s/^${release_key}='\([^']*\)'$/\1/p" /etc/openwrt_release
 }
 
-require_exact_value() {
+require_safe_component() {
 	value_label="$1"
-	actual_value="$2"
-	required_value="$3"
-
-	[ "$actual_value" = "$required_value" ] ||
-		die "Unsupported $value_label '$actual_value'; required '$required_value'."
+	value="$2"
+	case "$value" in
+		""|"."|".."|*".."*|*[!a-zA-Z0-9._+-]*)
+			die "OpenWrt returned an unsafe $value_label value."
+			;;
+	esac
 }
 
 run_with_download_deadline() {
@@ -178,7 +169,6 @@ read_commit_sha() {
 			return 1
 			;;
 	esac
-
 	printf '%s\n' "$sha_value"
 }
 
@@ -190,7 +180,6 @@ run_ffmpeg_report() (
 	if ! ulimit -f "$MAX_REPORT_BLOCKS"; then
 		exit 1
 	fi
-
 	timeout "$FFMPEG_PROBE_DEADLINE_SECONDS" \
 		"$PRIVATE_FFMPEG" -hide_banner "$report_option" \
 		>"$report_output" 2>"$report_error"
@@ -204,7 +193,6 @@ check_component() {
 	if grep -Eq "$component_pattern" "$component_report"; then
 		return 0
 	fi
-
 	printf 'Error: private FFmpeg does not report %s.\n' \
 		"$component_description" >&2
 	return 1
@@ -217,11 +205,10 @@ case "${1:-}" in
 		printf '%s\n' \
 			"Usage: sh install-codec-runtime.sh" \
 			"" \
-			"Downloads, verifies, and installs the private FFmpeg codec runtime." \
-			"Supported system only:" \
-			"  OpenWrt $REQUIRED_RELEASE $REQUIRED_REVISION" \
-			"  target $REQUIRED_TARGET, package architecture $REQUIRED_DISTRIB_ARCH" \
-			"  machine and apk architecture $REQUIRED_MACHINE_ARCH"
+			"Installs the architecture-specific private FFmpeg runtime." \
+			"Supported package sets are selected from the generated matrix for:" \
+			"  OpenWrt 25.12.5 r33051-f5dae5ece4 (apk)" \
+			"  OpenWrt 24.10.8 r29233-443ec4032a (opkg)"
 		exit 0
 		;;
 	*)
@@ -236,47 +223,47 @@ command -v id >/dev/null 2>&1 ||
 [ "$(id -u)" = "0" ] ||
 	die "Run this installer as root."
 
-for required_command in apk grep mktemp sed sha256sum timeout tr uname wc; do
+for required_command in grep mktemp sed sha256sum timeout tr wc; do
 	command -v "$required_command" >/dev/null 2>&1 ||
 		die "Required command is missing: $required_command"
 done
-if command -v opkg >/dev/null 2>&1; then
-	die "Both apk and opkg were found; package manager selection is ambiguous."
-fi
 if ! command -v uclient-fetch >/dev/null 2>&1 &&
 	! command -v wget >/dev/null 2>&1 &&
 	! command -v curl >/dev/null 2>&1; then
 	die "No HTTPS downloader found (uclient-fetch, wget, or curl is required)."
 fi
 
+HAS_APK="0"
+HAS_OPKG="0"
+command -v apk >/dev/null 2>&1 && HAS_APK="1"
+command -v opkg >/dev/null 2>&1 && HAS_OPKG="1"
+if [ "$HAS_APK" = "$HAS_OPKG" ]; then
+	if [ "$HAS_APK" = "1" ]; then
+		die "Both apk and opkg were found; package manager selection is ambiguous."
+	fi
+	die "Neither apk nor opkg is installed."
+fi
+if [ "$HAS_APK" = "1" ]; then
+	PACKAGE_FORMAT="apk"
+	PACKAGE_MANAGER="apk"
+	PACKAGE_FILE="$PACKAGE_NAME-$CODEC_VERSION-r$CODEC_RELEASE.apk"
+else
+	PACKAGE_FORMAT="ipk"
+	PACKAGE_MANAGER="opkg"
+fi
+
+DISTRIB_ID_VALUE="$(read_release_value DISTRIB_ID)"
 DISTRIB_RELEASE_VALUE="$(read_release_value DISTRIB_RELEASE)"
 DISTRIB_REVISION_VALUE="$(read_release_value DISTRIB_REVISION)"
-DISTRIB_TARGET_VALUE="$(read_release_value DISTRIB_TARGET)"
 DISTRIB_ARCH_VALUE="$(read_release_value DISTRIB_ARCH)"
-DISTRIB_ID_VALUE="$(read_release_value DISTRIB_ID)"
-
-require_exact_value "distribution" \
-	"$DISTRIB_ID_VALUE" "$REQUIRED_DISTRIB_ID"
-require_exact_value "OpenWrt release" \
-	"$DISTRIB_RELEASE_VALUE" "$REQUIRED_RELEASE"
-require_exact_value "OpenWrt revision" \
-	"$DISTRIB_REVISION_VALUE" "$REQUIRED_REVISION"
-require_exact_value "OpenWrt target" \
-	"$DISTRIB_TARGET_VALUE" "$REQUIRED_TARGET"
-require_exact_value "OpenWrt package architecture" \
-	"$DISTRIB_ARCH_VALUE" "$REQUIRED_DISTRIB_ARCH"
-
-if ! MACHINE_ARCH="$(uname -m 2>/dev/null)"; then
-	die "Could not determine the machine architecture."
+[ "$DISTRIB_ID_VALUE" = "OpenWrt" ] ||
+	die "Unsupported distribution '$DISTRIB_ID_VALUE'; required 'OpenWrt'."
+require_safe_component "release" "$DISTRIB_RELEASE_VALUE"
+require_safe_component "revision" "$DISTRIB_REVISION_VALUE"
+require_safe_component "package architecture" "$DISTRIB_ARCH_VALUE"
+if [ "$PACKAGE_FORMAT" = "ipk" ]; then
+	PACKAGE_FILE="${PACKAGE_NAME}_${CODEC_VERSION}-r${CODEC_RELEASE}_${DISTRIB_ARCH_VALUE}.ipk"
 fi
-require_exact_value "machine architecture" \
-	"$MACHINE_ARCH" "$REQUIRED_MACHINE_ARCH"
-
-if ! APK_ARCH="$(apk --print-arch 2>/dev/null)"; then
-	die "Could not determine the apk architecture."
-fi
-require_exact_value "apk architecture" \
-	"$APK_ARCH" "$REQUIRED_APK_ARCH"
 
 umask 077
 WORK_DIR="$(mktemp -d /tmp/videoplayer-codec-runtime.XXXXXX)" ||
@@ -297,7 +284,7 @@ SNAPSHOT_COMMIT="$(read_commit_sha "$SNAPSHOT_REF_PATH")" ||
 
 SNAPSHOT_RAW_URL="$RAW_BASE_URL/$SNAPSHOT_COMMIT"
 SOURCE_COMMIT_PATH="$WORK_DIR/SOURCE_COMMIT"
-CHECKSUM_PATH="$WORK_DIR/$PACKAGE_FILE.sha256"
+INDEX_PATH="$WORK_DIR/INDEX.tsv"
 PACKAGE_PATH="$WORK_DIR/$PACKAGE_FILE"
 
 if ! download_file \
@@ -310,19 +297,42 @@ SOURCE_COMMIT="$(read_commit_sha "$SOURCE_COMMIT_PATH")" ||
 	die "The codec snapshot contains an invalid source commit identifier."
 
 if ! download_file \
-	"$SNAPSHOT_RAW_URL/$CHECKSUM_OBJECT" \
-	"$CHECKSUM_PATH" \
+	"$SNAPSHOT_RAW_URL/$INDEX_OBJECT" \
+	"$INDEX_PATH" \
 	"$MAX_METADATA_BLOCKS"; then
-	die "Could not download the codec package checksum."
+	die "Could not download the architecture package index."
 fi
 
+MATCH_COUNT="0"
+CODEC_RELATIVE_PATH=""
 EXPECTED_SHA256=""
-CHECKSUM_NAME=""
-CHECKSUM_EXTRA=""
-if ! IFS=' ' read -r EXPECTED_SHA256 CHECKSUM_NAME CHECKSUM_EXTRA \
-	< "$CHECKSUM_PATH"; then
-	die "The codec package checksum file is empty."
-fi
+while IFS='|' read -r \
+	index_format index_release index_revision index_architecture \
+	_application_path _application_sha256 codec_path codec_sha256 extra
+do
+	case "$index_format" in
+		\#*|"")
+			continue
+			;;
+	esac
+	[ -z "$extra" ] ||
+		die "The architecture package index has unexpected fields."
+	if [ "$index_format" = "$PACKAGE_FORMAT" ] &&
+		[ "$index_release" = "$DISTRIB_RELEASE_VALUE" ] &&
+		[ "$index_revision" = "$DISTRIB_REVISION_VALUE" ] &&
+		[ "$index_architecture" = "$DISTRIB_ARCH_VALUE" ]; then
+		MATCH_COUNT=$((MATCH_COUNT + 1))
+		CODEC_RELATIVE_PATH="$codec_path"
+		EXPECTED_SHA256="$codec_sha256"
+	fi
+done < "$INDEX_PATH"
+
+[ "$MATCH_COUNT" -eq 1 ] ||
+	die \
+		"No unique codec package exists for OpenWrt $DISTRIB_RELEASE_VALUE $DISTRIB_REVISION_VALUE, architecture $DISTRIB_ARCH_VALUE, format $PACKAGE_FORMAT."
+EXPECTED_RELATIVE_PATH="$DISTRIB_ARCH_VALUE/openwrt-$DISTRIB_RELEASE_VALUE-$DISTRIB_REVISION_VALUE/$PACKAGE_FILE"
+[ "$CODEC_RELATIVE_PATH" = "$EXPECTED_RELATIVE_PATH" ] ||
+	die "The architecture package index returned an unexpected codec path."
 [ "${#EXPECTED_SHA256}" -eq 64 ] ||
 	die "The codec package checksum has an invalid length."
 case "$EXPECTED_SHA256" in
@@ -330,34 +340,14 @@ case "$EXPECTED_SHA256" in
 		die "The codec package checksum is not lowercase hexadecimal."
 		;;
 esac
-case "$CHECKSUM_NAME" in
-	\*)
-		CHECKSUM_NAME="${CHECKSUM_NAME#\*}"
-		;;
-esac
-case "$CHECKSUM_NAME" in
-	"$PACKAGE_FILE"|"./$PACKAGE_FILE"|"$ARTIFACT_PATH")
-		;;
-	*)
-		die "The codec package checksum names an unexpected file."
-		;;
-esac
-[ -z "$CHECKSUM_EXTRA" ] ||
-	die "The codec package checksum line has unexpected fields."
-CHECKSUM_TRAILING="$(
-	sed -n '2,$p' "$CHECKSUM_PATH" | tr -d '[:space:]'
-)"
-[ -z "$CHECKSUM_TRAILING" ] ||
-	die "The codec package checksum file has unexpected extra lines."
 
 printf 'Downloading codecs built from source commit %s...\n' "$SOURCE_COMMIT"
 if ! download_file \
-	"$SNAPSHOT_RAW_URL/$ARTIFACT_PATH" \
+	"$SNAPSHOT_RAW_URL/dist/$CODEC_RELATIVE_PATH" \
 	"$PACKAGE_PATH" \
 	"$MAX_PACKAGE_BLOCKS"; then
 	die "Could not download the codec package."
 fi
-
 ACTUAL_SHA256="$(sha256sum "$PACKAGE_PATH")"
 ACTUAL_SHA256="${ACTUAL_SHA256%% *}"
 [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] ||
@@ -368,33 +358,37 @@ printf '%s\n' \
 	"Verified source commit: $SOURCE_COMMIT" \
 	"Verified codec package SHA-256: $ACTUAL_SHA256"
 
-PACKAGE_PRESENT="0"
-if apk info -e "$PACKAGE_NAME" >/dev/null 2>&1; then
-	PACKAGE_PRESENT="1"
-else
-	APK_INFO_STATUS="$?"
-	case "$APK_INFO_STATUS" in
-		1)
-			;;
-		*)
-			die "Could not determine whether $PACKAGE_NAME is already installed."
-			;;
-	esac
-fi
+printf 'Installing %s with %s...\n' "$PACKAGE_FILE" "$PACKAGE_MANAGER"
+case "$PACKAGE_FORMAT" in
+	apk)
+		if apk info -e "$PACKAGE_NAME" >/dev/null 2>&1; then
+			if apk add --force-reinstall --help >/dev/null 2>&1; then
+				apk add --allow-untrusted --force-reinstall "$PACKAGE_PATH"
+			else
+				die "This apk version cannot safely reinstall $PACKAGE_NAME."
+			fi
+		else
+			APK_INFO_STATUS="$?"
+			[ "$APK_INFO_STATUS" -eq 1 ] ||
+				die "Could not determine whether $PACKAGE_NAME is installed."
+			apk add --allow-untrusted "$PACKAGE_PATH"
+		fi
+		apk info -e "$PACKAGE_NAME" >/dev/null 2>&1 ||
+			die "apk completed without registering $PACKAGE_NAME."
+		;;
+	ipk)
+		if opkg list-installed "$PACKAGE_NAME" 2>/dev/null |
+			grep -q "^$PACKAGE_NAME - "; then
+			opkg --force-reinstall --force-downgrade install "$PACKAGE_PATH"
+		else
+			opkg install "$PACKAGE_PATH"
+		fi
+		opkg list-installed "$PACKAGE_NAME" 2>/dev/null |
+			grep -q "^$PACKAGE_NAME - " ||
+			die "opkg completed without registering $PACKAGE_NAME."
+		;;
+esac
 
-printf 'Installing %s with apk...\n' "$PACKAGE_FILE"
-if [ "$PACKAGE_PRESENT" = "1" ]; then
-	if apk add --force-reinstall --help >/dev/null 2>&1; then
-		apk add --allow-untrusted --force-reinstall "$PACKAGE_PATH"
-	else
-		die "This apk version cannot safely reinstall $PACKAGE_NAME; no files were removed."
-	fi
-else
-	apk add --allow-untrusted "$PACKAGE_PATH"
-fi
-
-apk info -e "$PACKAGE_NAME" >/dev/null 2>&1 ||
-	die "apk completed without registering $PACKAGE_NAME."
 [ -x "$PRIVATE_FFMPEG" ] ||
 	die "The installed private FFmpeg is missing or not executable: $PRIVATE_FFMPEG"
 
@@ -404,40 +398,35 @@ MUXERS_REPORT="$WORK_DIR/ffmpeg-muxers"
 FILTERS_REPORT="$WORK_DIR/ffmpeg-filters"
 FFMPEG_ERROR="$WORK_DIR/ffmpeg-error"
 
-if ! run_ffmpeg_report -decoders "$DECODERS_REPORT" "$FFMPEG_ERROR"; then
-	[ ! -s "$FFMPEG_ERROR" ] ||
-		sed -n '1,8p' "$FFMPEG_ERROR" >&2
-	die "The installed private FFmpeg could not report its decoders."
-fi
-if ! run_ffmpeg_report -encoders "$ENCODERS_REPORT" "$FFMPEG_ERROR"; then
-	[ ! -s "$FFMPEG_ERROR" ] ||
-		sed -n '1,8p' "$FFMPEG_ERROR" >&2
-	die "The installed private FFmpeg could not report its encoders."
-fi
-if ! run_ffmpeg_report -muxers "$MUXERS_REPORT" "$FFMPEG_ERROR"; then
-	[ ! -s "$FFMPEG_ERROR" ] ||
-		sed -n '1,8p' "$FFMPEG_ERROR" >&2
-	die "The installed private FFmpeg could not report its muxers."
-fi
-if ! run_ffmpeg_report -filters "$FILTERS_REPORT" "$FFMPEG_ERROR"; then
-	[ ! -s "$FFMPEG_ERROR" ] ||
-		sed -n '1,8p' "$FFMPEG_ERROR" >&2
-	die "The installed private FFmpeg could not report its filters."
-fi
+for report in decoders encoders muxers filters; do
+	case "$report" in
+		decoders)
+			report_path="$DECODERS_REPORT"
+			;;
+		encoders)
+			report_path="$ENCODERS_REPORT"
+			;;
+		muxers)
+			report_path="$MUXERS_REPORT"
+			;;
+		filters)
+			report_path="$FILTERS_REPORT"
+			;;
+	esac
+	if ! run_ffmpeg_report "-$report" "$report_path" "$FFMPEG_ERROR"; then
+		[ ! -s "$FFMPEG_ERROR" ] ||
+			sed -n '1,8p' "$FFMPEG_ERROR" >&2
+		die "The installed private FFmpeg could not report its $report."
+	fi
+done
 
 COMPONENTS_OK="1"
-check_component "$DECODERS_REPORT" \
-	'^[[:space:]]*V[^[:space:]]*[[:space:]]+h264([[:space:]]|$)' \
-	"the native h264 video decoder" ||
-	COMPONENTS_OK="0"
-check_component "$DECODERS_REPORT" \
-	'^[[:space:]]*V[^[:space:]]*[[:space:]]+hevc([[:space:]]|$)' \
-	"the native hevc video decoder" ||
-	COMPONENTS_OK="0"
-check_component "$DECODERS_REPORT" \
-	'^[[:space:]]*V[^[:space:]]*[[:space:]]+vc1([[:space:]]|$)' \
-	"the native vc1 video decoder" ||
-	COMPONENTS_OK="0"
+for VIDEO_DECODER in h264 hevc vc1; do
+	check_component "$DECODERS_REPORT" \
+		"^[[:space:]]*V[^[:space:]]*[[:space:]]+$VIDEO_DECODER([[:space:]]|$)" \
+		"the native $VIDEO_DECODER video decoder" ||
+		COMPONENTS_OK="0"
+done
 for AUDIO_DECODER in \
 	aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis
 do
@@ -454,38 +443,18 @@ check_component "$ENCODERS_REPORT" \
 	'^[[:space:]]*A[^[:space:]]*[[:space:]]+pcm_s16le([[:space:]]|$)' \
 	"the PCM S16LE audio encoder" ||
 	COMPONENTS_OK="0"
-check_component "$MUXERS_REPORT" \
-	'^[[:space:]]*E[[:space:]]+image2([[:space:]]|$)' \
-	"the image2 muxer" ||
-	COMPONENTS_OK="0"
-check_component "$MUXERS_REPORT" \
-	'^[[:space:]]*E[[:space:]]+s16le([[:space:]]|$)' \
-	"the raw S16LE muxer" ||
-	COMPONENTS_OK="0"
-check_component "$FILTERS_REPORT" \
-	'^[[:space:]]*[^[:space:]]+[[:space:]]+fps[[:space:]]' \
-	"the fps video filter" ||
-	COMPONENTS_OK="0"
-check_component "$FILTERS_REPORT" \
-	'^[[:space:]]*[^[:space:]]+[[:space:]]+scale[[:space:]]' \
-	"the scale video filter" ||
-	COMPONENTS_OK="0"
-check_component "$FILTERS_REPORT" \
-	'^[[:space:]]*[^[:space:]]+[[:space:]]+format[[:space:]]' \
-	"the format video filter" ||
-	COMPONENTS_OK="0"
-check_component "$FILTERS_REPORT" \
-	'^[[:space:]]*[^[:space:]]+[[:space:]]+aresample[[:space:]]' \
-	"the audio resampling filter" ||
-	COMPONENTS_OK="0"
-check_component "$FILTERS_REPORT" \
-	'^[[:space:]]*[^[:space:]]+[[:space:]]+aformat[[:space:]]' \
-	"the audio format filter" ||
-	COMPONENTS_OK="0"
-check_component "$FILTERS_REPORT" \
-	'^[[:space:]]*[^[:space:]]+[[:space:]]+asetnsamples[[:space:]]' \
-	"the fixed audio sample-count filter" ||
-	COMPONENTS_OK="0"
+for MUXER in image2 s16le; do
+	check_component "$MUXERS_REPORT" \
+		"^[[:space:]]*E[[:space:]]+$MUXER([[:space:]]|$)" \
+		"the $MUXER muxer" ||
+		COMPONENTS_OK="0"
+done
+for FILTER in fps scale format aresample aformat asetnsamples; do
+	check_component "$FILTERS_REPORT" \
+		"^[[:space:]]*[^[:space:]]+[[:space:]]+${FILTER}[[:space:]]" \
+		"the $FILTER filter" ||
+		COMPONENTS_OK="0"
+done
 [ "$COMPONENTS_OK" = "1" ] ||
 	die "The installed private FFmpeg is incomplete."
 

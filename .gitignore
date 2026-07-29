@@ -7,11 +7,12 @@ tmp/
 build/
 bin/
 .staging/
+.codec-publish/
+.snapshot-publish/
 tmp_sample*
 __pycache__/
 .ruff_cache/
-# Local package artifacts stay out of main; CI publishes the current APK to
-# the generated snapshot branch after successful checks.
-dist/*.apk
-dist/*.ipk
-dist/codec-runtime/
+# Local package artifacts stay out of main; CI publishes validated packages
+# separately after successful checks.
+dist/
+codec-runtime/package/files/build-info

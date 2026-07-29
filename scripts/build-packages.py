@@ -27,7 +27,7 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG_DIR = ROOT / "luci-app-videoplayer"
-DEFAULT_DIST = ROOT / "dist"
+DEFAULT_DIST = ROOT / ".staging" / "app"
 
 PKG_NAME = "luci-app-videoplayer"
 PKG_VERSION = "1.1.0"
@@ -43,7 +43,6 @@ DEPENDS = [
     "jshn",
     "coreutils-stat",
     "coreutils-timeout",
-    "ffmpeg",
 ]
 CONFFILES = ["/etc/config/videoplayer"]
 REQUIRED_PACKAGE_FILES = {
@@ -1035,7 +1034,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=DEFAULT_DIST,
-        help="artifact directory (default: repository dist/)",
+        help="artifact directory (default: repository .staging/app/)",
     )
     parser.add_argument(
         "--verify-only",

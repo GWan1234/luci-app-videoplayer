@@ -8,26 +8,81 @@ die() {
 	exit 1
 }
 
-[ "$#" -eq 3 ] ||
-	die "usage: validate-runtime.sh BINARY SYSROOT WORK_DIRECTORY"
+[ "$#" -eq 7 ] ||
+	die "usage: validate-runtime.sh BINARY SYSROOT WORK_DIRECTORY QEMU_EXECUTABLE VALIDATION_MODE CONFIG_H CONFIG_COMPONENTS_H"
 
 binary="$1"
 sysroot="$2"
 work="$3"
-qemu="${QEMU_AARCH64:-qemu-aarch64-static}"
+qemu="$4"
+validation_mode="$5"
+main_config="$6"
+component_config="$7"
+validation_timeout="${VALIDATION_TIMEOUT:-180}"
 
 if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
 	die "private FFmpeg binary is missing or not executable"
 fi
-[ -d "$sysroot" ] ||
-	die "target sysroot is missing"
-command -v "$qemu" >/dev/null 2>&1 ||
-	die "qemu-aarch64-static is unavailable"
+[ -f "$main_config" ] ||
+	die "FFmpeg config.h is missing"
+[ -f "$component_config" ] ||
+	die "FFmpeg config_components.h is missing"
 command -v readelf >/dev/null 2>&1 ||
 	die "readelf is unavailable"
-command -v ffmpeg >/dev/null 2>&1 ||
-	die "host FFmpeg is unavailable"
 mkdir -p "$work"
+case "$validation_timeout" in
+	""|*[!0-9]*)
+		die "VALIDATION_TIMEOUT must be a positive integer"
+		;;
+	0)
+		die "VALIDATION_TIMEOUT must be greater than zero"
+		;;
+esac
+
+require_config_value() {
+	config_file="$1"
+	config_symbol="$2"
+	config_value="$3"
+	grep -Eq \
+		"^#define[[:space:]]+${config_symbol}[[:space:]]+${config_value}$" \
+		"$config_file" ||
+		die "$config_symbol is not set to $config_value"
+}
+
+for enabled_option in \
+	CONFIG_STATIC \
+	CONFIG_SWRESAMPLE
+do
+	require_config_value "$main_config" "$enabled_option" 1
+done
+for disabled_option in \
+	CONFIG_SHARED \
+	CONFIG_AUTODETECT \
+	CONFIG_NETWORK \
+	CONFIG_AVDEVICE
+do
+	require_config_value "$main_config" "$disabled_option" 0
+done
+
+for component in \
+	H264_DECODER HEVC_DECODER VC1_DECODER MPEG4_DECODER VP8_DECODER \
+	VP9_DECODER AV1_DECODER MJPEG_DECODER AAC_DECODER AC3_DECODER \
+	EAC3_DECODER ALAC_DECODER DCA_DECODER FLAC_DECODER MP3_DECODER \
+	OPUS_DECODER PCM_S16LE_DECODER TRUEHD_DECODER VORBIS_DECODER \
+	MJPEG_ENCODER PCM_S16LE_ENCODER MOV_DEMUXER MATROSKA_DEMUXER \
+	AVI_DEMUXER MPEGTS_DEMUXER IMAGE2_MUXER PCM_S16LE_MUXER \
+	FPS_FILTER SCALE_FILTER FORMAT_FILTER ARESAMPLE_FILTER \
+	AFORMAT_FILTER ASETNSAMPLES_FILTER
+do
+	require_config_value "$component_config" "CONFIG_$component" 1
+done
+for wrapper in \
+	H263_V4L2M2M_DECODER H264_V4L2M2M_DECODER HEVC_V4L2M2M_DECODER \
+	MPEG1_V4L2M2M_DECODER MPEG2_V4L2M2M_DECODER MPEG4_V4L2M2M_DECODER \
+	VC1_V4L2M2M_DECODER VP8_V4L2M2M_DECODER VP9_V4L2M2M_DECODER
+do
+	require_config_value "$component_config" "CONFIG_$wrapper" 0
+done
 
 dynamic="$work/readelf-dynamic.txt"
 readelf -d "$binary" > "$dynamic"
@@ -50,8 +105,31 @@ while IFS= read -r library; do
 	esac
 done
 
+case "$validation_mode" in
+	static)
+		printf '%s\n' \
+			"Private codec runtime static validation passed (QEMU execution unavailable for this ISA)."
+		exit 0
+		;;
+	qemu)
+		;;
+	*)
+		die "unknown validation mode: $validation_mode"
+		;;
+esac
+
+[ -d "$sysroot" ] ||
+	die "target sysroot is missing"
+command -v "$qemu" >/dev/null 2>&1 ||
+	die "$qemu is unavailable"
+command -v timeout >/dev/null 2>&1 ||
+	die "timeout is unavailable"
+command -v ffmpeg >/dev/null 2>&1 ||
+	die "host FFmpeg is unavailable"
+
 run_target() {
-	"$qemu" -L "$sysroot" "$binary" "$@"
+	timeout "$validation_timeout" \
+		"$qemu" -L "$sysroot" "$binary" "$@"
 }
 
 version="$work/version.txt"

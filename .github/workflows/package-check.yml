@@ -35,13 +35,18 @@ jobs:
           from pathlib import Path
 
           for path in (
+              Path("scripts/build-dist.py"),
               Path("scripts/build-packages.py"),
+              Path("scripts/codec_matrix.py"),
+              Path("scripts/verify_codec_package.py"),
+              Path("scripts/verify-dist.py"),
               Path("scripts/verify_packages.py"),
           ):
               compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
           for path in Path("luci-app-videoplayer").rglob("*.json"):
               json.loads(path.read_text(encoding="utf-8"))
+          json.loads(Path("codec-runtime/matrix.json").read_text(encoding="utf-8"))
           PY
           sh -n scripts/install-from-github.sh
           shellcheck -s sh scripts/install-from-github.sh
@@ -74,29 +79,27 @@ jobs:
             luci-app-videoplayer/root/usr/libexec/videoplayer-renderer
           shellcheck -s sh \
             luci-app-videoplayer/root/www/cgi-bin/videoplayer-frame
-          grep -Fx \
-            'PACKAGE_NAME="luci-videoplayer-codec-runtime"' \
-            scripts/install-codec-runtime.sh
-          grep -Fx \
-            'PACKAGE_FILE="luci-videoplayer-codec-runtime-6.1.4-r2.apk"' \
-            scripts/install-codec-runtime.sh
-          grep -Fx \
-            'ARTIFACT_DIRECTORY="targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53"' \
-            scripts/install-codec-runtime.sh
+          python scripts/codec_matrix.py --summary
+          [ "$(python scripts/codec_matrix.py --list-architectures | wc -l)" -eq 37 ]
+          [ "$(
+            python scripts/codec_matrix.py --github-matrix |
+              python -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))'
+          )" -eq 71 ]
           grep -Fx \
             'define Package/luci-videoplayer-codec-runtime' \
             codec-runtime/package/Makefile
+          grep -Fx 'format=3' codec-runtime/package/files/build-info.template
+          grep -Fx 'openwrt_release=@OPENWRT_RELEASE@' \
+            codec-runtime/package/files/build-info.template
+          grep -Fx 'package_format=@PACKAGE_FORMAT@' \
+            codec-runtime/package/files/build-info.template
+          grep -Fx 'validation_mode=@VALIDATION_MODE@' \
+            codec-runtime/package/files/build-info.template
           grep -E \
             '^LUCI_DEPENDS:=.*\+coreutils-timeout([[:space:]]|$)' \
             luci-app-videoplayer/Makefile
-          grep -Fx \
-            '          SNAPSHOT_BRANCH: codec-snapshot' \
-            .github/workflows/codec-runtime.yml
-          grep -Fx \
-            '  CODEC_APK: luci-videoplayer-codec-runtime-6.1.4-r2.apk' \
-            .github/workflows/codec-runtime.yml
-          grep -Fx \
-            '  CODEC_ARTIFACT_DIR: targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53' \
+          grep -F 'max-parallel: 8' .github/workflows/codec-runtime.yml
+          grep -F 'SNAPSHOT_BRANCH: codec-snapshot' \
             .github/workflows/codec-runtime.yml
           {
             printf '%s\n' '(function () {'
@@ -120,13 +123,41 @@ jobs:
       - name: Build, verify, and compare reproducible outputs
         env:
           SOURCE_DATE_EPOCH: "1767225600"
-        run: python scripts/build-packages.py --check-reproducible
+        run: >-
+          python scripts/build-packages.py
+          --output-dir "$RUNNER_TEMP/dist-lowlevel"
+          --check-reproducible
 
       - name: Verify existing outputs through the standalone CLI
-        run: python scripts/build-packages.py --verify-only
+        run: >-
+          python scripts/build-packages.py
+          --output-dir "$RUNNER_TEMP/dist-lowlevel"
+          --verify-only
 
-  publish-main-apk:
-    name: Publish current main APK
+      - name: Assemble and verify architecture-scoped app layout
+        env:
+          SOURCE_DATE_EPOCH: "1767225600"
+        run: |
+          python scripts/build-dist.py \
+            --output-dir dist \
+            --source-commit "$GITHUB_SHA"
+          python scripts/verify-dist.py --dist dist
+
+      - name: Reject linked distribution output
+        run: |
+          set -euo pipefail
+          mkdir -p .staging/output-link-target
+          ln -s output-link-target .staging/output-link
+          if python scripts/build-dist.py \
+            --output-dir .staging/output-link \
+            --source-commit "$GITHUB_SHA"
+          then
+            echo "build-dist accepted a symbolic-link output." >&2
+            exit 1
+          fi
+
+  publish-main-packages:
+    name: Publish current main package layout
     needs: package-check
     if: >-
       github.event_name == 'push' &&
@@ -146,16 +177,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Rebuild and verify the APK
+      - name: Rebuild and verify the architecture package layout
         env:
           SOURCE_DATE_EPOCH: "1767225600"
-        run: python scripts/build-packages.py --check-reproducible
+        run: |
+          python scripts/build-dist.py \
+            --output-dir .snapshot-publish/dist \
+            --source-commit "$GITHUB_SHA"
+          python scripts/verify-dist.py --dist .snapshot-publish/dist
+          printf '%s\n' \
+            '# Current main architecture packages' \
+            '' \
+            'This branch is generated after all package checks pass.' \
+            "Packages were built from main commit \`$GITHUB_SHA\`." \
+            'Folder names are exact OpenWrt `DISTRIB_ARCH` values.' \
+            'Codec placeholders are filled by the separate codec-snapshot build.' \
+            'Do not edit this branch manually.' \
+            > .snapshot-publish/README.md
 
-      - name: Publish the APK to the snapshot branch
+      - name: Publish the layout to the snapshot branch
         shell: bash
         env:
           SNAPSHOT_BRANCH: snapshot
-          SNAPSHOT_APK: luci-app-videoplayer-main.apk
+          PUBLISH_DIR: ${{ github.workspace }}/.snapshot-publish
         run: |
           set -euo pipefail
 
@@ -172,34 +216,16 @@ jobs:
             exit 0
           fi
 
-          shopt -s nullglob
-          built_apks=(dist/luci-app-videoplayer-*.apk)
-          if (( ${#built_apks[@]} != 1 )); then
-            echo "Expected exactly one built APK, found ${#built_apks[@]}." >&2
-            exit 1
-          fi
-
-          publish_dir="$(mktemp -d)"
           index_file="$RUNNER_TEMP/videoplayer-snapshot-index-$GITHUB_RUN_ID"
           cleanup() {
-            rm -rf -- "$publish_dir"
             rm -f -- "$index_file"
           }
           trap cleanup EXIT
 
-          cp -- "${built_apks[0]}" "$publish_dir/$SNAPSHOT_APK"
-          (
-            cd "$publish_dir"
-            sha256sum "$SNAPSHOT_APK" > "$SNAPSHOT_APK.sha256"
-            printf '%s\n' "$GITHUB_SHA" > SOURCE_COMMIT
-            printf '%s\n' \
-              '# Current main APK' \
-              '' \
-              'This branch is generated by GitHub Actions after all package checks pass.' \
-              "The APK was built from main commit \`$GITHUB_SHA\`." \
-              'Do not edit this branch manually.' \
-              > README.md
-          )
+          [ -s "$PUBLISH_DIR/dist/INDEX.json" ]
+          [ -s "$PUBLISH_DIR/dist/INDEX.tsv" ]
+          [ -s "$PUBLISH_DIR/dist/SOURCE_COMMIT" ]
+          [ -z "$(find "$PUBLISH_DIR" -type l -print -quit)" ]
 
           previous_snapshot="$(
             git ls-remote origin "refs/heads/$SNAPSHOT_BRANCH" |
@@ -222,7 +248,7 @@ jobs:
 
           rm -f -- "$index_file"
           GIT_INDEX_FILE="$index_file" \
-            git --work-tree="$publish_dir" add --all
+            git --work-tree="$PUBLISH_DIR" add --force --all
           snapshot_tree="$(
             GIT_INDEX_FILE="$index_file" git write-tree
           )"
@@ -230,7 +256,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           snapshot_commit="$(
-            printf 'Publish APK built from %s\n' "$GITHUB_SHA" |
+            printf 'Publish architecture packages built from %s\n' "$GITHUB_SHA" |
               git commit-tree "$snapshot_tree" "${parent_args[@]}"
           )"
 

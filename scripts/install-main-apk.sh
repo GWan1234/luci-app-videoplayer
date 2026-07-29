@@ -8,13 +8,17 @@ set -eu
 REPOSITORY="communism420/luci-app-videoplayer"
 MAIN_BRANCH="main"
 SNAPSHOT_BRANCH="snapshot"
-SNAPSHOT_APK="luci-app-videoplayer-main.apk"
+APP_VERSION="1.1.0"
+SNAPSHOT_APK="luci-app-videoplayer-$APP_VERSION.apk"
+SNAPSHOT_INDEX="INDEX.tsv"
 API_BASE_URL="https://api.github.com/repos/$REPOSITORY"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
 # POSIX ulimit -f counts 512-byte blocks.
-MAX_METADATA_BLOCKS="32"
+MAX_METADATA_BLOCKS="128"
 MAX_PACKAGE_BLOCKS="8192"
+DOWNLOAD_TIMEOUT_SECONDS="30"
+DOWNLOAD_DEADLINE_SECONDS="180"
 WORK_DIR=""
 
 die() {
@@ -35,6 +39,29 @@ cleanup() {
 	esac
 }
 
+run_with_download_deadline() {
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "$DOWNLOAD_DEADLINE_SECONDS" "$@"
+	else
+		"$@"
+	fi
+}
+
+check_download_size() {
+	download_path="$1"
+	max_blocks="$2"
+	max_bytes=$((max_blocks * 512))
+	download_size="$(wc -c < "$download_path" | tr -d '[:space:]')"
+
+	case "$download_size" in
+		''|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$download_size" -gt 0 ] &&
+		[ "$download_size" -le "$max_bytes" ]
+}
+
 download_file() (
 	url="$1"
 	destination="$2"
@@ -45,14 +72,31 @@ download_file() (
 	fi
 
 	if command -v uclient-fetch >/dev/null 2>&1; then
-		uclient-fetch -T 20 -O "$destination" "$url"
+		if ! run_with_download_deadline \
+			uclient-fetch -T "$DOWNLOAD_TIMEOUT_SECONDS" \
+			-O "$destination" "$url"; then
+			exit 1
+		fi
 	elif command -v wget >/dev/null 2>&1; then
-		wget -T 20 -O "$destination" "$url"
+		if ! run_with_download_deadline \
+			wget -T "$DOWNLOAD_TIMEOUT_SECONDS" \
+			-O "$destination" "$url"; then
+			exit 1
+		fi
 	elif command -v curl >/dev/null 2>&1; then
-		curl -fL --retry 3 --connect-timeout 20 -o "$destination" "$url"
+		if ! run_with_download_deadline \
+			curl -fL --retry 2 --retry-delay 1 \
+			--connect-timeout "$DOWNLOAD_TIMEOUT_SECONDS" \
+			--max-time "$DOWNLOAD_DEADLINE_SECONDS" \
+			--proto '=https' --proto-redir '=https' \
+			-o "$destination" "$url"; then
+			exit 1
+		fi
 	else
 		die "No HTTPS downloader found (uclient-fetch, wget, or curl is required)."
 	fi
+
+	check_download_size "$destination" "$max_blocks"
 )
 
 download_commit_sha() (
@@ -64,20 +108,36 @@ download_commit_sha() (
 	fi
 
 	if command -v uclient-fetch >/dev/null 2>&1; then
-		uclient-fetch \
+		if ! run_with_download_deadline \
+			uclient-fetch \
 			--header="Accept: application/vnd.github.sha" \
-			-T 20 -O "$destination" "$url"
+			-T "$DOWNLOAD_TIMEOUT_SECONDS" \
+			-O "$destination" "$url"; then
+			exit 1
+		fi
 	elif command -v wget >/dev/null 2>&1; then
-		wget \
+		if ! run_with_download_deadline \
+			wget \
 			--header="Accept: application/vnd.github.sha" \
-			-T 20 -O "$destination" "$url"
+			-T "$DOWNLOAD_TIMEOUT_SECONDS" \
+			-O "$destination" "$url"; then
+			exit 1
+		fi
 	elif command -v curl >/dev/null 2>&1; then
-		curl -fL --retry 3 --connect-timeout 20 \
+		if ! run_with_download_deadline \
+			curl -fL --retry 2 --retry-delay 1 \
+			--connect-timeout "$DOWNLOAD_TIMEOUT_SECONDS" \
+			--max-time "$DOWNLOAD_DEADLINE_SECONDS" \
+			--proto '=https' --proto-redir '=https' \
 			-H "Accept: application/vnd.github.sha" \
-			-o "$destination" "$url"
+			-o "$destination" "$url"; then
+			exit 1
+		fi
 	else
 		die "No HTTPS downloader found (uclient-fetch, wget, or curl is required)."
 	fi
+
+	check_download_size "$destination" "$MAX_METADATA_BLOCKS"
 )
 
 read_commit_sha() {
@@ -125,6 +185,23 @@ command -v mktemp >/dev/null 2>&1 ||
 	die "The mktemp command is required."
 command -v tr >/dev/null 2>&1 ||
 	die "The tr command is required."
+command -v wc >/dev/null 2>&1 ||
+	die "The wc command is required."
+
+# shellcheck disable=SC1091
+. /etc/openwrt_release
+OPENWRT_RELEASE="${DISTRIB_RELEASE:-}"
+OPENWRT_REVISION="${DISTRIB_REVISION:-}"
+OPENWRT_ARCH="${DISTRIB_ARCH:-}"
+[ "${DISTRIB_ID:-}" = "OpenWrt" ] ||
+	die "This installer supports OpenWrt only."
+for field in "$OPENWRT_RELEASE" "$OPENWRT_REVISION" "$OPENWRT_ARCH"; do
+	case "$field" in
+		""|*[!a-zA-Z0-9._+-]*)
+			die "OpenWrt returned unsafe release or architecture metadata."
+			;;
+	esac
+done
 
 umask 077
 WORK_DIR="$(mktemp -d /tmp/luci-app-videoplayer-main.XXXXXX)" ||
@@ -145,11 +222,11 @@ SNAPSHOT_COMMIT="$(read_commit_sha "$SNAPSHOT_REF_PATH")" ||
 
 SNAPSHOT_RAW_URL="$RAW_BASE_URL/$SNAPSHOT_COMMIT"
 SOURCE_COMMIT_PATH="$WORK_DIR/SOURCE_COMMIT"
-CHECKSUM_PATH="$WORK_DIR/$SNAPSHOT_APK.sha256"
+INDEX_PATH="$WORK_DIR/$SNAPSHOT_INDEX"
 APK_PATH="$WORK_DIR/$SNAPSHOT_APK"
 
 if ! download_file \
-	"$SNAPSHOT_RAW_URL/SOURCE_COMMIT" \
+	"$SNAPSHOT_RAW_URL/dist/SOURCE_COMMIT" \
 	"$SOURCE_COMMIT_PATH" \
 	"$MAX_METADATA_BLOCKS"; then
 	die "Could not download the snapshot source identifier."
@@ -158,15 +235,54 @@ SOURCE_COMMIT="$(read_commit_sha "$SOURCE_COMMIT_PATH")" ||
 	die "The snapshot contains an invalid source commit identifier."
 
 if ! download_file \
-	"$SNAPSHOT_RAW_URL/$SNAPSHOT_APK.sha256" \
-	"$CHECKSUM_PATH" \
+	"$SNAPSHOT_RAW_URL/dist/$SNAPSHOT_INDEX" \
+	"$INDEX_PATH" \
 	"$MAX_METADATA_BLOCKS"; then
-	die "Could not download the APK checksum."
+	die "Could not download the architecture package index."
 fi
+
+EXPECTED_SHA256=""
+APP_RELATIVE_PATH=""
+MATCH_COUNT="0"
+while IFS='|' read -r \
+	package_format release revision architecture \
+	application_path application_sha256 \
+	_codec_path _codec_sha256 extra
+do
+	case "$package_format" in
+		\#*|"")
+			continue
+			;;
+	esac
+	[ -z "$extra" ] ||
+		die "The architecture package index has unexpected fields."
+	if [ "$package_format" = "apk" ] &&
+		[ "$release" = "$OPENWRT_RELEASE" ] &&
+		[ "$revision" = "$OPENWRT_REVISION" ] &&
+		[ "$architecture" = "$OPENWRT_ARCH" ]; then
+		MATCH_COUNT=$((MATCH_COUNT + 1))
+		APP_RELATIVE_PATH="$application_path"
+		EXPECTED_SHA256="$application_sha256"
+	fi
+done < "$INDEX_PATH"
+
+[ "$MATCH_COUNT" -eq 1 ] ||
+	die \
+		"No unique current-main APK exists for OpenWrt $OPENWRT_RELEASE $OPENWRT_REVISION, architecture $OPENWRT_ARCH."
+EXPECTED_RELATIVE_PATH="$OPENWRT_ARCH/openwrt-$OPENWRT_RELEASE-$OPENWRT_REVISION/$SNAPSHOT_APK"
+[ "$APP_RELATIVE_PATH" = "$EXPECTED_RELATIVE_PATH" ] ||
+	die "The architecture package index returned an unexpected APK path."
+[ "${#EXPECTED_SHA256}" -eq 64 ] ||
+	die "The APK checksum has an invalid length."
+case "$EXPECTED_SHA256" in
+	*[!0-9a-f]*)
+		die "The APK checksum is not lowercase hexadecimal."
+		;;
+esac
 
 printf 'Downloading the APK built from main commit %s...\n' "$SOURCE_COMMIT"
 if ! download_file \
-	"$SNAPSHOT_RAW_URL/$SNAPSHOT_APK" \
+	"$SNAPSHOT_RAW_URL/dist/$APP_RELATIVE_PATH" \
 	"$APK_PATH" \
 	"$MAX_PACKAGE_BLOCKS"; then
 	die "Could not download the current main APK."
@@ -183,24 +299,6 @@ MAIN_COMMIT="$(read_commit_sha "$MAIN_REF_PATH")" ||
 	die "GitHub returned an invalid main commit identifier."
 [ "$SOURCE_COMMIT" = "$MAIN_COMMIT" ] ||
 	die "The verified APK has not caught up with current main yet. Wait for the package checks and retry."
-
-EXPECTED_SHA256=""
-CHECKSUM_NAME=""
-CHECKSUM_EXTRA=""
-if ! IFS=' ' read -r EXPECTED_SHA256 CHECKSUM_NAME CHECKSUM_EXTRA < "$CHECKSUM_PATH"; then
-	die "The APK checksum file is empty."
-fi
-[ "${#EXPECTED_SHA256}" -eq 64 ] ||
-	die "The APK checksum has an invalid length."
-case "$EXPECTED_SHA256" in
-	*[!0-9a-f]*)
-		die "The APK checksum is not lowercase hexadecimal."
-		;;
-esac
-[ "$CHECKSUM_NAME" = "$SNAPSHOT_APK" ] ||
-	die "The APK checksum names an unexpected file."
-[ -z "$CHECKSUM_EXTRA" ] ||
-	die "The APK checksum line has unexpected fields."
 
 ACTUAL_SHA256="$(sha256sum "$APK_PATH")"
 ACTUAL_SHA256="${ACTUAL_SHA256%% *}"

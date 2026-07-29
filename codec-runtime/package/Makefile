@@ -1,10 +1,36 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Private FFmpeg runtime for luci-app-videoplayer.
-# This recipe is intentionally pinned to the FFmpeg source used by the
-# OpenWrt 25.12.5 packages feed.
+# The workflow generates files/build-info for one exact release/package ABI
+# before invoking this recipe.
 
 include $(TOPDIR)/rules.mk
+
+CODEC_BUILD_INFO:=$(CURDIR)/files/build-info
+CODEC_OPENWRT_RELEASE:=$(strip $(shell sed -n 's/^openwrt_release=//p' $(CODEC_BUILD_INFO)))
+CODEC_OPENWRT_REVISION:=$(strip $(shell sed -n 's/^openwrt_revision=//p' $(CODEC_BUILD_INFO)))
+CODEC_COMPATIBLE_ARCH:=$(strip $(shell sed -n 's/^compatible_arch=//p' $(CODEC_BUILD_INFO)))
+CODEC_BUILD_TARGET:=$(strip $(shell sed -n 's/^build_target=//p' $(CODEC_BUILD_INFO)))
+CODEC_BUILD_SUBTARGET:=$(strip $(shell sed -n 's/^build_subtarget=//p' $(CODEC_BUILD_INFO)))
+
+ifeq ($(CODEC_OPENWRT_RELEASE),)
+  $(error codec runtime build-info is missing openwrt_release)
+endif
+ifeq ($(CODEC_OPENWRT_REVISION),)
+  $(error codec runtime build-info is missing openwrt_revision)
+endif
+ifeq ($(CODEC_COMPATIBLE_ARCH),)
+  $(error codec runtime build-info is missing compatible_arch)
+endif
+ifeq ($(CODEC_BUILD_TARGET),)
+  $(error codec runtime build-info is missing build_target)
+endif
+ifeq ($(CODEC_BUILD_SUBTARGET),)
+  $(error codec runtime build-info is missing build_subtarget)
+endif
+ifneq ($(findstring @,$(CODEC_OPENWRT_RELEASE)$(CODEC_OPENWRT_REVISION)$(CODEC_COMPATIBLE_ARCH)$(CODEC_BUILD_TARGET)$(CODEC_BUILD_SUBTARGET)),)
+  $(error codec runtime build-info template was not expanded)
+endif
 
 PKG_NAME:=ffmpeg
 PKG_VERSION:=6.1.4
@@ -28,20 +54,55 @@ include $(INCLUDE_DIR)/package.mk
 REAL_CPU_TYPE:=$(call qstrip,$(firstword $(subst +, ,$(CONFIG_CPU_TYPE))))
 REAL_CPU_TYPE:=$(subst octeonplus,octeon+,$(REAL_CPU_TYPE))
 
+# Keep the architecture safeguards from OpenWrt's pinned FFmpeg recipe. These
+# flags are especially important on soft-float ARM and embedded PowerPC CPUs:
+# allowing configure to auto-enable a newer ISA can produce an installable
+# package which then dies with SIGILL on the router.
+CODEC_ARCH_CONFIG:=
+ifeq ($(CONFIG_SOFT_FLOAT),y)
+  CODEC_ARCH_CONFIG+= \
+	--disable-altivec \
+	--disable-vsx \
+	--disable-power8 \
+	--disable-armv5te \
+	--disable-armv6 \
+	--disable-armv6t2 \
+	--disable-fast-unaligned
+else ifneq ($(findstring powerpc,$(CONFIG_ARCH)),)
+  CODEC_ARCH_CONFIG+=--disable-altivec
+endif
+
+ifneq ($(findstring arm,$(CONFIG_ARCH)),)
+  ifneq ($(findstring vfp,$(CONFIG_CPU_TYPE)),)
+    CODEC_ARCH_CONFIG+=--enable-vfp
+  else
+    CODEC_ARCH_CONFIG+=--disable-vfp
+  endif
+  ifneq ($(findstring neon,$(CONFIG_CPU_TYPE)),)
+    CODEC_ARCH_CONFIG+=--enable-neon --enable-vfp
+  else
+    CODEC_ARCH_CONFIG+=--disable-neon
+  endif
+endif
+
+ifneq ($(findstring aarch64,$(CONFIG_ARCH)),)
+  CODEC_ARCH_CONFIG+=--enable-neon --enable-vfp
+endif
+
 define Package/luci-videoplayer-codec-runtime
   SECTION:=multimedia
   CATEGORY:=Multimedia
   TITLE:=Private patented-codec FFmpeg runtime for LuCI Video Player
   URL:=https://github.com/communism420/luci-app-videoplayer
-  DEPENDS:=@TARGET_mediatek_filogic @BUILD_PATENTED
+  DEPENDS:=@BUILD_PATENTED
   VARIANT:=videoplayer
 endef
 
 define Package/luci-videoplayer-codec-runtime/description
  A target-specific FFmpeg command-line runtime for luci-app-videoplayer.
  It embeds the libav libraries into one private ELF and installs no files in
- /usr/bin or /usr/lib. This build is only for OpenWrt 25.12.5,
- mediatek/filogic, aarch64_cortex-a53.
+ /usr/bin or /usr/lib. Every package is built for one exact OpenWrt release,
+ revision, and package architecture recorded in its private build metadata.
 endef
 
 define Build/Configure
@@ -62,6 +123,7 @@ define Build/Configure
 			--bindir="/usr/libexec/videoplayer-ffmpeg" \
 			--pkg-config=false \
 			--extra-ldflags="-static-libgcc" \
+			--extra-libs="-Wl,-Bstatic -latomic -Wl,-Bdynamic" \
 			--enable-ffmpeg \
 			--disable-ffplay \
 			--disable-ffprobe \
@@ -84,6 +146,7 @@ define Build/Configure
 			--disable-vaapi \
 			--disable-vdpau \
 			--disable-vulkan \
+			--disable-x86asm \
 			--disable-zlib \
 			--disable-bzlib \
 			--disable-lzma \
@@ -93,8 +156,7 @@ define Build/Configure
 			--enable-small \
 			--enable-pthreads \
 			--disable-runtime-cpudetect \
-			--enable-neon \
-			--enable-vfp \
+			$(CODEC_ARCH_CONFIG) \
 			--disable-decoder=h263_v4l2m2m \
 			--disable-decoder=h264_v4l2m2m \
 			--disable-decoder=hevc_v4l2m2m \
@@ -147,11 +209,10 @@ if [ -z "$${IPKG_INSTROOT:-}" ]; then
 		exit 1
 	}
 	. /etc/openwrt_release
-	[ "$${DISTRIB_RELEASE:-}" = "25.12.5" ] &&
-		[ "$${DISTRIB_REVISION:-}" = "r33051-f5dae5ece4" ] &&
-		[ "$${DISTRIB_TARGET:-}" = "mediatek/filogic" ] &&
-		[ "$${DISTRIB_ARCH:-}" = "aarch64_cortex-a53" ] || {
-		echo "This codec runtime requires OpenWrt 25.12.5 r33051-f5dae5ece4 mediatek/filogic aarch64_cortex-a53." >&2
+	[ "$${DISTRIB_RELEASE:-}" = "$(CODEC_OPENWRT_RELEASE)" ] &&
+		[ "$${DISTRIB_REVISION:-}" = "$(CODEC_OPENWRT_REVISION)" ] &&
+		[ "$${DISTRIB_ARCH:-}" = "$(CODEC_COMPATIBLE_ARCH)" ] || {
+		echo "This codec runtime requires OpenWrt $(CODEC_OPENWRT_RELEASE) $(CODEC_OPENWRT_REVISION), architecture $(CODEC_COMPATIBLE_ARCH)." >&2
 		exit 1
 	}
 fi

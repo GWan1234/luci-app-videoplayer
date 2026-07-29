@@ -1,16 +1,39 @@
-name: Build private codec runtime
+name: Build architecture package matrix
 
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Build the complete matrix or a representative smoke subset
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - smoke
   push:
     branches:
       - main
     paths:
       - "codec-runtime/**"
+      - "luci-app-videoplayer/**"
+      - "scripts/build-dist.py"
+      - "scripts/build-packages.py"
+      - "scripts/codec_matrix.py"
+      - "scripts/verify_codec_package.py"
+      - "scripts/verify-dist.py"
+      - "scripts/verify_packages.py"
       - ".github/workflows/codec-runtime.yml"
   pull_request:
     paths:
       - "codec-runtime/**"
+      - "luci-app-videoplayer/**"
+      - "scripts/build-dist.py"
+      - "scripts/build-packages.py"
+      - "scripts/codec_matrix.py"
+      - "scripts/verify_codec_package.py"
+      - "scripts/verify-dist.py"
+      - "scripts/verify_packages.py"
       - ".github/workflows/codec-runtime.yml"
 
 permissions:
@@ -20,25 +43,93 @@ concurrency:
   group: codec-runtime-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  SDK_FILE: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
-  SDK_URL: https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic/openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
-  SDK_SHA256: ff4a38a397caa2cfe1c39e18f84ddede14878221b3593c3f2c4cfe24e3ec4c25
-  FEEDS_BUILDINFO_URL: https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic/feeds.buildinfo
-  FEEDS_BUILDINFO_SHA256: e11279b01e7fea7f7d399e25e969d9382be6891071cbc1225804195224b27b52
-  PACKAGES_FEED_COMMIT: 5caa62e0bc9f7fb9b0c12a23267bceb7724214dd
-  OPENWRT_RELEASE: "25.12.5"
-  OPENWRT_REVISION: r33051-f5dae5ece4
-  OPENWRT_TARGET: mediatek/filogic
-  OPENWRT_ARCH: aarch64_cortex-a53
-  CODEC_APK: luci-videoplayer-codec-runtime-6.1.4-r2.apk
-  CODEC_ARTIFACT_DIR: targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53
-
 jobs:
+  prepare:
+    name: Validate and select build matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      scope: ${{ steps.matrix.outputs.scope }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Validate pinned architecture inventory
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/build-dist.py \
+            scripts/codec_matrix.py \
+            scripts/verify_codec_package.py \
+            scripts/verify-dist.py
+          python scripts/codec_matrix.py --summary
+
+          scope=smoke
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$REQUESTED_SCOPE" == full ]]; then
+            scope=full
+          fi
+          matrix="$(python scripts/codec_matrix.py --github-matrix --scope "$scope")"
+          python - "$scope" "$matrix" <<'PY'
+          import json
+          import sys
+
+          scope = sys.argv[1]
+          entries = json.loads(sys.argv[2])["include"]
+          expected = 71 if scope == "full" else 8
+          if len(entries) != expected:
+              raise SystemExit(
+                  f"{scope} matrix has {len(entries)} entries instead of {expected}"
+              )
+          pairs = {(entry["format"], entry["arch"]) for entry in entries}
+          if len(pairs) != len(entries):
+              raise SystemExit("matrix contains a duplicate format/architecture pair")
+          PY
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
+
   build:
-    name: OpenWrt 25.12.5 mediatek/filogic
+    name: ${{ matrix.format }} ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      PACKAGE_FORMAT: ${{ matrix.format }}
+      PACKAGE_MANAGER: ${{ matrix.manager }}
+      OPENWRT_ARCH: ${{ matrix.arch }}
+      OPENWRT_RELEASE: ${{ matrix.release }}
+      OPENWRT_REVISION: ${{ matrix.revision }}
+      OPENWRT_TARGET: ${{ matrix.target }}
+      OPENWRT_SUBTARGET: ${{ matrix.subtarget }}
+      RELEASE_DIR: ${{ matrix.release_dir }}
+      SDK_FILE: ${{ matrix.sdk_file }}
+      SDK_URL: ${{ matrix.sdk_url }}
+      SDK_SHA256: ${{ matrix.sdk_sha256 }}
+      FEEDS_BUILDINFO_URL: ${{ matrix.feeds_buildinfo_url }}
+      FEEDS_BUILDINFO_SHA256: ${{ matrix.feeds_buildinfo_sha256 }}
+      PACKAGES_FEED_COMMIT: ${{ matrix.packages_feed_commit }}
+      QEMU_EXECUTABLE: ${{ matrix.qemu }}
+      VALIDATION_MODE: ${{ matrix.validation_mode }}
+      FFMPEG_VERSION: ${{ matrix.ffmpeg_version }}
+      FFMPEG_SHA256: ${{ matrix.ffmpeg_sha256 }}
+      CODEC_RELEASE: ${{ matrix.codec_release }}
+      CODEC_FILE: ${{ matrix.codec_file }}
+      ARTIFACT_DIR: ${{ matrix.artifact_dir }}
+      ARTIFACT_NAME: ${{ matrix.artifact_name }}
 
     steps:
       - name: Check out source
@@ -46,9 +137,10 @@ jobs:
 
       - name: Install build and emulation tools
         run: |
-          set -eu
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
+            binutils \
             build-essential \
             bzip2 \
             file \
@@ -70,7 +162,7 @@ jobs:
       - name: Download and verify the official SDK metadata
         id: sdk
         run: |
-          set -eu
+          set -euo pipefail
           sdk_archive="$RUNNER_TEMP/$SDK_FILE"
           feeds_buildinfo="$RUNNER_TEMP/feeds.buildinfo"
 
@@ -91,14 +183,15 @@ jobs:
           sdk_parent="$RUNNER_TEMP/openwrt-sdk"
           mkdir -p "$sdk_parent"
           tar --use-compress-program=unzstd -xf "$sdk_archive" -C "$sdk_parent"
-          sdk_dir="$(find "$sdk_parent" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          sdk_dir="$(find "$sdk_parent" -mindepth 1 -maxdepth 1 \
+            -type d -print -quit)"
           [ -n "$sdk_dir" ] && [ -x "$sdk_dir/scripts/feeds" ]
           printf 'sdk_dir=%s\n' "$sdk_dir" >> "$GITHUB_OUTPUT"
 
       - name: Pin feeds and add the private package
         working-directory: ${{ steps.sdk.outputs.sdk_dir }}
         run: |
-          set -eu
+          set -euo pipefail
           printf '%s\n' \
             "src-git packages https://git.openwrt.org/feed/packages.git^$PACKAGES_FEED_COMMIT" \
             > feeds.conf.default
@@ -110,42 +203,49 @@ jobs:
           mkdir -p "$package_dir"
           cp -a "$GITHUB_WORKSPACE/codec-runtime/package/." "$package_dir/"
           official_ffmpeg="feeds/packages/multimedia/ffmpeg/Makefile"
-          for field in \
-            'PKG_VERSION:=6.1.4' \
-            'PKG_HASH:=a231e3d5742c44b1cdaebfb98ad7b6200d12763e0b6db9e1e2c5891f2c083a18'
-          do
-            grep -Fx "$field" "$official_ffmpeg"
-            grep -Fx "$field" "$package_dir/Makefile"
-          done
+          grep -Fx "PKG_VERSION:=$FFMPEG_VERSION" "$official_ffmpeg"
           grep -Fx 'PKG_RELEASE:=1' "$official_ffmpeg"
-          grep -Fx 'PKG_RELEASE:=2' "$package_dir/Makefile"
+          grep -Fx "PKG_HASH:=$FFMPEG_SHA256" "$official_ffmpeg"
+          grep -Fx "PKG_VERSION:=$FFMPEG_VERSION" "$package_dir/Makefile"
+          grep -Fx "PKG_RELEASE:=$CODEC_RELEASE" "$package_dir/Makefile"
+          grep -Fx "PKG_HASH:=$FFMPEG_SHA256" "$package_dir/Makefile"
 
           official_patches="feeds/packages/multimedia/ffmpeg/patches"
           [ -d "$official_patches" ]
-          find "$official_patches" -mindepth 1 -maxdepth 1 -type f \
-            -printf '%f\n' | LC_ALL=C sort > "$RUNNER_TEMP/ffmpeg-patches.txt"
-          printf '%s\n' \
-            '010-pkgconfig.patch' \
-            '020-libavcodec-fix-Wint-conversion-in-vulkan.patch' \
-            '030-avformat-file-guard-fd_dup-by-FD_PROTOCOL-or-PIPE_PR.patch' \
-            '040-vulkan_decode-fix-the-print-format-of-VkDeviceSize.patch' \
-            '050-avcodec-dct-Make-declarations-and-definitions-match.patch' \
-            '060-avutil-tx-fix-GCC-memset-warning.patch' \
-            '070-avformat-rawdec-guard-by-CONFIG_DATA_DEMUXER.patch' \
-            '080-avcodec-pcm-bluray-dvd-Use-correct-pointer-types-on-.patch' \
-            '090-avcodec-tiff-Suppress-unused-variable-warnings.patch' \
-            '100-avcodec-tableprint_vlc-Unbreak-hardcoded-tables.patch' \
-            '120-avfilter-af_channelsplit-fix-mixed-declaration-and-c.patch' \
-            > "$RUNNER_TEMP/expected-ffmpeg-patches.txt"
-          diff -u \
-            "$RUNNER_TEMP/expected-ffmpeg-patches.txt" \
-            "$RUNNER_TEMP/ffmpeg-patches.txt"
           cp -a "$official_patches" "$package_dir/patches"
 
-      - name: Configure the exact target
+          cat > "$package_dir/files/build-info" <<EOF
+          format=3
+          openwrt_release=$OPENWRT_RELEASE
+          openwrt_revision=$OPENWRT_REVISION
+          compatible_arch=$OPENWRT_ARCH
+          build_target=$OPENWRT_TARGET
+          build_subtarget=$OPENWRT_SUBTARGET
+          sdk_sha256=$SDK_SHA256
+          packages_feed_commit=$PACKAGES_FEED_COMMIT
+          ffmpeg_version=$FFMPEG_VERSION
+          package_format=$PACKAGE_FORMAT
+          validation_mode=$VALIDATION_MODE
+          build_patented=y
+          network_enabled=n
+          avdevice_enabled=n
+          swresample_enabled=y
+          audio_output=pcm_s16le
+          audio_sample_rate=48000
+          audio_channels=2
+          audio_chunk_frames=12000
+          audio_chunk_bytes=48000
+          private_binary=/usr/libexec/videoplayer-ffmpeg/ffmpeg
+          EOF
+          if grep -Eq '@[A-Z_]+@' "$package_dir/files/build-info"; then
+            echo "Unexpanded build-info placeholder." >&2
+            exit 1
+          fi
+
+      - name: Configure the SDK target
         working-directory: ${{ steps.sdk.outputs.sdk_dir }}
         run: |
-          set -eu
+          set -euo pipefail
           touch .config
           sed -i \
             -e '/^CONFIG_BUILD_PATENTED=/d' \
@@ -159,22 +259,28 @@ jobs:
             >> .config
           make defconfig
 
-          grep -Fx 'CONFIG_TARGET_mediatek=y' .config
-          grep -Fx 'CONFIG_TARGET_mediatek_filogic=y' .config
+          target_symbol="${OPENWRT_TARGET//-/_}"
+          subtarget_symbol="${OPENWRT_SUBTARGET//-/_}"
+          grep -Fx "CONFIG_TARGET_${target_symbol}=y" .config
+          grep -Fx \
+            "CONFIG_TARGET_${target_symbol}_${subtarget_symbol}=y" \
+            .config
           grep -Fx 'CONFIG_BUILD_PATENTED=y' .config
-          grep -Fx 'CONFIG_PACKAGE_luci-videoplayer-codec-runtime=y' .config
+          grep -Fx \
+            'CONFIG_PACKAGE_luci-videoplayer-codec-runtime=y' \
+            .config
 
-      - name: Build the private codec runtime APK
+      - name: Build the private codec runtime
         working-directory: ${{ steps.sdk.outputs.sdk_dir }}
         run: |
-          set -eu
+          set -euo pipefail
           make -j2 package/luci-videoplayer-codec-runtime/compile V=s
 
       - name: Validate package isolation and codec features
         id: package
         working-directory: ${{ steps.sdk.outputs.sdk_dir }}
         run: |
-          set -eu
+          set -euo pipefail
           binary="$(find build_dir -type f \
             -path '*/.pkgdir/luci-videoplayer-codec-runtime/usr/libexec/videoplayer-ffmpeg/ffmpeg' \
             -print -quit)"
@@ -193,67 +299,94 @@ jobs:
             "$RUNNER_TEMP/package-files.txt"
 
           build_info="$package_root/usr/share/luci-videoplayer-codec-runtime/build-info"
+          grep -Fx 'format=3' "$build_info"
           grep -Fx "openwrt_release=$OPENWRT_RELEASE" "$build_info"
           grep -Fx "openwrt_revision=$OPENWRT_REVISION" "$build_info"
-          grep -Fx "openwrt_target=$OPENWRT_TARGET" "$build_info"
-          grep -Fx "openwrt_arch=$OPENWRT_ARCH" "$build_info"
+          grep -Fx "compatible_arch=$OPENWRT_ARCH" "$build_info"
+          grep -Fx "build_target=$OPENWRT_TARGET" "$build_info"
+          grep -Fx "build_subtarget=$OPENWRT_SUBTARGET" "$build_info"
           grep -Fx "sdk_sha256=$SDK_SHA256" "$build_info"
           grep -Fx "packages_feed_commit=$PACKAGES_FEED_COMMIT" "$build_info"
-          grep -Fx 'format=2' "$build_info"
-          grep -Fx 'build_patented=y' "$build_info"
-          grep -Fx 'swresample_enabled=y' "$build_info"
-          grep -Fx 'audio_output=pcm_s16le' "$build_info"
-          grep -Fx 'audio_sample_rate=48000' "$build_info"
-          grep -Fx 'audio_channels=2' "$build_info"
-          grep -Fx 'audio_chunk_frames=12000' "$build_info"
-          grep -Fx 'audio_chunk_bytes=48000' "$build_info"
+          grep -Fx "package_format=$PACKAGE_FORMAT" "$build_info"
 
-          target_staging="$(find staging_dir -mindepth 1 -maxdepth 1 -type d \
-            -name 'target-aarch64_cortex-a53_musl*' -print -quit)"
-          [ -n "$target_staging" ]
-          sysroot="$target_staging/root-mediatek"
-          [ -x "$sysroot/lib/ld-musl-aarch64.so.1" ]
+          mapfile -t target_staging_candidates < <(
+            find staging_dir -mindepth 1 -maxdepth 1 \
+              -type d -name 'target-*_musl*' -print
+          )
+          if (( ${#target_staging_candidates[@]} != 1 )); then
+            echo "Expected one target staging directory, found ${#target_staging_candidates[@]}." >&2
+            printf '  %s\n' "${target_staging_candidates[@]}" >&2
+            exit 1
+          fi
+          target_staging="${target_staging_candidates[0]}"
+          sysroot="$(find "$target_staging" -mindepth 1 -maxdepth 1 \
+            -type d -name 'root-*' -print -quit)"
+          [ -n "$sysroot" ] && [ -d "$sysroot/lib" ]
+          config_h="$(find build_dir -type f -path '*/ffmpeg-*/config.h' \
+            -print -quit)"
+          component_config="$(find build_dir -type f \
+            -path '*/ffmpeg-*/config_components.h' -print -quit)"
+          [ -n "$config_h" ] && [ -n "$component_config" ]
+          if [[ "$VALIDATION_MODE" == qemu ]]; then
+            command -v "$QEMU_EXECUTABLE"
+          fi
           chmod +x "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh"
-          "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh" \
-            "$binary" "$sysroot" "$RUNNER_TEMP/codec-validation"
+          VALIDATION_TIMEOUT=300 \
+            "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh" \
+            "$binary" "$sysroot" "$RUNNER_TEMP/codec-validation" \
+            "$QEMU_EXECUTABLE" "$VALIDATION_MODE" \
+            "$config_h" "$component_config"
 
-          apk_dir="bin/packages/$OPENWRT_ARCH"
-          apk="$(find "$apk_dir" -type f \
-            -name 'luci-videoplayer-codec-runtime-*.apk' -print -quit)"
-          [ -n "$apk" ] && [ -s "$apk" ]
-          count="$(find "$apk_dir" -type f \
-            -name 'luci-videoplayer-codec-runtime-*.apk' | wc -l)"
-          [ "$count" -eq 1 ]
-          [ "$(basename "$apk")" = "$CODEC_APK" ]
+          mapfile -t packages < <(
+            find bin -type f -name "$CODEC_FILE" -print
+          )
+          if (( ${#packages[@]} != 1 )); then
+            echo "Expected one $CODEC_FILE, found ${#packages[@]}." >&2
+            printf '  %s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+          package="${packages[0]}"
+          [ -s "$package" ]
+          file "$package"
+          python "$GITHUB_WORKSPACE/scripts/verify_codec_package.py" \
+            "$package" \
+            --format "$PACKAGE_FORMAT" \
+            --architecture "$OPENWRT_ARCH" \
+            --build-info "$build_info" \
+            --expected-binary "$binary"
 
-          artifact_dir="$RUNNER_TEMP/codec-runtime-artifact"
-          artifact_target="$artifact_dir/$CODEC_ARTIFACT_DIR"
+          artifact_root="$RUNNER_TEMP/codec-runtime-artifact"
+          artifact_target="$artifact_root/$ARTIFACT_DIR"
           mkdir -p "$artifact_target"
-          cp "$apk" "$artifact_target/$CODEC_APK"
+          cp "$package" "$artifact_target/$CODEC_FILE"
           cp "$build_info" "$artifact_target/BUILD_INFO"
           (
             cd "$artifact_target"
-            sha256sum "$CODEC_APK" > "$CODEC_APK.sha256"
+            sha256sum "$CODEC_FILE" > "$CODEC_FILE.sha256"
           )
-          printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"
+          printf 'artifact_root=%s\n' "$artifact_root" >> "$GITHUB_OUTPUT"
 
-      - name: Upload validated APK
+      - name: Upload validated codec package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: luci-videoplayer-codec-runtime-25.12.5-mediatek-filogic
-          path: ${{ steps.package.outputs.artifact_dir }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ steps.package.outputs.artifact_root }}
           if-no-files-found: error
-          retention-days: 14
+          compression-level: 0
+          retention-days: 1
 
   publish:
-    name: Publish current codec snapshot
-    needs: build
+    name: Publish complete architecture package tree
+    needs:
+      - prepare
+      - build
     if: >-
-      github.event_name == 'push' &&
+      needs.prepare.outputs.scope == 'full' &&
       github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' &&
       github.repository == 'communism420/luci-app-videoplayer'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
     permissions:
       contents: write
 
@@ -261,79 +394,74 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Download validated codec artifact
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Download all validated codec packages
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: luci-videoplayer-codec-runtime-25.12.5-mediatek-filogic
-          path: ${{ runner.temp }}/codec-runtime-publish
+          pattern: codec-*
+          path: ${{ runner.temp }}/codec-artifacts
+          merge-multiple: true
 
-      - name: Publish to the generated codec-snapshot branch
+      - name: Assemble and verify dist tree
         env:
-          SNAPSHOT_BRANCH: codec-snapshot
-          PUBLISH_DIR: ${{ runner.temp }}/codec-runtime-publish
+          SOURCE_DATE_EPOCH: "1767225600"
         run: |
           set -euo pipefail
+          publish_root="$GITHUB_WORKSPACE/.codec-publish"
+          codec_source="$RUNNER_TEMP/codec-artifacts/dist"
+          [ -d "$codec_source" ]
+          [ ! -e "$codec_source/SOURCE_COMMIT" ]
+          printf '%s\n' "$GITHUB_SHA" > "$codec_source/SOURCE_COMMIT"
+          python scripts/build-dist.py \
+            --output-dir "$publish_root/dist" \
+            --codec-source "$codec_source" \
+            --require-codecs \
+            --source-commit "$GITHUB_SHA"
+          python scripts/verify-dist.py \
+            --dist "$publish_root/dist" \
+            --require-codecs
+          printf '%s\n' \
+            '# Current architecture package snapshot' \
+            '' \
+            'This branch is generated from the pinned OpenWrt SDK matrix.' \
+            "All packages were built from main commit \`$GITHUB_SHA\`." \
+            'Folder names are exact OpenWrt `DISTRIB_ARCH` values.' \
+            'Do not edit this branch manually.' \
+            > "$publish_root/README.md"
+          [ -z "$(find "$publish_root" -type l -print -quit)" ]
 
-          artifact_target="$PUBLISH_DIR/$CODEC_ARTIFACT_DIR"
-          apk="$artifact_target/$CODEC_APK"
-          checksum="$apk.sha256"
-          build_info="$artifact_target/BUILD_INFO"
-          [ -s "$apk" ] && [ -s "$checksum" ] && [ -s "$build_info" ]
-          [ -z "$(find "$PUBLISH_DIR" -type l -print -quit)" ]
-
-          mapfile -t artifact_files < <(
-            find "$PUBLISH_DIR" -type f -printf '%P\n' | LC_ALL=C sort
-          )
-          expected_files=(
-            "$CODEC_ARTIFACT_DIR/BUILD_INFO"
-            "$CODEC_ARTIFACT_DIR/$CODEC_APK"
-            "$CODEC_ARTIFACT_DIR/$CODEC_APK.sha256"
-          )
-          if (( ${#artifact_files[@]} != ${#expected_files[@]} )); then
-            echo "Validated artifact contains unexpected files." >&2
-            printf '  %s\n' "${artifact_files[@]}" >&2
+      - name: Publish generated codec-snapshot branch
+        env:
+          SNAPSHOT_BRANCH: codec-snapshot
+          PUBLISH_DIR: ${{ github.workspace }}/.codec-publish
+        run: |
+          set -euo pipefail
+          remote_main="$(
+            git ls-remote origin refs/heads/main |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
+            echo "Main changed while the matrix was building; refusing stale publication." >&2
             exit 1
           fi
-          for index in "${!expected_files[@]}"; do
-            [ "${artifact_files[$index]}" = "${expected_files[$index]}" ]
-          done
-
-          (
-            cd "$artifact_target"
-            sha256sum --check --strict "$CODEC_APK.sha256"
-          )
-          printf '%s\n' "$GITHUB_SHA" > "$PUBLISH_DIR/SOURCE_COMMIT"
-          printf '%s\n' \
-            '# Current private codec runtime' \
-            '' \
-            'This branch is generated after the pinned OpenWrt SDK build and codec validation pass.' \
-            "The APK was built from main commit \`$GITHUB_SHA\`." \
-            'Do not edit this branch manually.' \
-            > "$PUBLISH_DIR/README.md"
 
           previous_snapshot="$(
             git ls-remote origin "refs/heads/$SNAPSHOT_BRANCH" |
               awk 'NR == 1 { print $1 }'
           )"
-          parent_args=()
-          if [[ -n "$previous_snapshot" ]]; then
-            if [[ ! "$previous_snapshot" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "The codec snapshot branch returned an invalid commit." >&2
-              exit 1
-            fi
-            git fetch --no-tags --depth=1 origin "refs/heads/$SNAPSHOT_BRANCH"
-            fetched_snapshot="$(git rev-parse FETCH_HEAD)"
-            if [[ "$fetched_snapshot" != "$previous_snapshot" ]]; then
-              echo "The codec snapshot branch changed while it was fetched." >&2
-              exit 1
-            fi
-            parent_args=(-p "$previous_snapshot")
+          if [[ -n "$previous_snapshot" && ! "$previous_snapshot" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The codec snapshot branch returned an invalid commit." >&2
+            exit 1
           fi
 
           index_file="$RUNNER_TEMP/codec-snapshot-index-$GITHUB_RUN_ID"
           trap 'rm -f -- "$index_file"' EXIT
           GIT_INDEX_FILE="$index_file" \
-            git --work-tree="$PUBLISH_DIR" add --all
+            git --work-tree="$PUBLISH_DIR" add --force --all
           snapshot_tree="$(
             GIT_INDEX_FILE="$index_file" git write-tree
           )"
@@ -341,8 +469,8 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           snapshot_commit="$(
-            printf 'Publish codec runtime built from %s\n' "$GITHUB_SHA" |
-              git commit-tree "$snapshot_tree" "${parent_args[@]}"
+            printf 'Publish architecture packages built from %s\n' "$GITHUB_SHA" |
+              git commit-tree "$snapshot_tree"
           )"
 
           current_snapshot="$(
@@ -350,8 +478,9 @@ jobs:
               awk 'NR == 1 { print $1 }'
           )"
           if [[ "$current_snapshot" != "$previous_snapshot" ]]; then
-            echo "The codec snapshot branch changed before it could be published." >&2
+            echo "The codec snapshot branch changed before publication." >&2
             exit 1
           fi
-
-          git push origin "$snapshot_commit:refs/heads/$SNAPSHOT_BRANCH"
+          git push origin \
+            "$snapshot_commit:refs/heads/$SNAPSHOT_BRANCH" \
+            "--force-with-lease=refs/heads/$SNAPSHOT_BRANCH:$previous_snapshot"

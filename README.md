@@ -73,10 +73,11 @@ expiry.
 ## Requirements
 
 The package directly depends on `luci-base`, `uhttpd`, `jshn`,
-`coreutils-stat`, `coreutils-timeout`, and `ffmpeg`. The application itself contains no
-CPU-specific binaries, so its architecture remains `all` for IPK and `noarch`
-for APK; the package manager selects the architecture-specific FFmpeg
-dependencies.
+`coreutils-stat`, and `coreutils-timeout`. FFmpeg is optional: browser mode
+works without it, while router CPU mode uses the private compatible codec
+runtime when installed and otherwise tries a compatible system `ffmpeg`.
+The application itself contains no CPU-specific binaries, so its architecture
+remains `all` for IPK and `noarch` for APK.
 
 FFmpeg is large for router software. Depending on architecture and repository
 configuration, `libffmpeg-full` alone may consume roughly 14–23 MiB after
@@ -104,6 +105,13 @@ it installs one private executable at
 private executable when it is present and passes all capability and filesystem
 safety checks, then falls back to the normal system FFmpeg if it is absent or
 unusable.
+
+The codec build matrix covers every package ABI published for the current
+official OpenWrt stable and old-stable releases: 35 APK architectures for
+OpenWrt 25.12.5 and 36 IPK architectures for OpenWrt 24.10.8, producing 37
+unique `DISTRIB_ARCH` folders and 71 separately compiled codec packages. The
+folder key is the exact OpenWrt package ABI, not a marketing CPU name or the
+broader value returned by `uname -m`.
 
 If the player reports that the installed FFmpeg has no usable decoder for a
 video, inspect the installed decoder list:
@@ -182,7 +190,7 @@ and installs the package. The released APK is unsigned, so installation on
 OpenWrt 25.12+ uses `apk add --allow-untrusted`. Downloads are size-limited to
 protect the router's RAM-backed `/tmp` filesystem.
 
-### Current `main` APK (OpenWrt 25.12+)
+### Current `main` APK (OpenWrt 25.12.5)
 
 To install the newest successfully tested `main` source instead of Release
 1.0.0, use the separate APK-only installer:
@@ -204,29 +212,36 @@ To install the newest successfully tested `main` source instead of Release
 ```
 
 After every successful package-check run for a push to `main`, GitHub Actions
-rebuilds the current source package and publishes the APK, its SHA-256
-checksum, and the exact source commit to the generated `snapshot` branch. The
-installer pins all three files to one immutable snapshot commit, verifies the
-checksum, and confirms that the APK source commit still equals the current
-head of `main`. It refuses to install while a newer push is still being
-checked or if any verification fails. This path supports only `apk`; use the
-published-release installer above on OpenWrt versions that still use `opkg`.
+rebuilds the current source package and publishes the architecture-scoped
+`dist/` index, packages, SHA-256 values, and exact source commit to the
+generated `snapshot` branch. The installer resolves that branch immutably,
+matches the router's exact release, revision, and `DISTRIB_ARCH`, validates the
+indexed path and checksum, and confirms that the source commit still equals
+the current head of `main`. It refuses to install while a newer push is still
+being checked or if any verification fails. This path supports only `apk`; use
+the published-release installer above on OpenWrt versions that still use
+`opkg`.
 OpenWrt 25.12.1 and newer can force a reinstall when two snapshots share the
 same package version. On 25.12.0, the first installation works, but an existing
 copy must be removed manually before installing any newer build, including a
 genuine version upgrade.
 
-### Optional Codec Runtime for OpenWrt 25.12.5 `mediatek/filogic`
+### Architecture-specific Codec Runtime (APK or IPK)
 
-The first private codec-runtime build targets the exact system reported by an
-ASUS RT-AX52 running OpenWrt `25.12.5` revision
-`r33051-f5dae5ece4`, target `mediatek/filogic`, and package architecture
-`aarch64_cortex-a53`. The current generated companion package version is
-**6.1.4-r2**. It is an APK-only package. Do not try to install it on a different
-OpenWrt release, revision, target, or architecture.
+The generated codec package version is **6.1.4-r2**. The current matrix covers:
 
-Install the current `main` APK first, select **Router CPU rendering** in LuCI,
-and then run:
+- OpenWrt `25.12.5` revision `r33051-f5dae5ece4`: 35 APK architectures;
+- OpenWrt `24.10.8` revision `r29233-443ec4032a`: 36 IPK architectures;
+- 37 unique `DISTRIB_ARCH` folders and 71 codec packages in total.
+
+Your ASUS RT-AX52 reports `aarch64_cortex-a53` and therefore selects that
+folder. Other AArch64 routers may report `aarch64_cortex-a72`,
+`aarch64_cortex-a76`, or `aarch64_generic`; those are separate ABI folders
+with separately compiled codec binaries.
+
+Install the current 1.1.0 application package from the same exact architecture
+folder first: the APK on OpenWrt 25.12.5 or the IPK on OpenWrt 24.10.8. Then
+select **Router CPU rendering** in LuCI and run:
 
 ```sh
 (
@@ -244,74 +259,126 @@ and then run:
 )
 ```
 
-The installer checks `DISTRIB_RELEASE`, `DISTRIB_REVISION`,
-`DISTRIB_TARGET`, `DISTRIB_ARCH`, `uname -m`, and `apk --print-arch` before
-downloading anything. It resolves the generated `codec-snapshot` branch to an
-immutable commit, verifies the package SHA-256 checksum, installs the unsigned
-APK with `apk --allow-untrusted`, and confirms that the private runtime exposes
-the native H.264, HEVC, and VC-1 decoders plus every component required by the
-JPEG and PCM renderers.
+The installer detects `apk` or `opkg`, reads `DISTRIB_RELEASE`,
+`DISTRIB_REVISION`, and `DISTRIB_ARCH`, and selects exactly one entry from the
+immutable `codec-snapshot` index. It rejects malformed metadata, unknown
+architectures, mismatched revisions, duplicate entries, unexpected paths, and
+checksum failures before installation. It then confirms that the private
+runtime exposes the native H.264, HEVC, and VC-1 decoders plus every component
+required by the JPEG and PCM renderers.
 
-The runtime is built from the official OpenWrt 25.12.5
-`mediatek/filogic` SDK with `CONFIG_BUILD_PATENTED=y`. Its native FFmpeg
-decoders cover substantially more formats than the official patent-disabled
-package, but this is not a promise of literally every existing or future
-codec. DRM, encryption, damaged media, unsupported codecs, available memory,
+Each runtime is built from a checksum-pinned official OpenWrt SDK with
+`CONFIG_BUILD_PATENTED=y`. QEMU-compatible architectures are executed under
+their matching user emulator for H.264-to-JPEG and AAC-to-PCM smoke tests.
+The Octeon and embedded PowerPC ABIs receive static ELF, linkage,
+configuration, component, and package validation because QEMU user mode cannot
+faithfully execute those CPU-specific userspace ABIs. Availability of a
+package is not a promise of literally every existing or future codec.
+DRM, encryption, damaged media, unsupported formats, available flash and RAM,
 CPU performance, heat, and storage throughput can still prevent playback.
 
 ## Building and Verifying Packages Locally
 
-Python 3.10 or newer is sufficient for rapid local development:
+Python 3.10 or newer is sufficient to build the application packages and the
+architecture-scoped layout:
+
+```sh
+python scripts/build-dist.py
+python scripts/verify-dist.py
+```
+
+The layout builder creates 37 top-level architecture folders and 71
+release-qualified package-set directories. It builds the architecture-neutral
+application once, verifies it, and places byte-identical APK or IPK copies in
+every compatible directory. Without a validated codec artifact source it
+writes an explicit `CODEC_NOT_BUILT.txt` marker; it never copies an
+incompatible binary into a folder.
+
+To require the complete codec matrix from a shallow checkout of the generated
+`codec-snapshot` branch:
+
+```sh
+git clone --depth 1 --branch codec-snapshot \
+  https://github.com/communism420/luci-app-videoplayer.git \
+  /path/to/codec-snapshot
+python scripts/build-dist.py \
+  --codec-source /path/to/codec-snapshot/dist \
+  --require-codecs
+python scripts/verify-dist.py --require-codecs
+```
+
+The builder uses `SOURCE_DATE_EPOCH` (default: `0`), so identical application
+sources produce byte-for-byte identical packages. When it records the current
+`HEAD` automatically, it refuses a dirty worktree so that `SOURCE_COMMIT`
+cannot claim false provenance. A supplied codec tree must also contain the
+same `SOURCE_COMMIT`; stale codec binaries cannot be relabeled as a newer
+source build. Example in PowerShell:
+
+```powershell
+$env:SOURCE_DATE_EPOCH = '1767225600'
+python scripts/build-dist.py
+python scripts/verify-dist.py
+```
+
+The low-level application-only builder remains available for development:
 
 ```sh
 python scripts/build-packages.py --check-reproducible
 python scripts/build-packages.py --verify-only
 ```
 
-The builder uses `SOURCE_DATE_EPOCH` (default: `0`), so identical sources
-produce byte-for-byte identical packages. Example with an explicit timestamp:
+It writes to `.staging/app/`, not to the organized `dist/` tree.
 
-```sh
-SOURCE_DATE_EPOCH=1767225600 python scripts/build-packages.py --check-reproducible
+The resulting full layout is:
+
+```text
+dist/
+├── INDEX.json
+├── INDEX.tsv
+├── SOURCE_COMMIT
+├── aarch64_cortex-a53/
+│   ├── openwrt-25.12.5-r33051-f5dae5ece4/
+│   │   ├── luci-app-videoplayer-1.1.0.apk
+│   │   └── luci-videoplayer-codec-runtime-6.1.4-r2.apk
+│   └── openwrt-24.10.8-r29233-443ec4032a/
+│       ├── luci-app-videoplayer_1.1.0_all.ipk
+│       └── luci-videoplayer-codec-runtime_6.1.4-r2_aarch64_cortex-a53.ipk
+├── aarch64_cortex-a72/
+├── …
+└── x86_64/
 ```
-
-In PowerShell:
-
-```powershell
-$env:SOURCE_DATE_EPOCH = '1767225600'
-python scripts/build-packages.py --check-reproducible
-```
-
-The resulting files are written to `dist/`:
-
-| File | Package manager | OpenWrt |
-|---|---|---|
-| `luci-app-videoplayer-1.1.0.apk` | `apk` | 25.12+ / snapshots |
-| `luci-app-videoplayer_1.1.0_all.ipk` | `opkg` | 24.10 and compatible releases that use `opkg` |
 
 The IPK uses the gzip-compressed GNU tar format expected by OpenWrt 24.10.
 `Installed-Size` is calculated in the same way as by the standard
-`ipkg-build` script: from the size of the uncompressed `data.tar`.
+`ipkg-build` script. The locally built APK is unsigned and intended for
+development and testing. For an official package repository, use the official
+OpenWrt SDK/Buildroot and signing infrastructure.
 
-The locally built APK is unsigned, and its minimal built-in builder is intended
-for development and testing. For a public package repository, use the official
-OpenWrt SDK/Buildroot and its standard `apk mkpkg` tool. It creates and signs a
-package in the format expected by the selected OpenWrt release.
+To display the correct folder key on a router:
+
+```sh
+. /etc/openwrt_release
+printf '%s\n' "$DISTRIB_ARCH"
+```
 
 ## Installing a Prebuilt Local Package
 
-OpenWrt 25.12+:
+OpenWrt 25.12.5 on `aarch64_cortex-a53`:
 
 ```sh
-scp -O dist/luci-app-videoplayer-1.1.0.apk root@192.168.1.1:/tmp/
+scp -O \
+  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.1.0.apk \
+  root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 apk add --allow-untrusted /tmp/luci-app-videoplayer-1.1.0.apk
 ```
 
-OpenWrt 24.10 (`opkg`):
+OpenWrt 24.10.8 on `aarch64_cortex-a53`:
 
 ```sh
-scp -O dist/luci-app-videoplayer_1.1.0_all.ipk root@192.168.1.1:/tmp/
+scp -O \
+  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.1.0_all.ipk \
+  root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 opkg install /tmp/luci-app-videoplayer_1.1.0_all.ipk
 ```
@@ -351,7 +418,9 @@ The script first uploads files to a temporary directory and then replaces the
 installed files atomically. An existing `/etc/config/videoplayer` is preserved;
 missing UCI options are added separately. The script tries `scp -O` first and
 then falls back to regular `scp`. This development installer does not install
-dependencies, so install a compatible `ffmpeg` package on the router first.
+package dependencies. FFmpeg is optional for browser mode; router CPU mode
+requires either the private codec runtime described above or a compatible
+system FFmpeg.
 
 To remove only the program files installed manually:
 
@@ -398,6 +467,7 @@ apk del luci-videoplayer-codec-runtime
 
 # OpenWrt with opkg
 opkg remove luci-app-videoplayer
+opkg remove luci-videoplayer-codec-runtime
 ```
 
 Removing only `luci-videoplayer-codec-runtime` restores the normal system
@@ -464,17 +534,27 @@ conversion, queueing, and cleanup, checks modern and legacy missing-decoder
 diagnostics, unusable V4L2 hardware decoders, bounded noisy logs, and unknown
 FFmpeg failures with isolated fake processes, and builds and verifies both
 packages. After those checks pass on `main`, a separate job
-with narrowly scoped repository write access rebuilds the APK and updates the
-generated `snapshot` branch. It never uploads files to a router or changes
-GitHub Releases.
+with narrowly scoped repository write access rebuilds the architecture-scoped
+application layout and updates the generated `snapshot` branch. It never
+uploads files to a router or changes GitHub Releases.
 
-The separate codec-runtime workflow downloads the checksum-pinned official
-OpenWrt SDK, pins the release's packages-feed commit, applies that feed's
-FFmpeg patches, cross-compiles the private AArch64 executable, verifies that
-its only dynamic dependency is the target `libc`, checks its codec and renderer
-feature lists under emulation, decodes an H.264 sample to JPEG, and validates
-the PCM audio path. Only that validated architecture-specific APK is published
-to the generated `codec-snapshot` branch.
+`scripts/codec_matrix.py` validates the exact 37-folder, 71-build inventory.
+`scripts/verify-dist.py` rejects missing or extra architecture folders,
+non-identical application copies, unsafe links, stale files, malformed
+metadata, checksum drift, codec package metadata or ELF architecture drift,
+and incomplete codec coverage.
+
+The separate codec-runtime workflow downloads all checksum-pinned official
+OpenWrt SDKs, pins each release's packages-feed commit, applies that feed's
+FFmpeg patches, and cross-compiles 35 private APK executables plus 36 private
+IPK executables. Every binary is checked for an isolated payload and target
+`libc` as its only dynamic dependency, then exercised under the matching QEMU
+user emulator for H.264-to-JPEG and AAC-to-PCM output where that ISA is
+faithfully supported. Octeon and embedded PowerPC use the strict static
+validation path described above. Pushes and pull requests use the eight-entry
+smoke matrix; the complete matrix is an explicit manual run. The validated tree
+is published atomically to the generated `codec-snapshot` branch only after all
+71 jobs succeed.
 
 ## Repository Structure
 
@@ -487,6 +567,7 @@ openwrt-video-player/
 ├── LICENSE
 ├── codec-runtime/
 │   ├── README.md
+│   ├── matrix.json
 │   ├── validate-runtime.sh
 │   └── package/
 ├── tests/
@@ -494,11 +575,15 @@ openwrt-video-player/
 │   ├── renderer-behavior.sh
 │   └── web-audio.js
 ├── scripts/
+│   ├── build-dist.py
 │   ├── build-packages.py
+│   ├── codec_matrix.py
 │   ├── install-codec-runtime.sh
 │   ├── install-from-github.sh
 │   ├── install-main-apk.sh
 │   ├── install-to-router.sh
+│   ├── verify_codec_package.py
+│   ├── verify-dist.py
 │   └── verify_packages.py
 └── luci-app-videoplayer/
     ├── Makefile
