@@ -1025,12 +1025,17 @@ assert_eq \
 	"$("$helper" start "$audio_failure" "$work/media/audio-runtime.mp4")" \
 	started \
 	"audio-failure start"
-for _ in {1..60}; do
-	[[ "$("$helper" has-audio "$audio_failure")" == 0 ]] && break
+audio_failure_audio=""
+audio_failure_video=""
+for _ in {1..100}; do
+	audio_failure_audio="$("$helper" has-audio "$audio_failure")"
+	audio_failure_video="$("$helper" status "$audio_failure")"
+	[[ "$audio_failure_audio" == 0 && "$audio_failure_video" == running ]] &&
+		break
 	sleep 0.05
 done
-assert_eq "$("$helper" has-audio "$audio_failure")" 0 "audio-failure state"
-assert_eq "$("$helper" status "$audio_failure")" running "audio-failure video status"
+assert_eq "$audio_failure_audio" 0 "audio-failure state"
+assert_eq "$audio_failure_video" running "audio-failure video status"
 run_cgi GET "$audio_failure" 1 "$work/response"
 check_response "$work/response" GET
 assert_eq "$("$helper" stop "$audio_failure")" stopped "audio-failure stop"
