@@ -224,8 +224,17 @@ done
 renderer_stub="$work/videoplayer-renderer"
 cat > "$renderer_stub" <<'SH'
 #!/bin/sh
-[ "$#" -eq 3 ] && [ "$1" = "start" ] || exit 2
-printf 'started\n'
+case "${1:-}" in
+	start)
+		[ "$#" -eq 3 ] || exit 2
+		printf 'started\n'
+		;;
+	has-audio)
+		[ "$#" -eq 2 ] || exit 2
+		printf '1\n'
+		;;
+	*) exit 2 ;;
+esac
 SH
 chmod 0755 "$renderer_stub"
 
@@ -266,17 +275,18 @@ get_file_metadata() {
 	# shellcheck disable=SC2034
 	FILE_SIZE=1
 }
+declare -A json_fields=()
 json_init() {
-	:
+	json_fields=()
 }
 json_add_string() {
-	:
+	json_fields["$1"]="$2"
 }
 json_add_int() {
-	:
+	json_fields["$1"]="$2"
 }
 json_add_boolean() {
-	:
+	json_fields["$1"]="$2"
 }
 json_dump() {
 	printf '{}\n'
@@ -304,6 +314,25 @@ cmd_resolve '{}' router >/dev/null
 	fail "router mode allocated a browser stream token"
 [[ -e "$renderer_token_marker" ]] ||
 	fail "router mode did not allocate a renderer token"
+assert_eq "${json_fields[stream_type]:-}" "jpeg-frames" \
+	"router stream type"
+assert_eq "${json_fields[stream_url]:-}" \
+	"/cgi-bin/videoplayer-frame?token=22222222222222222222222222222222" \
+	"router frame URL"
+assert_eq "${json_fields[audio_url]:-}" \
+	"/cgi-bin/videoplayer-audio?token=22222222222222222222222222222222" \
+	"router audio URL"
+assert_eq "${json_fields[audio_type]:-}" "pcm-s16le-chunks" \
+	"router audio type"
+assert_eq "${json_fields[has_audio]:-}" "1" "router audio flag"
+assert_eq "${json_fields[audio_sample_rate]:-}" "48000" \
+	"router audio sample rate"
+assert_eq "${json_fields[audio_channels]:-}" "2" "router audio channels"
+assert_eq "${json_fields[audio_frames_per_chunk]:-}" "12000" \
+	"router audio chunk frames"
+assert_eq "${json_fields[router_fps]:-}" "8" "router FPS"
+assert_eq "${json_fields[frame_interval_ms]:-}" "125" \
+	"router frame interval"
 
 test_request_path="movie.mp4"
 # Invoked indirectly by cmd_resolve from the sourced rpcd backend.

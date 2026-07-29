@@ -22,7 +22,7 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DIST = ROOT / "dist"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.1.0"
+PKG_VERSION = "1.2.0"
 PKG_ARCH_IPK = "all"
 PKG_ARCH_APK = "noarch"
 PKG_LICENSE = "GPL-2.0-or-later"
@@ -49,6 +49,7 @@ REQUIRED_PACKAGE_FILES = {
     "usr/share/rpcd/acl.d/luci-app-videoplayer.json",
     "www/cgi-bin/videoplayer-stream",
     "www/cgi-bin/videoplayer-frame",
+    "www/cgi-bin/videoplayer-audio",
     "www/luci-static/resources/view/videoplayer/main.js",
 }
 

@@ -3,9 +3,10 @@
 # shellcheck shell=sh
 #
 # Single-session router CPU renderer for luci-app-videoplayer.
-# FFmpeg decodes a validated local file and atomically refreshes one JPEG in
-# tmpfs. Short CGI requests serve the current frame, avoiding uhttpd's
-# long-running CGI timeout.
+# Separate FFmpeg workers decode one validated local file into an atomically
+# refreshed JPEG and raw PCM. A dedicated chunker serializes that PCM into a
+# hard-bounded ring in tmpfs. Short CGI requests serve both streams, avoiding
+# uhttpd's long-running CGI timeout.
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export LC_ALL=C
@@ -24,6 +25,12 @@ STARTUP_TIMEOUT=15
 STOP_TIMEOUT=6
 MAX_PATH_LENGTH=4096
 MAX_FRAME_BYTES=4194304
+MAX_AUDIO_BYTES=48000
+AUDIO_SAMPLE_RATE=48000
+AUDIO_CHANNELS=2
+AUDIO_FRAMES_PER_CHUNK=12000
+AUDIO_RING_SEGMENTS=32
+AUDIO_STARTUP_TIMEOUT=10
 FFMPEG_LOG_MAX_BYTES=65536
 FFMPEG_LOG_HEAD_BYTES=16384
 FFMPEG_LOG_TAIL_BYTES=49151
@@ -81,6 +88,16 @@ get_render_mode() {
 	case "$value" in
 		router) printf 'router\n' ;;
 		*) printf 'browser\n' ;;
+	esac
+}
+
+get_router_fps() {
+	local value
+
+	value="$(uci -q get videoplayer.main.router_fps 2>/dev/null)" || value=""
+	case "$value" in
+		5|8|12) printf '%s\n' "$value" ;;
+		*) printf '8\n' ;;
 	esac
 }
 
@@ -442,8 +459,70 @@ load_heartbeat() {
 	HEARTBEAT_TIME=""
 	session_dir_is_safe "$token" || return 1
 	safe_regular_file "$dir/heartbeat" 600 || return 1
-	exec 7< "$dir/heartbeat" || return 1
-	IFS= read -r value <&7 || {
+	exec 6< "$dir/heartbeat" || return 1
+	IFS= read -r value <&6 || {
+		exec 6<&-
+		return 1
+	}
+	if IFS= read -r extra <&6; then
+		: "$extra"
+		exec 6<&-
+		return 1
+	fi
+	exec 6<&-
+	valid_decimal "$value" 12 || return 1
+	HEARTBEAT_TIME="$value"
+	return 0
+}
+
+refresh_heartbeat() {
+	local token="$1" now="$2"
+
+	if load_heartbeat "$token" 2>/dev/null &&
+	   [ "$HEARTBEAT_TIME" = "$now" ]; then
+		return 0
+	fi
+	write_heartbeat "$token" "$now"
+}
+
+write_audio_state() {
+	local token="$1" state="$2" dir tmp
+
+	dir="$RUNTIME_DIR/s-$token"
+	tmp="$dir/.audio-state.$$"
+	session_dir_is_safe "$token" || return 1
+	case "$state" in
+		starting|running|ended|unavailable|error) ;;
+		*) return 1 ;;
+	esac
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n' "$LAYOUT" "$state" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/audio-state"
+}
+
+load_audio_state() {
+	local token="$1" dir version state extra
+
+	dir="$RUNTIME_DIR/s-$token"
+	AUDIO_STATE=""
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/audio-state" 600 || return 1
+	exec 7< "$dir/audio-state" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r state <&7 || {
 		exec 7<&-
 		return 1
 	}
@@ -453,8 +532,12 @@ load_heartbeat() {
 		return 1
 	fi
 	exec 7<&-
-	valid_decimal "$value" 12 || return 1
-	HEARTBEAT_TIME="$value"
+	[ "$version" = "$LAYOUT" ] || return 1
+	case "$state" in
+		starting|running|ended|unavailable|error) ;;
+		*) return 1 ;;
+	esac
+	AUDIO_STATE="$state"
 	return 0
 }
 
@@ -581,6 +664,31 @@ probe_selected_ffmpeg() {
 			return 1
 		}
 	FFMPEG_PROBE_REASON=""
+	return 0
+}
+
+probe_selected_audio() {
+	local output component
+
+	output="$(invoke_selected_ffmpeg -hide_banner -encoders 2>/dev/null)" ||
+		return 1
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*A[^[:space:]]*[[:space:]]+pcm_s16le([[:space:]]|$)' ||
+		return 1
+
+	output="$(invoke_selected_ffmpeg -hide_banner -muxers 2>/dev/null)" ||
+		return 1
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*E[[:space:]]+s16le([[:space:]]|$)' ||
+		return 1
+
+	output="$(invoke_selected_ffmpeg -hide_banner -filters 2>/dev/null)" ||
+		return 1
+	for component in aresample aformat asetnsamples; do
+		printf '%s\n' "$output" |
+			grep -Eq "^[[:space:]]*[^[:space:]]+[[:space:]]+${component}[[:space:]]" ||
+			return 1
+	done
 	return 0
 }
 
@@ -826,7 +934,7 @@ write_worker_identity() {
 	local dir="$RUNTIME_DIR/s-$token" tmp
 
 	case "$name" in
-		worker|ffmpeg) ;;
+		worker|ffmpeg|audio|chunker) ;;
 		*) return 1 ;;
 	esac
 	tmp="$dir/.$name.$$"
@@ -854,7 +962,7 @@ load_worker_identity() {
 
 	dir="$RUNTIME_DIR/s-$token"
 	case "$name" in
-		worker|ffmpeg) ;;
+		worker|ffmpeg|audio|chunker) ;;
 		*) return 1 ;;
 	esac
 	WORKER_PID=""
@@ -891,8 +999,9 @@ load_worker_identity() {
 	return 0
 }
 
-process_matches_ffmpeg() {
-	local pid="$1" start="$2" token="$3" actual arg1 frame
+process_matches_ffmpeg_role() {
+	local pid="$1" start="$2" token="$3" role="$4"
+	local actual arg1 output
 
 	actual="$(process_start_time "$pid" 2>/dev/null)" || return 1
 	[ "$actual" = "$start" ] || return 1
@@ -902,24 +1011,67 @@ process_matches_ffmpeg() {
 		ffmpeg|/usr/bin/ffmpeg|"$PRIVATE_FFMPEG_BIN") ;;
 		*) return 1 ;;
 	esac
-	frame="$RUNTIME_DIR/s-$token/frame.jpg"
+	case "$role" in
+		video) output="$RUNTIME_DIR/s-$token/frame.jpg" ;;
+		audio) output="$RUNTIME_DIR/s-$token/audio.pipe" ;;
+		*) return 1 ;;
+	esac
 	tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null |
-		grep -Fqx -- "$frame"
+		grep -Fqx -- "$output"
+}
+
+process_matches_ffmpeg() {
+	process_matches_ffmpeg_role "$1" "$2" "$3" video
+}
+
+process_matches_chunker() {
+	local pid="$1" start="$2" token="$3" worker_pid="$4" worker_start="$5"
+	local actual cmdline old_ifs noglob=0
+
+	actual="$(process_start_time "$pid" 2>/dev/null)" || return 1
+	[ "$actual" = "$start" ] || return 1
+	[ -r "/proc/$pid/cmdline" ] || return 1
+	cmdline="$(tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null)" ||
+		return 1
+	old_ifs="$IFS"
+	IFS='
+'
+	case "$-" in
+		*f*) noglob=1 ;;
+		*) set -f ;;
+	esac
+	# Intentional split on the newlines produced from NUL separators above.
+	# shellcheck disable=SC2086
+	set -- $cmdline
+	[ "$noglob" -eq 1 ] || set +f
+	IFS="$old_ifs"
+	[ "$#" -eq 6 ] || return 1
+
+	case "$1" in
+		/bin/sh|/bin/ash|sh|ash) ;;
+		*) return 1 ;;
+	esac
+	[ "$2" = "/usr/libexec/videoplayer-renderer" ] || return 1
+	[ "$3" = "audio-chunker" ] || return 1
+	[ "$4" = "$token" ] || return 1
+	[ "$5" = "$worker_pid" ] || return 1
+	[ "$6" = "$worker_start" ] || return 1
+	return 0
 }
 
 stop_ffmpeg_bounded() {
-	local pid="$1" start="$2" token="$3" attempts=0
+	local pid="$1" start="$2" token="$3" role="${4:-video}" attempts=0
 
-	if ! process_matches_ffmpeg "$pid" "$start" "$token"; then
+	if ! process_matches_ffmpeg_role "$pid" "$start" "$token" "$role"; then
 		return 0
 	fi
 	kill -TERM "$pid" 2>/dev/null || :
-	while process_matches_ffmpeg "$pid" "$start" "$token"; do
+	while process_matches_ffmpeg_role "$pid" "$start" "$token" "$role"; do
 		attempts=$((attempts + 1))
 		[ "$attempts" -lt "$STOP_TIMEOUT" ] || break
 		sleep 1
 	done
-	if process_matches_ffmpeg "$pid" "$start" "$token"; then
+	if process_matches_ffmpeg_role "$pid" "$start" "$token" "$role"; then
 		kill -KILL "$pid" 2>/dev/null || :
 	fi
 	return 0
@@ -928,6 +1080,8 @@ stop_ffmpeg_bounded() {
 terminate_worker() {
 	local token="$1" i=0 wrapper_pid="" wrapper_start=""
 	local ffmpeg_pid="" ffmpeg_start=""
+	local audio_pid="" audio_start=""
+	local chunker_pid="" chunker_start=""
 
 	if load_worker_identity "$token" worker; then
 		wrapper_pid="$WORKER_PID"
@@ -937,6 +1091,14 @@ terminate_worker() {
 		ffmpeg_pid="$WORKER_PID"
 		ffmpeg_start="$WORKER_START"
 	fi
+	if load_worker_identity "$token" audio; then
+		audio_pid="$WORKER_PID"
+		audio_start="$WORKER_START"
+	fi
+	if load_worker_identity "$token" chunker; then
+		chunker_pid="$WORKER_PID"
+		chunker_start="$WORKER_START"
+	fi
 
 	if [ -n "$wrapper_pid" ] &&
 	   process_matches_worker "$wrapper_pid" "$wrapper_start" "$token"; then
@@ -945,6 +1107,16 @@ terminate_worker() {
 	if [ -n "$ffmpeg_pid" ] &&
 	   process_matches_ffmpeg "$ffmpeg_pid" "$ffmpeg_start" "$token"; then
 		kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+	fi
+	if [ -n "$audio_pid" ] &&
+	   process_matches_ffmpeg_role "$audio_pid" "$audio_start" "$token" audio; then
+		kill -TERM "$audio_pid" 2>/dev/null || :
+	fi
+	if [ -n "$chunker_pid" ] &&
+	   process_matches_chunker \
+		"$chunker_pid" "$chunker_start" "$token" \
+		"$wrapper_pid" "$wrapper_start"; then
+		kill -TERM "$chunker_pid" 2>/dev/null || :
 	fi
 	while [ -n "$wrapper_pid" ] &&
 	      process_matches_worker "$wrapper_pid" "$wrapper_start" "$token"; do
@@ -959,6 +1131,16 @@ terminate_worker() {
 	if [ -n "$ffmpeg_pid" ] &&
 	   process_matches_ffmpeg "$ffmpeg_pid" "$ffmpeg_start" "$token"; then
 		kill -KILL "$ffmpeg_pid" 2>/dev/null || :
+	fi
+	if [ -n "$audio_pid" ] &&
+	   process_matches_ffmpeg_role "$audio_pid" "$audio_start" "$token" audio; then
+		kill -KILL "$audio_pid" 2>/dev/null || :
+	fi
+	if [ -n "$chunker_pid" ] &&
+	   process_matches_chunker \
+		"$chunker_pid" "$chunker_start" "$token" \
+		"$wrapper_pid" "$wrapper_start"; then
+		kill -KILL "$chunker_pid" 2>/dev/null || :
 	fi
 	return 0
 }
@@ -1073,6 +1255,257 @@ validate_source_path() {
 	return 0
 }
 
+open_audio_source_fd() {
+	local path="$1" opened expected_metadata opened_metadata
+
+	[ -n "$path" ] || return 1
+	exec 4< "$path" || return 1
+	opened="$(readlink -f -- /proc/self/fd/4 2>/dev/null)" || {
+		exec 4<&-
+		return 1
+	}
+	[ "$opened" = "$path" ] || {
+		exec 4<&-
+		return 1
+	}
+	expected_metadata="$(
+		stat -L -c '%d:%i:%F:%s' -- /proc/self/fd/3 2>/dev/null
+	)" || {
+		exec 4<&-
+		return 1
+	}
+	opened_metadata="$(
+		stat -L -c '%d:%i:%F:%s' -- /proc/self/fd/4 2>/dev/null
+	)" || {
+		exec 4<&-
+		return 1
+	}
+	if [ "$expected_metadata" != "$opened_metadata" ]; then
+		exec 4<&-
+		return 1
+	fi
+	case "$opened_metadata" in
+		*":regular file:"*) ;;
+		*)
+			exec 4<&-
+			return 1
+			;;
+	esac
+	return 0
+}
+
+normalize_audio_sequence() {
+	local value="$1"
+
+	valid_decimal "$value" 8 || return 1
+	while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
+		value="${value#0}"
+	done
+	printf '%s\n' "$value"
+}
+
+audio_sequence_bounds() {
+	local token="$1" dir path name sequence
+
+	AUDIO_LOWEST=""
+	AUDIO_HIGHEST=""
+	AUDIO_COUNT=0
+	session_dir_is_safe "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	for path in "$dir"/audio-????????.pcm; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		[ -f "$path" ] && [ ! -L "$path" ] || continue
+		name="${path##*/}"
+		sequence="${name#audio-}"
+		sequence="${sequence%.pcm}"
+		[ "${#sequence}" -eq 8 ] || continue
+		sequence="$(normalize_audio_sequence "$sequence" 2>/dev/null)" || continue
+		safe_regular_file "$path" 600 || continue
+		[ -n "$AUDIO_LOWEST" ] || AUDIO_LOWEST="$sequence"
+		AUDIO_HIGHEST="$sequence"
+		AUDIO_COUNT=$((AUDIO_COUNT + 1))
+	done
+	[ -n "$AUDIO_HIGHEST" ]
+}
+
+audio_file_is_valid() {
+	local path="$1" size
+
+	safe_regular_file "$path" 600 || return 1
+	size="$(stat -L -c '%s' -- "$path" 2>/dev/null)" || return 1
+	valid_decimal "$size" 10 || return 1
+	[ "$size" -eq "$MAX_AUDIO_BYTES" ]
+}
+
+safe_audio_fifo() {
+	local path="$1" canonical metadata
+
+	[ -p "$path" ] && [ ! -L "$path" ] || return 1
+	canonical="$(readlink -f -- "$path" 2>/dev/null)" || return 1
+	case "$canonical" in
+		"$RUNTIME_DIR"/s-*/audio.pipe) ;;
+		*) return 1 ;;
+	esac
+	metadata="$(stat -c '%u:%a:%F' -- "$path" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:600:fifo" ]
+}
+
+audio_published_high() {
+	local token="$1"
+
+	AUDIO_PUBLISHED_HIGH=""
+	load_audio_state "$token" || return 1
+	case "$AUDIO_STATE" in
+		unavailable) return 1 ;;
+	esac
+	audio_sequence_bounds "$token" || return 1
+	# The chunker publishes only complete 48,000-byte files with an atomic
+	# rename, so even the newest visible sequence is safe to serve.
+	AUDIO_PUBLISHED_HIGH="$AUDIO_HIGHEST"
+	return 0
+}
+
+cmd_audio_chunker() {
+	local token="$1" worker_pid="$2" worker_start="$3"
+	local dir pipe sequence=0 padded destination tmp size oldest_sequence oldest
+	local pid start reader_pid="" watchdog_pid="" stopping=0
+
+	valid_token "$token" &&
+		valid_decimal "$worker_pid" 10 &&
+		valid_decimal "$worker_start" 24 || exit 2
+	session_dir_is_safe "$token" || exit 1
+	process_matches_worker "$worker_pid" "$worker_start" "$token" || exit 1
+	dir="$RUNTIME_DIR/s-$token"
+	pipe="$dir/audio.pipe"
+	safe_audio_fifo "$pipe" || exit 1
+	[ "$(
+		stat -L -c '%d:%i:%F' -- /proc/self/fd/0 2>/dev/null
+	)" = "$(
+		stat -L -c '%d:%i:%F' -- "$pipe" 2>/dev/null
+	)" ] || exit 1
+	# POSIX shells may attach /dev/null to an asynchronous command's stdin.
+	# Preserve the verified FIFO on a non-stdin descriptor for the background
+	# reader so it cannot silently spin on empty files instead of draining FFmpeg.
+	exec 9<&0 || exit 1
+
+	pid="$$"
+	start="$(process_start_time "$pid" 2>/dev/null)" || exit 1
+
+	# Invoked indirectly by signal traps and the worker-liveness watchdog.
+	# shellcheck disable=SC2317
+	stop_chunker() {
+		stopping=1
+		if [ -n "${reader_pid:-}" ]; then
+			kill -TERM "$reader_pid" 2>/dev/null || :
+			wait "$reader_pid" 2>/dev/null || :
+		fi
+		if [ -n "${watchdog_pid:-}" ]; then
+			kill -TERM "$watchdog_pid" 2>/dev/null || :
+			wait "$watchdog_pid" 2>/dev/null || :
+		fi
+		[ -n "${tmp:-}" ] && rm -f -- "$tmp" 2>/dev/null || :
+		exit 1
+	}
+	trap stop_chunker HUP INT TERM
+
+	# The reader can block indefinitely when a broken decoder stops writing.
+	# This watchdog makes worker death close the FIFO reader even if the worker
+	# was SIGKILLed and therefore could not run its own cleanup trap.
+	(
+		while process_matches_worker \
+			"$worker_pid" "$worker_start" "$token" &&
+		      process_matches_chunker \
+			"$pid" "$start" "$token" "$worker_pid" "$worker_start"; do
+			sleep 1
+		done
+		if process_matches_chunker \
+			"$pid" "$start" "$token" "$worker_pid" "$worker_start"; then
+			kill -TERM "$pid" 2>/dev/null || :
+		fi
+	) </dev/null 3<&- 4<&- 5>&- 6<&- 7>&- 8<&- 9<&- &
+	watchdog_pid=$!
+
+	while process_matches_worker "$worker_pid" "$worker_start" "$token"; do
+		[ "$sequence" -le 99999999 ] || break
+		padded="$(printf '%08d' "$sequence")"
+		destination="$dir/audio-$padded.pcm"
+		tmp="$dir/.audio-$padded.$$"
+
+		# Keep staging inside the same hard limit as published audio. Removing
+		# the oldest block before reading means 31 complete files plus at most
+		# one partial temp file can exist even if this process is SIGKILLed.
+		if [ "$sequence" -ge "$AUDIO_RING_SEGMENTS" ]; then
+			oldest_sequence=$((sequence - AUDIO_RING_SEGMENTS))
+			oldest="$dir/audio-$(printf '%08d' "$oldest_sequence").pcm"
+			if [ -e "$oldest" ] || [ -L "$oldest" ]; then
+				if ! safe_regular_file "$oldest" 600 ||
+				   ! rm -f -- "$oldest" 2>/dev/null; then
+					break
+				fi
+			fi
+		fi
+		rm -f -- "$tmp" || break
+
+		# fullblock is essential for pipes: a short read must not become a
+		# published short PCM segment.
+		(
+			umask 077
+			dd iflag=fullblock bs="$MAX_AUDIO_BYTES" count=1 \
+				of="$tmp" 2>/dev/null <&9
+		) &
+		reader_pid=$!
+		if ! wait "$reader_pid"; then
+			reader_pid=""
+			rm -f -- "$tmp" 2>/dev/null || :
+			stopping=1
+			break
+		fi
+		reader_pid=""
+		process_matches_worker "$worker_pid" "$worker_start" "$token" || {
+			rm -f -- "$tmp" 2>/dev/null || :
+			break
+		}
+		[ -f "$tmp" ] && [ ! -L "$tmp" ] || break
+		size="$(stat -L -c '%s' -- "$tmp" 2>/dev/null)" || size=""
+		if [ "$size" = "0" ]; then
+			rm -f -- "$tmp" 2>/dev/null || :
+			tmp=""
+			# Before FFmpeg opens the FIFO, a read can observe a temporary
+			# EOF. Once at least one complete chunk has arrived, EOF means
+			# the single writer has closed and the audio stream is finished.
+			[ "$sequence" -gt 0 ] && break
+			sleep 0.05
+			continue
+		fi
+		if ! valid_decimal "$size" 10 ||
+		   [ "$size" -ne "$MAX_AUDIO_BYTES" ]; then
+			rm -f -- "$tmp" 2>/dev/null || :
+			tmp=""
+			stopping=1
+			break
+		fi
+		chmod 0600 "$tmp" 2>/dev/null || {
+			rm -f -- "$tmp" 2>/dev/null || :
+			break
+		}
+
+		mv -f -- "$tmp" "$destination" || {
+			rm -f -- "$tmp" 2>/dev/null || :
+			break
+		}
+		tmp=""
+		sequence=$((sequence + 1))
+	done
+
+	if [ -n "$watchdog_pid" ]; then
+		kill -TERM "$watchdog_pid" 2>/dev/null || :
+		wait "$watchdog_pid" 2>/dev/null || :
+	fi
+	exec 9<&-
+	trap - HUP INT TERM
+	[ "$stopping" -eq 0 ]
+}
+
 worker_current() {
 	local token="$1" now
 
@@ -1089,9 +1522,16 @@ worker_current() {
 cmd_worker() {
 	local token="$1" dir frame log_pipe log_file log_pid="" log_start=""
 	local now pid start ffmpeg_pid ffmpeg_start candidate_pid rc=1
+	local audio_pipe audio_pid="" audio_start="" audio_rc=1
+	local chunker_pid="" chunker_start="" chunker_rc=1
+	local audio_capable=0 audio_running_written=0 audio_launching=0
+	local chunker_launching=0 audio_anchor_open=0
+	local audio_fd_open=0 audio_file last_audio router_fps ffmpeg_launching=0
+	local audio_launch_time=""
 	local frame_mtime="" last_frame_mtime="" last_frame_change=""
 	local running_written=0 stopping=0 failure_reason=""
 	local log_anchor_open=0 log_launching=0
+	local _audio_wait _chunker_wait
 
 	valid_token "$token" || exit 2
 	ensure_lock_file "$WORKER_LOCK" || exit 1
@@ -1112,11 +1552,33 @@ cmd_worker() {
 		exec 3<&-
 		exit 1
 	fi
+	router_fps="$(get_router_fps)"
 	dir="$RUNTIME_DIR/s-$token"
 	frame="$dir/frame.jpg"
+	audio_pipe="$dir/audio.pipe"
 	log_pipe="$dir/ffmpeg-log.pipe"
 	log_file="$dir/ffmpeg.log"
-	rm -f -- "$frame" "$frame.tmp" "$log_pipe" "$log_file" 2>/dev/null || :
+	rm -f -- "$frame" "$frame.tmp" "$log_pipe" "$log_file" \
+		"$dir/audio-state" "$dir/audio" "$dir/chunker" "$audio_pipe" \
+		2>/dev/null || :
+	for audio_file in "$dir"/audio-????????.pcm; do
+		[ -f "$audio_file" ] && [ ! -L "$audio_file" ] || continue
+		rm -f -- "$audio_file" 2>/dev/null || :
+	done
+	if probe_selected_audio && open_audio_source_fd "$SESSION_PATH"; then
+		audio_capable=1
+		audio_fd_open=1
+	fi
+	if [ "$audio_capable" -eq 1 ]; then
+		write_audio_state "$token" starting 2>/dev/null || {
+			audio_capable=0
+			exec 4<&-
+			audio_fd_open=0
+		}
+	fi
+	if [ "$audio_capable" -eq 0 ]; then
+		write_audio_state "$token" unavailable 2>/dev/null || :
+	fi
 	pid="$$"
 	start="$(process_start_time "$pid" 2>/dev/null)" || {
 		exec 3<&-
@@ -1164,6 +1626,28 @@ cmd_worker() {
 		return 1
 	}
 
+	finalize_audio_state() {
+		local final_audio_rc="$1" final_chunker_rc="$2"
+
+		rm -f -- "$dir/audio" "$dir/chunker" "$audio_pipe" \
+			2>/dev/null || :
+		if [ "$final_audio_rc" -eq 0 ] &&
+		   [ "$final_chunker_rc" -eq 0 ] &&
+		   audio_sequence_bounds "$token"; then
+			last_audio="$dir/audio-$(printf '%08d' "$AUDIO_HIGHEST").pcm"
+			if audio_file_is_valid "$last_audio"; then
+				write_audio_state "$token" ended 2>/dev/null || :
+				audio_running_written=1
+			else
+				write_audio_state "$token" error 2>/dev/null || :
+			fi
+		elif [ "$audio_running_written" -eq 1 ]; then
+			write_audio_state "$token" error 2>/dev/null || :
+		else
+			write_audio_state "$token" unavailable 2>/dev/null || :
+		fi
+	}
+
 	# Invoked indirectly by the signal trap below.
 	# shellcheck disable=SC2317
 	stop_child() {
@@ -1180,12 +1664,35 @@ cmd_worker() {
 				)" || log_start=""
 			fi
 		fi
-		# A trap may run in the tiny interval after the asynchronous launch
-		# updates $! but before ffmpeg_pid is assigned.
-		if [ -z "${ffmpeg_pid:-}" ] && [ -n "${log_pid:-}" ]; then
+		# Recover a media child when a trap lands after an asynchronous launch
+		# updates $! but before the corresponding PID assignment.
+		if [ -z "${audio_pid:-}" ] &&
+		   [ "${audio_launching:-0}" -eq 1 ]; then
 			candidate_pid=$!
 			if valid_decimal "$candidate_pid" 10 &&
-			   [ "$candidate_pid" != "$log_pid" ]; then
+			   process_is_direct_child "$candidate_pid"; then
+				audio_pid="$candidate_pid"
+				audio_start="$(
+					process_start_time "$audio_pid" 2>/dev/null
+				)" || audio_start=""
+			fi
+		fi
+		if [ -z "${chunker_pid:-}" ] &&
+		   [ "${chunker_launching:-0}" -eq 1 ]; then
+			candidate_pid=$!
+			if valid_decimal "$candidate_pid" 10 &&
+			   process_is_direct_child "$candidate_pid"; then
+				chunker_pid="$candidate_pid"
+				chunker_start="$(
+					process_start_time "$chunker_pid" 2>/dev/null
+				)" || chunker_start=""
+			fi
+		fi
+		if [ -z "${ffmpeg_pid:-}" ] &&
+		   [ "${ffmpeg_launching:-0}" -eq 1 ]; then
+			candidate_pid=$!
+			if valid_decimal "$candidate_pid" 10 &&
+			   process_is_direct_child "$candidate_pid"; then
 				ffmpeg_pid="$candidate_pid"
 				ffmpeg_start="$(
 					process_start_time "$ffmpeg_pid" 2>/dev/null
@@ -1196,6 +1703,22 @@ cmd_worker() {
 			stop_direct_child_bounded \
 				"$ffmpeg_pid" "${ffmpeg_start:-}" || :
 		fi
+		if [ -n "${audio_pid:-}" ]; then
+			stop_direct_child_bounded \
+				"$audio_pid" "${audio_start:-}" || :
+		fi
+		if [ "${audio_anchor_open:-0}" -eq 1 ]; then
+			exec 5>&-
+			audio_anchor_open=0
+		fi
+		if [ -n "${chunker_pid:-}" ]; then
+			stop_direct_child_bounded \
+				"$chunker_pid" "${chunker_start:-}" || :
+		fi
+		if [ "${audio_fd_open:-0}" -eq 1 ]; then
+			exec 4<&-
+			audio_fd_open=0
+		fi
 		if [ "${log_anchor_open:-0}" -eq 1 ]; then
 			exec 7>&-
 			log_anchor_open=0
@@ -1203,7 +1726,8 @@ cmd_worker() {
 		if [ -n "${log_pid:-}" ]; then
 			stop_direct_child_bounded "$log_pid" "${log_start:-}" || :
 		fi
-		rm -f -- "$log_pipe" "$log_file" 2>/dev/null || :
+		rm -f -- "$log_pipe" "$log_file" "$dir/ffmpeg" "$dir/audio" \
+			"$dir/chunker" "$audio_pipe" 2>/dev/null || :
 		if worker_current "$token" 2>/dev/null; then
 			write_status "$token" stopped "Renderer stopped" 2>/dev/null || :
 		fi
@@ -1285,10 +1809,119 @@ cmd_worker() {
 			for (i = tail_first; i <= tail_last; i++)
 				printf "%s", tail[i]
 		}
-	' < "$log_pipe" > "$log_file" 2>/dev/null 3<&- 7>&- 8<&- &
+	' < "$log_pipe" > "$log_file" 2>/dev/null 3<&- 4<&- 7>&- 8<&- &
 	log_pid=$!
 	log_launching=0
 	log_start="$(process_start_time "$log_pid" 2>/dev/null)" || log_start=""
+
+	if [ "$audio_capable" -eq 1 ]; then
+		if ! mkfifo "$audio_pipe" ||
+		   ! safe_audio_fifo "$audio_pipe" ||
+		   ! exec 5<> "$audio_pipe"; then
+			rm -f -- "$audio_pipe" 2>/dev/null || :
+			audio_capable=0
+			exec 4<&-
+			audio_fd_open=0
+			write_audio_state "$token" unavailable 2>/dev/null || :
+		else
+			audio_anchor_open=1
+		fi
+	fi
+
+	if [ "$audio_capable" -eq 1 ]; then
+		chunker_launching=1
+		/usr/libexec/videoplayer-renderer \
+			audio-chunker "$token" "$pid" "$start" \
+			< "$audio_pipe" 3<&- 4<&- 5>&- 7>&- 8<&- &
+		chunker_pid=$!
+		chunker_launching=0
+		chunker_start="$(
+			process_start_time "$chunker_pid" 2>/dev/null
+		)" || chunker_start=""
+		for _chunker_wait in 1 2 3 4 5 6 7 8 9 10; do
+			process_matches_chunker \
+				"$chunker_pid" "$chunker_start" "$token" "$pid" "$start" &&
+				break
+			process_is_running "$chunker_pid" || break
+			sleep 0.05
+		done
+		if [ -z "$chunker_start" ] ||
+		   ! process_matches_chunker \
+			"$chunker_pid" "$chunker_start" "$token" "$pid" "$start" ||
+		   ! write_worker_identity \
+			"$token" "$chunker_pid" "$chunker_start" chunker; then
+			stop_direct_child_bounded \
+				"$chunker_pid" "$chunker_start" || :
+			chunker_pid=""
+			chunker_start=""
+			exec 5>&-
+			audio_anchor_open=0
+			rm -f -- "$audio_pipe" 2>/dev/null || :
+			audio_capable=0
+			exec 4<&-
+			audio_fd_open=0
+			write_audio_state "$token" unavailable 2>/dev/null || :
+		fi
+	fi
+
+	if [ "$audio_capable" -eq 1 ]; then
+		set -- \
+			-y \
+			-hide_banner \
+			-loglevel error \
+			-nostats \
+			-nostdin \
+			-re \
+			-protocol_whitelist file,pipe \
+			-threads 1 \
+			-fflags +genpts \
+			-err_detect ignore_err \
+			-i /proc/self/fd/4 \
+			-map 0:a:0 \
+			-vn \
+			-sn \
+			-dn \
+			-map_metadata -1 \
+			-filter_threads 1 \
+			-af "aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,asetnsamples=n=${AUDIO_FRAMES_PER_CHUNK}:p=1" \
+			-threads 1 \
+			-c:a pcm_s16le \
+			-f s16le \
+			"$audio_pipe"
+		audio_launching=1
+		if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
+			LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
+				nice -n 12 "$FFMPEG_BIN" "$@" \
+				3<&- 5>&- 7>&- 8<&- </dev/null >/dev/null 2>/dev/null &
+		else
+			nice -n 12 "$FFMPEG_BIN" "$@" \
+				3<&- 5>&- 7>&- 8<&- </dev/null >/dev/null 2>/dev/null &
+		fi
+		audio_pid=$!
+		audio_launching=0
+		audio_start="$(
+			process_start_time "$audio_pid" 2>/dev/null
+		)" || audio_start=""
+		if [ -z "$audio_start" ] ||
+		   ! write_worker_identity "$token" "$audio_pid" "$audio_start" audio; then
+			stop_direct_child_bounded "$audio_pid" "$audio_start" || :
+			audio_pid=""
+			audio_start=""
+			stop_direct_child_bounded \
+				"$chunker_pid" "$chunker_start" || :
+			chunker_pid=""
+			chunker_start=""
+			audio_capable=0
+			write_audio_state "$token" unavailable 2>/dev/null || :
+		else
+			audio_launch_time="$(date +%s 2>/dev/null)" || audio_launch_time=""
+		fi
+		exec 5>&-
+		audio_anchor_open=0
+		exec 4<&-
+		audio_fd_open=0
+	fi
+
 	set -- \
 		-y \
 		-hide_banner \
@@ -1297,7 +1930,7 @@ cmd_worker() {
 		-nostdin \
 		-re \
 		-protocol_whitelist file,pipe \
-		-threads 1 \
+		-threads 2 \
 		-fflags +genpts \
 		-err_detect ignore_err \
 		-i /proc/self/fd/3 \
@@ -1307,7 +1940,7 @@ cmd_worker() {
 		-dn \
 		-map_metadata -1 \
 		-filter_threads 1 \
-		-vf "fps=3,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
+		-vf "fps=$router_fps,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 		-threads 1 \
 		-c:v mjpeg \
 		-q:v 8 \
@@ -1315,23 +1948,33 @@ cmd_worker() {
 		-update 1 \
 		-atomic_writing 1 \
 		"$frame"
+	ffmpeg_launching=1
 	if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
 		LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
 			nice -n 10 "$FFMPEG_BIN" "$@" \
-			8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
+			4<&- 8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
 	else
 		nice -n 10 "$FFMPEG_BIN" "$@" \
-			8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
+			4<&- 8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
 	fi
 	ffmpeg_pid=$!
+	ffmpeg_launching=0
 	exec 7>&-
 	log_anchor_open=0
 	ffmpeg_start="$(process_start_time "$ffmpeg_pid" 2>/dev/null)" || ffmpeg_start=""
 	if [ -z "$ffmpeg_start" ] ||
 	   ! write_worker_identity "$token" "$ffmpeg_pid" "$ffmpeg_start" ffmpeg; then
 		stop_direct_child_bounded "$ffmpeg_pid" "$ffmpeg_start" || :
+		if [ -n "$audio_pid" ]; then
+			stop_direct_child_bounded "$audio_pid" "$audio_start" || :
+		fi
+		if [ -n "$chunker_pid" ]; then
+			stop_direct_child_bounded \
+				"$chunker_pid" "$chunker_start" || :
+		fi
 		stop_direct_child_bounded "$log_pid" "$log_start" || :
-		rm -f -- "$log_pipe" "$log_file" 2>/dev/null || :
+		rm -f -- "$log_pipe" "$log_file" "$dir/audio" "$dir/chunker" \
+			"$audio_pipe" 2>/dev/null || :
 		write_status "$token" error "Cannot track FFmpeg process" 2>/dev/null || :
 		exec 3<&-
 		exit 1
@@ -1359,6 +2002,76 @@ cmd_worker() {
 			break
 		fi
 
+		if [ -n "$audio_pid" ] && [ -n "$chunker_pid" ]; then
+			if ! process_is_running "$audio_pid"; then
+				wait "$audio_pid" 2>/dev/null
+				audio_rc=$?
+				audio_pid=""
+				rm -f -- "$dir/audio" 2>/dev/null || :
+				for _audio_wait in 1 2 3 4 5 6 7 8 9 10 \
+					11 12 13 14 15 16 17 18 19 20; do
+					process_is_running "$chunker_pid" || break
+					sleep 0.05
+				done
+				if process_is_running "$chunker_pid"; then
+					stop_direct_child_bounded \
+						"$chunker_pid" "$chunker_start" || :
+					chunker_rc=1
+				else
+					wait "$chunker_pid" 2>/dev/null
+					chunker_rc=$?
+				fi
+				chunker_pid=""
+				finalize_audio_state "$audio_rc" "$chunker_rc"
+			elif ! process_is_running "$chunker_pid"; then
+				wait "$chunker_pid" 2>/dev/null
+				chunker_rc=$?
+				chunker_pid=""
+				rm -f -- "$dir/chunker" 2>/dev/null || :
+				# On clean EOF the FIFO reader can finish just before FFmpeg
+				# changes into an exited child. Give that paired success path
+				# a short grace period instead of misclassifying it as failure.
+				if [ "$chunker_rc" -eq 0 ]; then
+					for _audio_wait in 1 2 3 4 5 6 7 8 9 10 \
+						11 12 13 14 15 16 17 18 19 20; do
+						process_is_running "$audio_pid" || break
+						sleep 0.05
+					done
+				fi
+				if process_is_running "$audio_pid"; then
+					stop_direct_child_bounded \
+						"$audio_pid" "$audio_start" || :
+					audio_rc=1
+				else
+					wait "$audio_pid" 2>/dev/null
+					audio_rc=$?
+				fi
+				audio_pid=""
+				finalize_audio_state "$audio_rc" "$chunker_rc"
+			else
+				if [ "$audio_running_written" -eq 0 ] &&
+				   audio_file_is_valid "$dir/audio-00000000.pcm" &&
+				   audio_file_is_valid "$dir/audio-00000001.pcm"; then
+					if write_audio_state "$token" running; then
+						audio_running_written=1
+					fi
+				fi
+				if [ "$audio_running_written" -eq 0 ] &&
+				   valid_decimal "$audio_launch_time" 12 &&
+				   [ $((now - audio_launch_time)) -gt "$AUDIO_STARTUP_TIMEOUT" ]; then
+					stop_direct_child_bounded \
+						"$audio_pid" "$audio_start" || :
+					audio_pid=""
+					stop_direct_child_bounded \
+						"$chunker_pid" "$chunker_start" || :
+					chunker_pid=""
+					rm -f -- "$dir/audio" "$dir/chunker" \
+						"$audio_pipe" 2>/dev/null || :
+					write_audio_state "$token" unavailable 2>/dev/null || :
+				fi
+			fi
+		fi
+
 		if [ -f "$frame" ] && [ ! -L "$frame" ]; then
 			frame_mtime="$(stat -L -c '%Y' -- "$frame" 2>/dev/null)" ||
 				frame_mtime=""
@@ -1369,7 +2082,7 @@ cmd_worker() {
 					last_frame_change="$now"
 				fi
 				if [ "$running_written" -eq 0 ]; then
-					if ! write_heartbeat "$token" "$now" ||
+					if ! refresh_heartbeat "$token" "$now" ||
 					   ! write_status "$token" running ""; then
 						kill -TERM "$ffmpeg_pid" 2>/dev/null || :
 						failure_reason="Cannot publish renderer state"
@@ -1389,6 +2102,15 @@ cmd_worker() {
 		sleep 1
 	done
 
+	if [ -n "$audio_pid" ]; then
+		stop_direct_child_bounded "$audio_pid" "$audio_start" || :
+		audio_pid=""
+	fi
+	if [ -n "$chunker_pid" ]; then
+		stop_direct_child_bounded "$chunker_pid" "$chunker_start" || :
+		chunker_pid=""
+	fi
+	rm -f -- "$dir/audio" "$dir/chunker" "$audio_pipe" 2>/dev/null || :
 	if [ "$stopping" -eq 1 ] || [ -n "$failure_reason" ]; then
 		stop_direct_child_bounded "$ffmpeg_pid" "$ffmpeg_start" || :
 	fi
@@ -1404,6 +2126,26 @@ cmd_worker() {
 	   [ -z "$failure_reason" ] &&
 	   { [ "$rc" -ne 0 ] || [ "$running_written" -eq 0 ]; }; then
 		failure_reason="$(ffmpeg_failure_reason "$log_file" "$rc")"
+	fi
+	if [ "$stopping" -eq 0 ] &&
+	   [ -z "$failure_reason" ] &&
+	   [ "$rc" -eq 0 ] &&
+	   [ "$running_written" -eq 1 ] &&
+	   load_audio_state "$token"; then
+		case "$AUDIO_STATE" in
+			starting|running)
+				if audio_sequence_bounds "$token"; then
+					last_audio="$dir/audio-$(printf '%08d' "$AUDIO_HIGHEST").pcm"
+					if audio_file_is_valid "$last_audio"; then
+						write_audio_state "$token" ended 2>/dev/null || :
+					else
+						write_audio_state "$token" unavailable 2>/dev/null || :
+					fi
+				else
+					write_audio_state "$token" unavailable 2>/dev/null || :
+				fi
+				;;
+		esac
 	fi
 	ffmpeg_pid=""
 	rm -f -- "$dir/ffmpeg" 2>/dev/null || :
@@ -1620,6 +2362,70 @@ cmd_reason() {
 	printf '%s\n' "$SESSION_REASON"
 }
 
+cmd_has_audio() {
+	local token="$1" now worker_pid worker_start audio_pid audio_start
+
+	valid_token "$token" || return 1
+	load_current || {
+		printf '0\n'
+		return 0
+	}
+	[ "$CURRENT_TOKEN" = "$token" ] || {
+		printf '0\n'
+		return 0
+	}
+	now="$(date +%s 2>/dev/null)" || now=""
+	if ! valid_decimal "$now" 12 || [ "$CURRENT_EXPIRY" -le "$now" ]; then
+		printf '0\n'
+		return 0
+	fi
+	load_audio_state "$token" || {
+		printf '0\n'
+		return 0
+	}
+	case "$AUDIO_STATE" in
+		starting|running)
+			if load_worker_identity "$token" worker; then
+				worker_pid="$WORKER_PID"
+				worker_start="$WORKER_START"
+			else
+				worker_pid=""
+				worker_start=""
+			fi
+			if load_worker_identity "$token" audio; then
+				audio_pid="$WORKER_PID"
+				audio_start="$WORKER_START"
+			else
+				audio_pid=""
+				audio_start=""
+			fi
+			if [ -n "$worker_pid" ] &&
+			   [ -n "$audio_pid" ] &&
+			   process_matches_worker \
+				"$worker_pid" "$worker_start" "$token" &&
+			   process_matches_ffmpeg_role \
+				"$audio_pid" "$audio_start" "$token" audio &&
+			   load_worker_identity "$token" chunker &&
+			   process_matches_chunker \
+				"$WORKER_PID" "$WORKER_START" "$token" \
+				"$worker_pid" "$worker_start"; then
+				printf '1\n'
+			else
+				printf '0\n'
+			fi
+			;;
+		ended)
+			if audio_published_high "$token"; then
+				printf '1\n'
+			else
+				printf '0\n'
+			fi
+			;;
+		*) printf '0\n' ;;
+	esac
+	return 0
+}
+
 http_error() {
 	local status="$1" message="$2"
 
@@ -1632,6 +2438,17 @@ http_error() {
 	if [ "${REQUEST_METHOD:-GET}" != "HEAD" ]; then
 		printf '%s\n' "$message"
 	fi
+	exit 0
+}
+
+http_no_content() {
+	printf 'Status: 204 No Content\r\n'
+	printf 'Content-Length: 0\r\n'
+	printf 'Cache-Control: no-store\r\n'
+	printf 'X-Content-Type-Options: nosniff\r\n'
+	printf 'Referrer-Policy: no-referrer\r\n'
+	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
+	printf '\r\n'
 	exit 0
 }
 
@@ -1666,6 +2483,33 @@ parse_frame_query() {
 		*) return 1 ;;
 	esac
 	valid_token "$CGI_TOKEN"
+}
+
+parse_audio_query() {
+	local query="$1" first second chunk
+
+	CGI_TOKEN=""
+	CGI_AUDIO_CHUNK=""
+	case "$query" in
+		token=*\&chunk=*)
+			first="${query%%&*}"
+			second="${query#*&}"
+			case "$second" in *'&'*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+	CGI_TOKEN="${first#token=}"
+	chunk="${second#chunk=}"
+	valid_token "$CGI_TOKEN" || return 1
+	case "$chunk" in
+		live) CGI_AUDIO_CHUNK="live" ;;
+		*)
+			CGI_AUDIO_CHUNK="$(
+				normalize_audio_sequence "$chunk" 2>/dev/null
+			)" || return 1
+			;;
+	esac
+	return 0
 }
 
 cmd_cgi() {
@@ -1744,7 +2588,7 @@ cmd_cgi() {
 	}
 
 	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
-		write_heartbeat "$CGI_TOKEN" "$now" || {
+		refresh_heartbeat "$CGI_TOKEN" "$now" || {
 			exec 7<&-
 			http_error "503 Service Unavailable" "Cannot refresh renderer lease"
 		}
@@ -1762,6 +2606,147 @@ cmd_cgi() {
 	printf '\r\n'
 	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
 		dd bs=65536 <&7 2>/dev/null
+	fi
+	exec 7<&-
+	exit 0
+}
+
+cmd_audio_cgi() {
+	local now dir path opened metadata kind size sequence state require_worker=0
+
+	case "${REQUEST_METHOD:-GET}" in
+		GET|HEAD) ;;
+		*)
+			printf 'Status: 405 Method Not Allowed\r\n'
+			printf 'Allow: GET, HEAD\r\n'
+			printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+			printf 'Method not allowed\n'
+			exit 0
+			;;
+	esac
+	parse_audio_query "${QUERY_STRING:-}" ||
+		http_error "400 Bad Request" "Invalid query"
+	get_enabled || http_error "403 Forbidden" "Local playback is disabled"
+	[ "$(get_render_mode)" = "router" ] ||
+		http_error "409 Conflict" "Router CPU rendering is not selected"
+	load_current || http_error "404 Not Found" "Renderer session not found"
+	[ "$CURRENT_TOKEN" = "$CGI_TOKEN" ] ||
+		http_error "404 Not Found" "Renderer session not found"
+	now="$(date +%s 2>/dev/null)" ||
+		http_error "503 Service Unavailable" "Clock unavailable"
+	valid_decimal "$now" 12 ||
+		http_error "503 Service Unavailable" "Clock unavailable"
+	[ "$CURRENT_EXPIRY" -gt "$now" ] ||
+		http_error "410 Gone" "Renderer session expired"
+	load_status "$CGI_TOKEN" ||
+		http_error "503 Service Unavailable" "Renderer state is invalid"
+	case "$SESSION_STATUS" in
+		starting|running) require_worker=1 ;;
+		ended) ;;
+		stopped) http_error "410 Gone" "Playback ended" ;;
+		error) http_error "503 Service Unavailable" "Renderer failed" ;;
+	esac
+	if [ "$require_worker" -eq 1 ] &&
+	   { ! load_worker_identity "$CGI_TOKEN" worker ||
+	     ! process_matches_worker "$WORKER_PID" "$WORKER_START" "$CGI_TOKEN"; }; then
+		http_error "503 Service Unavailable" "Renderer worker is not running"
+	fi
+	load_audio_state "$CGI_TOKEN" ||
+		http_error "409 Conflict" "Audio is unavailable"
+	state="$AUDIO_STATE"
+	case "$state" in
+		unavailable|error)
+			http_error "409 Conflict" "Audio is unavailable"
+			;;
+	esac
+	if ! audio_published_high "$CGI_TOKEN"; then
+		state="$AUDIO_STATE"
+		case "$state" in
+			starting|running)
+				http_error "202 Accepted" "Audio segment is not ready"
+				;;
+			*) http_error "410 Gone" "Audio playback ended" ;;
+		esac
+	fi
+	state="$AUDIO_STATE"
+	if [ "$CGI_AUDIO_CHUNK" = "live" ]; then
+		sequence="$AUDIO_PUBLISHED_HIGH"
+	else
+		sequence="$CGI_AUDIO_CHUNK"
+		if [ "$sequence" -lt "$AUDIO_LOWEST" ]; then
+			http_error "410 Gone" "Audio segment expired"
+		fi
+		if [ "$sequence" -gt "$AUDIO_PUBLISHED_HIGH" ]; then
+			case "$state" in
+				starting|running)
+					http_error "202 Accepted" "Audio segment is not ready"
+					;;
+				ended) http_no_content ;;
+				*) http_error "410 Gone" "Audio playback ended" ;;
+			esac
+		fi
+	fi
+
+	dir="$RUNTIME_DIR/s-$CGI_TOKEN"
+	path="$dir/audio-$(printf '%08d' "$sequence").pcm"
+	[ -z "${HTTP_RANGE:-}" ] ||
+		http_error "416 Range Not Satisfiable" "Range requests are not supported"
+	if [ ! -f "$path" ] || [ -L "$path" ]; then
+		http_error "410 Gone" "Audio segment is unavailable"
+	fi
+	exec 7< "$path" ||
+		http_error "503 Service Unavailable" "Cannot open audio segment"
+	opened="$(readlink -f -- /proc/self/fd/7 2>/dev/null)" || {
+		exec 7<&-
+		http_error "503 Service Unavailable" "Cannot verify audio segment"
+	}
+	case "$opened" in
+		"$path"|"$path (deleted)") ;;
+		*)
+			exec 7<&-
+			http_error "503 Service Unavailable" "Cannot verify audio segment"
+			;;
+	esac
+	metadata="$(stat -L -c '%F:%s:%u:%a' -- /proc/self/fd/7 2>/dev/null)" || {
+		exec 7<&-
+		http_error "503 Service Unavailable" "Cannot inspect audio segment"
+	}
+	kind="${metadata%%:*}"
+	metadata="${metadata#*:}"
+	size="${metadata%%:*}"
+	metadata="${metadata#*:}"
+	if [ "$kind" != "regular file" ] ||
+	   ! valid_decimal "$size" 10 ||
+	   [ "$size" -ne "$MAX_AUDIO_BYTES" ] ||
+	   [ "$metadata" != "0:600" ]; then
+		exec 7<&-
+		http_error "503 Service Unavailable" "Invalid audio segment"
+	fi
+	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
+		refresh_heartbeat "$CGI_TOKEN" "$now" || {
+			exec 7<&-
+			http_error "503 Service Unavailable" "Cannot refresh renderer lease"
+		}
+	fi
+
+	printf 'Status: 200 OK\r\n'
+	printf 'Content-Type: application/octet-stream\r\n'
+	printf 'Content-Length: %s\r\n' "$size"
+	printf 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n'
+	printf 'Pragma: no-cache\r\n'
+	printf 'Expires: 0\r\n'
+	printf 'Accept-Ranges: none\r\n'
+	printf 'X-Content-Type-Options: nosniff\r\n'
+	printf 'Referrer-Policy: no-referrer\r\n'
+	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
+	printf 'X-Videoplayer-Audio-Format: s16le\r\n'
+	printf 'X-Videoplayer-Audio-Sequence: %s\r\n' "$sequence"
+	printf 'X-Videoplayer-Audio-Sample-Rate: %s\r\n' "$AUDIO_SAMPLE_RATE"
+	printf 'X-Videoplayer-Audio-Channels: %s\r\n' "$AUDIO_CHANNELS"
+	printf 'X-Videoplayer-Audio-Frames: %s\r\n' "$AUDIO_FRAMES_PER_CHUNK"
+	printf '\r\n'
+	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
+		dd bs="$MAX_AUDIO_BYTES" count=1 <&7 2>/dev/null
 	fi
 	exec 7<&-
 	exit 0
@@ -1798,13 +2783,25 @@ case "${1:-}" in
 		[ "$#" -eq 2 ] || exit 2
 		cmd_reason "$2"
 		;;
+	has-audio)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_has_audio "$2"
+		;;
 	worker)
 		[ "$#" -eq 2 ] || exit 2
 		cmd_worker "$2"
 		;;
+	audio-chunker)
+		[ "$#" -eq 4 ] || exit 2
+		cmd_audio_chunker "$2" "$3" "$4"
+		;;
 	cgi)
 		[ "$#" -eq 1 ] || exit 2
 		cmd_cgi
+		;;
+	cgi-audio)
+		[ "$#" -eq 1 ] || exit 2
+		cmd_audio_cgi
 		;;
 	cleanup)
 		[ "$#" -eq 1 ] || exit 2

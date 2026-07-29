@@ -30,7 +30,7 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DEFAULT_DIST = ROOT / "dist"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.1.0"
+PKG_VERSION = "1.2.0"
 PKG_DESC = "LuCI video player with browser and router CPU rendering"
 PKG_LICENSE = "GPL-2.0-or-later"
 PKG_MAINTAINER = "openwrt-video-player contributors"
@@ -55,6 +55,7 @@ REQUIRED_PACKAGE_FILES = {
     "usr/share/rpcd/acl.d/luci-app-videoplayer.json",
     "www/cgi-bin/videoplayer-stream",
     "www/cgi-bin/videoplayer-frame",
+    "www/cgi-bin/videoplayer-audio",
     "www/luci-static/resources/view/videoplayer/main.js",
 }
 
@@ -300,6 +301,7 @@ def collect_files() -> list[tuple[str, Path, int]]:
             if path.name in (
                 "videoplayer-stream",
                 "videoplayer-frame",
+                "videoplayer-audio",
                 "videoplayer-renderer",
                 "luci.videoplayer",
             ) or "uci-defaults" in install:
@@ -314,6 +316,7 @@ def collect_files() -> list[tuple[str, Path, int]]:
             (
                 "videoplayer-stream",
                 "videoplayer-frame",
+                "videoplayer-audio",
                 "videoplayer-renderer",
                 "luci.videoplayer",
             )
@@ -361,6 +364,7 @@ default_postinst
 	chmod 0755 \
 		/www/cgi-bin/videoplayer-stream \
 		/www/cgi-bin/videoplayer-frame \
+		/www/cgi-bin/videoplayer-audio \
 		/usr/libexec/rpcd/luci.videoplayer \
 		/usr/libexec/videoplayer-renderer 2>/dev/null || true
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true

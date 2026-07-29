@@ -7,5 +7,7 @@ config videoplayer 'main'
 	option allow_remote '1'
 	# Local playback mode: browser or router
 	option render_mode 'browser'
+	# Router CPU renderer output frame rate: 5, 8, or 12 FPS
+	option router_fps '8'
 	# Max depth when browsing local folders
 	option max_depth '8'

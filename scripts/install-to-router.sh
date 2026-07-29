@@ -98,6 +98,7 @@ rm -f \
 	/www/luci-static/resources/view/videoplayer/main.js \
 	/www/cgi-bin/videoplayer-stream \
 	/www/cgi-bin/videoplayer-frame \
+	/www/cgi-bin/videoplayer-audio \
 	/usr/libexec/rpcd/luci.videoplayer \
 	/usr/libexec/videoplayer-renderer \
 	/usr/share/luci/menu.d/luci-app-videoplayer.json \
@@ -145,6 +146,7 @@ for source_file in \
 	"$PKG/usr/libexec/videoplayer-renderer" \
 	"$PKG/www/cgi-bin/videoplayer-stream" \
 	"$PKG/www/cgi-bin/videoplayer-frame" \
+	"$PKG/www/cgi-bin/videoplayer-audio" \
 	"$HTDOCS/luci-static/resources/view/videoplayer/main.js"
 do
 	if [ ! -f "$source_file" ]; then
@@ -277,6 +279,8 @@ scp_openwrt "$PKG/www/cgi-bin/videoplayer-stream" \
 	"$TARGET:$REMOTE_STAGE/stream-cgi"
 scp_openwrt "$PKG/www/cgi-bin/videoplayer-frame" \
 	"$TARGET:$REMOTE_STAGE/frame-cgi"
+scp_openwrt "$PKG/www/cgi-bin/videoplayer-audio" \
+	"$TARGET:$REMOTE_STAGE/audio-cgi"
 scp_openwrt "$HTDOCS/luci-static/resources/view/videoplayer/main.js" \
 	"$TARGET:$REMOTE_STAGE/main.js"
 
@@ -325,6 +329,7 @@ install_staged rpcd-backend /usr/libexec/rpcd/luci.videoplayer 0755
 install_staged renderer /usr/libexec/videoplayer-renderer 0755
 install_staged stream-cgi /www/cgi-bin/videoplayer-stream 0755
 install_staged frame-cgi /www/cgi-bin/videoplayer-frame 0755
+install_staged audio-cgi /www/cgi-bin/videoplayer-audio 0755
 install_staged main.js /www/luci-static/resources/view/videoplayer/main.js 0644
 
 # Add only missing UCI values; this never creates the media directory.

@@ -6,4 +6,6 @@ config videoplayer 'main'
 	option media_path '/mnt/sda1/videos'
 	option allow_remote '1'
 	option render_mode 'browser'
+	# Router CPU renderer output frame rate: 5, 8, or 12 FPS
+	option router_fps '8'
 	option max_depth '8'

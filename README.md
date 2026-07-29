@@ -2,11 +2,11 @@
 
 A joke but functional video player for **OpenWrt**, integrated into **LuCI**.
 Local videos can either be decoded normally by the client browser or decoded
-and converted into a low-frame-rate JPEG preview by the router CPU with
-FFmpeg. In both cases, the output stays inside the LuCI web interface. The
+by the router CPU with FFmpeg and delivered as JPEG frames plus PCM audio
+chunks. In both cases, playback stays inside the LuCI web interface. The
 application does not use HDMI or a framebuffer.
 
-Current source package version: **1.1.0**. The latest published GitHub release
+Current source package version: **1.2.0**. The latest published GitHub release
 is still **1.0.0**. The release installer below remains pinned to that release,
 while a separate APK-only installer follows the latest successfully tested
 `main` source.
@@ -16,7 +16,7 @@ while a separate APK-only installer follows the latest successfully tested
 | Mode | How it works |
 |---|---|
 | Browser decoding | Browse local storage and stream the original file to the HTML5 `<video>` element with HTTP Range support |
-| Router CPU rendering | FFmpeg decodes a local file on the router and publishes an experimental silent JPEG preview at up to 3 FPS |
+| Router CPU rendering | FFmpeg decodes a local file on the router and publishes JPEG frames at a selectable 5, 8, or 12 FPS plus PCM audio for the browser Web Audio API |
 | Remote URLs | Play `http://` and `https://` URLs directly in the browser; remote URLs are never fetched by FFmpeg on the router |
 | Interface | **Services → Video Player** page in LuCI |
 
@@ -42,8 +42,9 @@ luci.videoplayer ── authenticated list / resolve / renderer control
     ├── Browser mode ── /cgi-bin/videoplayer-stream?token=…
     │                    └── original file with HTTP Range (206)
     │
-    └── Router mode ─── FFmpeg worker ── atomic JPEG in /tmp
-                         └── /cgi-bin/videoplayer-frame?token=…
+    └── Router mode ─── FFmpeg workers ── JPEG frames + PCM chunks in /tmp
+                         ├── /cgi-bin/videoplayer-frame?token=…
+                         └── /cgi-bin/videoplayer-audio?token=…&chunk=…
 
 UCI videoplayer.main.media_path ── root of the accessible media library
 ```
@@ -60,13 +61,14 @@ and lookup cost from growing without bound. If a random collision selects a
 slot containing an unexpired token, the backend chooses another slot instead
 of overwriting it.
 
-Router CPU mode has a separate single-session runtime. Only one FFmpeg worker
-may run at a time, and selecting another local video replaces the previous
-session. Each session uses its own random token directory under `/tmp`; frames
-are written with FFmpeg's atomic image update mode. The UI renews a short
-heartbeat while it is receiving frames. Closing the page or losing the client
-stops CPU work after the heartbeat timeout, and every session also has an
-absolute expiry.
+Router CPU mode has a separate single-session runtime. Only one CPU-rendering
+session may run at a time, and selecting another local video replaces the
+previous session. Each session uses its own random token directory under
+`/tmp`; video frames are written with FFmpeg's atomic image update mode and
+audio is divided into bounded raw PCM chunks. The UI renews a short heartbeat
+while it is receiving media. Closing the page or losing the client stops CPU
+work after the heartbeat timeout, and every session also has an absolute
+expiry.
 
 ## Requirements
 
@@ -80,8 +82,10 @@ FFmpeg is large for router software. Depending on architecture and repository
 configuration, `libffmpeg-full` alone may consume roughly 14–23 MiB after
 installation, before its other dependencies. Router CPU mode also requires an
 FFmpeg build containing the native MJPEG encoder, the `image2` muxer, and the
-`fps`, `scale`, and `format` filters. The UI checks these capabilities before
-enabling a CPU-rendered session.
+`fps`, `scale`, and `format` filters. Audio additionally requires the
+`pcm_s16le` encoder, the `s16le` muxer, and the `aresample`, `aformat`, and
+`asetnsamples` filters. The UI checks these capabilities before enabling the
+corresponding CPU-rendered output.
 
 Despite its name, the official OpenWrt `libffmpeg-full` package is built
 without H.264, HEVC, and VC-1 decoders when OpenWrt's global
@@ -170,7 +174,7 @@ router must have working HTTPS access to GitHub:
 ```
 
 The installer currently installs the latest published release, not the newer
-1.1.0 source tree. It detects whether the router uses `apk` or `opkg`,
+1.2.0 source tree. It detects whether the router uses `apk` or `opkg`,
 downloads the matching 1.0.0 package from
 [Release 1.0.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.0.0),
 verifies its pinned SHA-256 checksum, attempts to refresh the package indexes,
@@ -209,15 +213,17 @@ checked or if any verification fails. This path supports only `apk`; use the
 published-release installer above on OpenWrt versions that still use `opkg`.
 OpenWrt 25.12.1 and newer can force a reinstall when two snapshots share the
 same package version. On 25.12.0, the first installation works, but an existing
-copy must be removed manually before installing another same-version snapshot.
+copy must be removed manually before installing any newer build, including a
+genuine version upgrade.
 
 ### Optional Codec Runtime for OpenWrt 25.12.5 `mediatek/filogic`
 
 The first private codec-runtime build targets the exact system reported by an
 ASUS RT-AX52 running OpenWrt `25.12.5` revision
 `r33051-f5dae5ece4`, target `mediatek/filogic`, and package architecture
-`aarch64_cortex-a53`. It is an APK-only package. Do not try to install it on a
-different OpenWrt release, revision, target, or architecture.
+`aarch64_cortex-a53`. The current generated companion package version is
+**6.1.4-r2**. It is an APK-only package. Do not try to install it on a different
+OpenWrt release, revision, target, or architecture.
 
 Install the current `main` APK first, select **Router CPU rendering** in LuCI,
 and then run:
@@ -244,7 +250,7 @@ downloading anything. It resolves the generated `codec-snapshot` branch to an
 immutable commit, verifies the package SHA-256 checksum, installs the unsigned
 APK with `apk --allow-untrusted`, and confirms that the private runtime exposes
 the native H.264, HEVC, and VC-1 decoders plus every component required by the
-JPEG renderer.
+JPEG and PCM renderers.
 
 The runtime is built from the official OpenWrt 25.12.5
 `mediatek/filogic` SDK with `CONFIG_BUILD_PATENTED=y`. Its native FFmpeg
@@ -280,8 +286,8 @@ The resulting files are written to `dist/`:
 
 | File | Package manager | OpenWrt |
 |---|---|---|
-| `luci-app-videoplayer-1.1.0.apk` | `apk` | 25.12+ / snapshots |
-| `luci-app-videoplayer_1.1.0_all.ipk` | `opkg` | 24.10 and compatible releases that use `opkg` |
+| `luci-app-videoplayer-1.2.0.apk` | `apk` | 25.12+ / snapshots |
+| `luci-app-videoplayer_1.2.0_all.ipk` | `opkg` | 24.10 and compatible releases that use `opkg` |
 
 The IPK uses the gzip-compressed GNU tar format expected by OpenWrt 24.10.
 `Installed-Size` is calculated in the same way as by the standard
@@ -297,17 +303,17 @@ package in the format expected by the selected OpenWrt release.
 OpenWrt 25.12+:
 
 ```sh
-scp -O dist/luci-app-videoplayer-1.1.0.apk root@192.168.1.1:/tmp/
+scp -O dist/luci-app-videoplayer-1.2.0.apk root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-apk add --allow-untrusted /tmp/luci-app-videoplayer-1.1.0.apk
+apk add --allow-untrusted /tmp/luci-app-videoplayer-1.2.0.apk
 ```
 
 OpenWrt 24.10 (`opkg`):
 
 ```sh
-scp -O dist/luci-app-videoplayer_1.1.0_all.ipk root@192.168.1.1:/tmp/
+scp -O dist/luci-app-videoplayer_1.2.0_all.ipk root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-opkg install /tmp/luci-app-videoplayer_1.1.0_all.ipk
+opkg install /tmp/luci-app-videoplayer_1.2.0_all.ipk
 ```
 
 If your `scp` implementation does not support `-O`, omit that option. After
@@ -315,7 +321,7 @@ installation, sign out of LuCI and sign in again if the new menu item does not
 appear.
 
 Package managers may consider an older build with a release suffix newer than
-this suffix-free `1.1.0` build. When replacing such an installation, explicitly
+this suffix-free `1.2.0` build. When replacing such an installation, explicitly
 allow a downgrade or remove the old package before installing this one.
 
 Direct URL:
@@ -365,6 +371,7 @@ config videoplayer 'main'
 	option media_path '/mnt/video'
 	option allow_remote '1'
 	option render_mode 'browser'
+	option router_fps '8'
 	option max_depth '8'
 ```
 
@@ -374,6 +381,7 @@ config videoplayer 'main'
 | `media_path` | Root directory of the local media library |
 | `allow_remote` | Show the remote URL field in the interface |
 | `render_mode` | Local playback mode: `browser` or `router`; unknown values safely fall back to `browser` |
+| `router_fps` | Router CPU output frame rate: `5`, `8` (default), or `12`; unknown values safely fall back to `8` |
 | `max_depth` | Maximum traversal depth for nested directories |
 
 The `uci-defaults` script is idempotent: it restores a missing section and adds
@@ -405,8 +413,16 @@ on the package manager and whether the file has been modified.
 
 - This is a web interface, not a hardware HDMI player.
 - Browser mode codec support depends on the client browser.
-- Router CPU mode is an experimental silent preview capped at 640×360 and
-  approximately 3 FPS. It has no audio, pause, seeking, duration, or timeline.
+- Router CPU mode is experimental and capped at 640×360. Its frame rate is
+  selectable at 5, 8, or 12 FPS; 8 FPS is the default, while 12 FPS places the
+  greatest load on the router.
+- Router CPU audio uses signed 16-bit stereo PCM chunks at 48 kHz and the
+  browser Web Audio API. Playback must be started by a user action because of
+  browser autoplay policies. Media without a usable audio stream remains
+  silent, and browsers without Web Audio support continue with video only.
+- Router CPU mode has no pause, seeking, duration, or timeline. Its independently
+  delivered JPEG frames and audio chunks provide approximate synchronization,
+  so slow routers or networks may introduce stutter, gaps, or audio/video drift.
 - If router-side FFmpeg cannot start for a local file, the UI reports the
   classified failure and automatically retries that file with browser
   decoding. Automatic browser fallback starts muted; audio can be enabled with
@@ -443,21 +459,22 @@ exact payload contents. The builder also rejects metadata drift against the
 verifier and checks its version, release suffix, and dependencies against the
 OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
 exercises browser extension filtering and extensionless CPU media discovery,
-exercises successful renderer lifecycle, modern and legacy missing-decoder
+exercises successful renderer and PCM-audio lifecycle, validates browser PCM
+conversion, queueing, and cleanup, checks modern and legacy missing-decoder
 diagnostics, unusable V4L2 hardware decoders, bounded noisy logs, and unknown
-FFmpeg failures with an isolated fake process, and builds and verifies both
-packages. After those checks pass on `main`, a separate job with narrowly
-scoped repository write access rebuilds the APK and updates the generated
-`snapshot` branch. It never uploads files to a router or changes GitHub
-Releases.
+FFmpeg failures with isolated fake processes, and builds and verifies both
+packages. After those checks pass on `main`, a separate job
+with narrowly scoped repository write access rebuilds the APK and updates the
+generated `snapshot` branch. It never uploads files to a router or changes
+GitHub Releases.
 
 The separate codec-runtime workflow downloads the checksum-pinned official
 OpenWrt SDK, pins the release's packages-feed commit, applies that feed's
 FFmpeg patches, cross-compiles the private AArch64 executable, verifies that
 its only dynamic dependency is the target `libc`, checks its codec and renderer
-feature lists under emulation, and decodes an H.264 sample to JPEG. Only that
-validated architecture-specific APK is published to the generated
-`codec-snapshot` branch.
+feature lists under emulation, decodes an H.264 sample to JPEG, and validates
+the PCM audio path. Only that validated architecture-specific APK is published
+to the generated `codec-snapshot` branch.
 
 ## Repository Structure
 
@@ -474,7 +491,8 @@ openwrt-video-player/
 │   └── package/
 ├── tests/
 │   ├── local-listing.sh
-│   └── renderer-behavior.sh
+│   ├── renderer-behavior.sh
+│   └── web-audio.js
 ├── scripts/
 │   ├── build-packages.py
 │   ├── install-codec-runtime.sh
@@ -493,7 +511,8 @@ openwrt-video-player/
         ├── usr/share/luci/menu.d/…
         ├── usr/share/rpcd/acl.d/…
         ├── www/cgi-bin/videoplayer-stream
-        └── www/cgi-bin/videoplayer-frame
+        ├── www/cgi-bin/videoplayer-frame
+        └── www/cgi-bin/videoplayer-audio
 ```
 
 ## License

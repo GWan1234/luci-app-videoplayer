@@ -23,6 +23,7 @@ ensure_option enabled 1
 ensure_option media_path /mnt/video
 ensure_option allow_remote 1
 ensure_option render_mode browser
+ensure_option router_fps 8
 ensure_option max_depth 8
 
 [ "$changed" -eq 0 ] || uci commit videoplayer
@@ -82,6 +83,7 @@ cleanup_token_store() (
 chmod 0755 \
 	/www/cgi-bin/videoplayer-stream \
 	/www/cgi-bin/videoplayer-frame \
+	/www/cgi-bin/videoplayer-audio \
 	/usr/libexec/rpcd/luci.videoplayer \
 	/usr/libexec/videoplayer-renderer 2>/dev/null || true
 

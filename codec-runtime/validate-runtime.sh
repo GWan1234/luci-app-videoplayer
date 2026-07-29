@@ -61,7 +61,8 @@ for option in \
 	--enable-static \
 	--disable-autodetect \
 	--disable-network \
-	--disable-avdevice
+	--disable-avdevice \
+	--enable-swresample
 do
 	grep -F -- "$option" "$version" >/dev/null ||
 		die "FFmpeg configuration is missing $option"
@@ -91,21 +92,28 @@ has_component() {
 	' "$1"
 }
 
-for decoder in h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg
+for decoder in \
+	h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg \
+	aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis
 do
 	has_component "$decoders" "$decoder" ||
 		die "native decoder is missing: $decoder"
 done
 has_component "$encoders" mjpeg ||
 	die "MJPEG encoder is missing"
+has_component "$encoders" pcm_s16le ||
+	die "PCM S16LE encoder is missing"
 for demuxer in mov matroska avi mpegts
 do
 	has_component "$demuxers" "$demuxer" ||
 		die "demuxer is missing: $demuxer"
 done
-has_component "$muxers" image2 ||
-	die "image2 muxer is missing"
-for filter in fps scale format
+for muxer in image2 s16le
+do
+	has_component "$muxers" "$muxer" ||
+		die "muxer is missing: $muxer"
+done
+for filter in fps scale format aresample aformat asetnsamples
 do
 	has_component "$filters" "$filter" ||
 		die "filter is missing: $filter"
@@ -117,10 +125,16 @@ fi
 
 sample="$work/h264-sample.mp4"
 frame="$work/frame.jpg"
+audio_pcm="$work/audio.pcm"
+[ ! -e "$audio_pcm" ] ||
+	die "audio smoke-test output already exists: $audio_pcm"
 ffmpeg \
 	-hide_banner -loglevel error -y \
 	-f lavfi -i "testsrc=size=160x90:rate=5:duration=1" \
-	-c:v libx264 -pix_fmt yuv420p -an "$sample"
+	-f lavfi -i "sine=frequency=1000:sample_rate=44100:duration=1" \
+	-map 0:v:0 -map 1:a:0 \
+	-c:v libx264 -pix_fmt yuv420p \
+	-c:a aac -b:a 96k -shortest "$sample"
 
 (
 	exec 3< "$sample"
@@ -140,5 +154,26 @@ ffmpeg \
 magic="$(od -An -tx1 -N2 "$frame" | tr -d ' \n')"
 [ "$magic" = "ffd8" ] ||
 	die "smoke-test output is not a JPEG file"
+
+(
+	exec 3< "$sample"
+	run_target \
+		-y -hide_banner -loglevel error -nostats -nostdin \
+		-protocol_whitelist file,pipe -threads 1 \
+		-fflags +genpts -err_detect ignore_err \
+		-i /proc/self/fd/3 -map 0:a:0 -vn -sn -dn -map_metadata -1 \
+		-filter_threads 1 \
+		-af "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,asetnsamples=n=12000:p=1" \
+		-c:a pcm_s16le \
+		-f s16le "$audio_pcm"
+)
+
+[ -s "$audio_pcm" ] ||
+	die "AAC-to-PCM smoke test produced no audio"
+audio_size="$(wc -c < "$audio_pcm" | tr -d '[:space:]')"
+[ "$audio_size" -ge 192000 ] ||
+	die "AAC-to-PCM smoke test produced only $audio_size bytes"
+[ $((audio_size % 48000)) -eq 0 ] ||
+	die "PCM smoke-test size is not an exact number of 48,000-byte chunks"
 
 printf '%s\n' "Private codec runtime validation passed."

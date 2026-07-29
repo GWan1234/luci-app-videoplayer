@@ -56,15 +56,18 @@ jobs:
           shellcheck -s bash tests/local-listing.sh
           bash -n tests/renderer-behavior.sh
           shellcheck -s bash tests/renderer-behavior.sh
+          node --check tests/web-audio.js
           sh -n luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer
           sh -n luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer
           sh -n luci-app-videoplayer/root/usr/libexec/videoplayer-renderer
           sh -n luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream
           sh -n luci-app-videoplayer/root/www/cgi-bin/videoplayer-frame
+          sh -n luci-app-videoplayer/root/www/cgi-bin/videoplayer-audio
           shellcheck -s sh scripts/install-to-router.sh
           shellcheck -s sh -e SC3043 \
             luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer \
-            luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream
+            luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream \
+            luci-app-videoplayer/root/www/cgi-bin/videoplayer-audio
           shellcheck -s sh -e SC1091,SC3043 \
             luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer
           shellcheck -s sh -e SC3043,SC2329 \
@@ -75,7 +78,7 @@ jobs:
             'PACKAGE_NAME="luci-videoplayer-codec-runtime"' \
             scripts/install-codec-runtime.sh
           grep -Fx \
-            'PACKAGE_FILE="luci-videoplayer-codec-runtime-6.1.4-r1.apk"' \
+            'PACKAGE_FILE="luci-videoplayer-codec-runtime-6.1.4-r2.apk"' \
             scripts/install-codec-runtime.sh
           grep -Fx \
             'ARTIFACT_DIRECTORY="targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53"' \
@@ -90,7 +93,7 @@ jobs:
             '          SNAPSHOT_BRANCH: codec-snapshot' \
             .github/workflows/codec-runtime.yml
           grep -Fx \
-            '  CODEC_APK: luci-videoplayer-codec-runtime-6.1.4-r1.apk' \
+            '  CODEC_APK: luci-videoplayer-codec-runtime-6.1.4-r2.apk' \
             .github/workflows/codec-runtime.yml
           grep -Fx \
             '  CODEC_ARTIFACT_DIR: targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53' \
@@ -101,6 +104,10 @@ jobs:
             printf '%s\n' '})();'
           } > /tmp/videoplayer-main-wrapped.js
           node --check /tmp/videoplayer-main-wrapped.js
+
+      - name: Exercise browser PCM scheduling
+        shell: bash
+        run: node tests/web-audio.js
 
       - name: Exercise local media listing
         shell: bash

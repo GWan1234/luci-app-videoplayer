@@ -207,6 +207,24 @@ get_render_mode() {
 	esac
 }
 
+get_router_fps() {
+	local value
+
+	value="$(uci -q get videoplayer.main.router_fps 2>/dev/null)" || value=""
+	case "$value" in
+		5|8|12) printf '%s\n' "$value" ;;
+		*) printf '8\n' ;;
+	esac
+}
+
+frame_interval_for_fps() {
+	case "$1" in
+		5) printf '200\n' ;;
+		12) printf '83\n' ;;
+		*) printf '125\n' ;;
+	esac
+}
+
 is_allowed_ext() {
 	local name="$1" base ext
 
@@ -605,7 +623,7 @@ normalize_list_args() {
 
 cmd_get_status() {
 	local configured root valid=0 enabled allow_remote exists=0 readable=0
-	local render_mode renderer_available=0 renderer_reason
+	local render_mode router_fps renderer_available=0 renderer_reason
 
 	configured="$(get_configured_media_path)"
 	root="$(canonicalize_media_root "$configured" 2>/dev/null)" && valid=1
@@ -613,6 +631,7 @@ cmd_get_status() {
 	allow_remote="$(uci -q get videoplayer.main.allow_remote 2>/dev/null)" || allow_remote=""
 	[ -n "$allow_remote" ] || allow_remote="1"
 	render_mode="$(get_render_mode)"
+	router_fps="$(get_router_fps)"
 	if [ -x "$RENDERER_HELPER" ]; then
 		if renderer_reason="$("$RENDERER_HELPER" probe 2>/dev/null)"; then
 			renderer_available=1
@@ -634,6 +653,7 @@ cmd_get_status() {
 	json_add_boolean "enabled" "$enabled"
 	json_add_boolean "allow_remote" "$([ "$allow_remote" = "1" ] && printf 1 || printf 0)"
 	json_add_string "render_mode" "$render_mode"
+	json_add_int "router_fps" "$router_fps"
 	json_add_boolean "renderer_available" "$renderer_available"
 	if [ "$renderer_available" -eq 0 ]; then
 		json_add_string "renderer_reason" "$renderer_reason"
@@ -879,6 +899,7 @@ cmd_resolve() {
 	local raw="$1" requested_mode="${2:-browser}"
 	local rel root path canonical_rel parent depth max_depth token name mime
 	local render_mode renderer_message renderer_result
+	local has_audio=0 router_fps frame_interval
 
 	[ "$(get_enabled)" = "1" ] || {
 		json_error "video player disabled"
@@ -972,6 +993,9 @@ cmd_resolve() {
 			json_error "$renderer_message"
 			return
 		fi
+		if [ "$("$RENDERER_HELPER" has-audio "$token" 2>/dev/null)" = "1" ]; then
+			has_audio=1
+		fi
 	else
 		token="$(create_token "$path")" || {
 			json_error "cannot create stream token"
@@ -985,13 +1009,23 @@ cmd_resolve() {
 	json_add_int "size" "$FILE_SIZE"
 	json_add_string "render_mode" "$render_mode"
 	if [ "$render_mode" = "router" ]; then
+		router_fps="$(get_router_fps)"
+		frame_interval="$(frame_interval_for_fps "$router_fps")"
 		json_add_string "stream_url" "/cgi-bin/videoplayer-frame?token=$token"
 		json_add_string "stream_type" "jpeg-frames"
 		json_add_string "session_token" "$token"
 		json_add_string "mime" "image/jpeg"
-		json_add_boolean "has_audio" 0
+		json_add_boolean "has_audio" "$has_audio"
+		if [ "$has_audio" -eq 1 ]; then
+			json_add_string "audio_url" "/cgi-bin/videoplayer-audio?token=$token"
+			json_add_string "audio_type" "pcm-s16le-chunks"
+			json_add_int "audio_sample_rate" 48000
+			json_add_int "audio_channels" 2
+			json_add_int "audio_frames_per_chunk" 12000
+		fi
 		json_add_boolean "seekable" 0
-		json_add_int "frame_interval_ms" 333
+		json_add_int "router_fps" "$router_fps"
+		json_add_int "frame_interval_ms" "$frame_interval"
 	else
 		json_add_string "stream_url" "/cgi-bin/videoplayer-stream?token=$token"
 		json_add_string "stream_type" "html5-video"

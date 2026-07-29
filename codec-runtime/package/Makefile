@@ -8,7 +8,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ffmpeg
 PKG_VERSION:=6.1.4
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
 PKG_SOURCE_URL:=https://ffmpeg.org/releases/
@@ -71,8 +71,8 @@ define Build/Configure
 			--enable-avformat \
 			--enable-avfilter \
 			--enable-swscale \
+			--enable-swresample \
 			--disable-avdevice \
-			--disable-swresample \
 			--disable-postproc \
 			--disable-shared \
 			--enable-static \
@@ -107,6 +107,22 @@ define Build/Configure
 			--enable-decoder=h264 \
 			--enable-decoder=hevc \
 			--enable-decoder=vc1 \
+			--enable-decoder=aac \
+			--enable-decoder=ac3 \
+			--enable-decoder=eac3 \
+			--enable-decoder=alac \
+			--enable-decoder=dca \
+			--enable-decoder=flac \
+			--enable-decoder=mp3 \
+			--enable-decoder=opus \
+			--enable-decoder=pcm_s16le \
+			--enable-decoder=truehd \
+			--enable-decoder=vorbis \
+			--enable-encoder=pcm_s16le \
+			--enable-muxer=pcm_s16le \
+			--enable-filter=aresample \
+			--enable-filter=aformat \
+			--enable-filter=asetnsamples \
 	)
 endef
 

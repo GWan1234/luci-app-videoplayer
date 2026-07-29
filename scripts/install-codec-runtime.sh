@@ -21,7 +21,7 @@ REQUIRED_MACHINE_ARCH="aarch64"
 REQUIRED_APK_ARCH="aarch64"
 
 PACKAGE_NAME="luci-videoplayer-codec-runtime"
-PACKAGE_FILE="luci-videoplayer-codec-runtime-6.1.4-r1.apk"
+PACKAGE_FILE="luci-videoplayer-codec-runtime-6.1.4-r2.apk"
 ARTIFACT_DIRECTORY="targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53"
 ARTIFACT_PATH="$ARTIFACT_DIRECTORY/$PACKAGE_FILE"
 CHECKSUM_OBJECT="$ARTIFACT_PATH.sha256"
@@ -438,13 +438,29 @@ check_component "$DECODERS_REPORT" \
 	'^[[:space:]]*V[^[:space:]]*[[:space:]]+vc1([[:space:]]|$)' \
 	"the native vc1 video decoder" ||
 	COMPONENTS_OK="0"
+for AUDIO_DECODER in \
+	aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis
+do
+	check_component "$DECODERS_REPORT" \
+		"^[[:space:]]*A[^[:space:]]*[[:space:]]+$AUDIO_DECODER([[:space:]]|$)" \
+		"the native $AUDIO_DECODER audio decoder" ||
+		COMPONENTS_OK="0"
+done
 check_component "$ENCODERS_REPORT" \
 	'^[[:space:]]*V[^[:space:]]*[[:space:]]+mjpeg([[:space:]]|$)' \
 	"the mjpeg video encoder" ||
 	COMPONENTS_OK="0"
+check_component "$ENCODERS_REPORT" \
+	'^[[:space:]]*A[^[:space:]]*[[:space:]]+pcm_s16le([[:space:]]|$)' \
+	"the PCM S16LE audio encoder" ||
+	COMPONENTS_OK="0"
 check_component "$MUXERS_REPORT" \
 	'^[[:space:]]*E[[:space:]]+image2([[:space:]]|$)' \
 	"the image2 muxer" ||
+	COMPONENTS_OK="0"
+check_component "$MUXERS_REPORT" \
+	'^[[:space:]]*E[[:space:]]+s16le([[:space:]]|$)' \
+	"the raw S16LE muxer" ||
 	COMPONENTS_OK="0"
 check_component "$FILTERS_REPORT" \
 	'^[[:space:]]*[^[:space:]]+[[:space:]]+fps[[:space:]]' \
@@ -458,11 +474,25 @@ check_component "$FILTERS_REPORT" \
 	'^[[:space:]]*[^[:space:]]+[[:space:]]+format[[:space:]]' \
 	"the format video filter" ||
 	COMPONENTS_OK="0"
+check_component "$FILTERS_REPORT" \
+	'^[[:space:]]*[^[:space:]]+[[:space:]]+aresample[[:space:]]' \
+	"the audio resampling filter" ||
+	COMPONENTS_OK="0"
+check_component "$FILTERS_REPORT" \
+	'^[[:space:]]*[^[:space:]]+[[:space:]]+aformat[[:space:]]' \
+	"the audio format filter" ||
+	COMPONENTS_OK="0"
+check_component "$FILTERS_REPORT" \
+	'^[[:space:]]*[^[:space:]]+[[:space:]]+asetnsamples[[:space:]]' \
+	"the fixed audio sample-count filter" ||
+	COMPONENTS_OK="0"
 [ "$COMPONENTS_OK" = "1" ] ||
 	die "The installed private FFmpeg is incomplete."
 
 printf '%s\n' \
 	"Codec runtime installation complete." \
 	"Verified private FFmpeg: $PRIVATE_FFMPEG" \
-	"Verified decoders: h264, hevc, vc1" \
-	"Verified renderer pipeline: mjpeg, image2, fps, scale, format"
+	"Verified video decoders: h264, hevc, vc1" \
+	"Verified audio decoders: aac, ac3, eac3, alac, dca, flac, mp3, opus, pcm_s16le, truehd, vorbis" \
+	"Verified video pipeline: mjpeg, image2, fps, scale, format" \
+	"Verified audio pipeline: pcm_s16le, s16le, aresample, aformat, asetnsamples"

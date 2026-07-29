@@ -10,12 +10,12 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_VERSION:=1.1.0
-# Override luci.mk's default release so the package version stays exactly 1.1.0.
+PKG_VERSION:=1.2.0
+# Override luci.mk's default release so the package version stays exactly 1.2.0.
 PKG_RELEASE:=
 
 LUCI_TITLE:=LuCI Video Player (local + remote)
-LUCI_DESCRIPTION:=LuCI video player with browser playback and experimental router-CPU rendering for local media.
+LUCI_DESCRIPTION:=LuCI video player with browser playback and configurable router-CPU JPEG/PCM rendering for local media.
 LUCI_DEPENDS:=+luci-base +uhttpd +jshn +coreutils-stat +coreutils-timeout +ffmpeg
 LUCI_PKGARCH:=all
 LUCI_URL:=https://github.com/communism420/luci-app-videoplayer
@@ -27,7 +27,8 @@ PKG_FILE_MODES:=/etc/uci-defaults/80_luci-videoplayer:root:root:0755 \
 	/usr/libexec/rpcd/luci.videoplayer:root:root:0755 \
 	/usr/libexec/videoplayer-renderer:root:root:0755 \
 	/www/cgi-bin/videoplayer-stream:root:root:0755 \
-	/www/cgi-bin/videoplayer-frame:root:root:0755
+	/www/cgi-bin/videoplayer-frame:root:root:0755 \
+	/www/cgi-bin/videoplayer-audio:root:root:0755
 
 define Package/luci-app-videoplayer/conffiles
 /etc/config/videoplayer

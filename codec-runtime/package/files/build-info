@@ -1,4 +1,4 @@
-format=1
+format=2
 openwrt_release=25.12.5
 openwrt_revision=r33051-f5dae5ece4
 openwrt_target=mediatek/filogic
@@ -9,4 +9,10 @@ ffmpeg_version=6.1.4
 build_patented=y
 network_enabled=n
 avdevice_enabled=n
+swresample_enabled=y
+audio_output=pcm_s16le
+audio_sample_rate=48000
+audio_channels=2
+audio_chunk_frames=12000
+audio_chunk_bytes=48000
 private_binary=/usr/libexec/videoplayer-ffmpeg/ffmpeg

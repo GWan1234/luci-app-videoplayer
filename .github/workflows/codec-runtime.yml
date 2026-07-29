@@ -31,7 +31,7 @@ env:
   OPENWRT_REVISION: r33051-f5dae5ece4
   OPENWRT_TARGET: mediatek/filogic
   OPENWRT_ARCH: aarch64_cortex-a53
-  CODEC_APK: luci-videoplayer-codec-runtime-6.1.4-r1.apk
+  CODEC_APK: luci-videoplayer-codec-runtime-6.1.4-r2.apk
   CODEC_ARTIFACT_DIR: targets/openwrt-25.12.5-r33051-f5dae5ece4/mediatek-filogic/aarch64_cortex-a53
 
 jobs:
@@ -112,12 +112,13 @@ jobs:
           official_ffmpeg="feeds/packages/multimedia/ffmpeg/Makefile"
           for field in \
             'PKG_VERSION:=6.1.4' \
-            'PKG_RELEASE:=1' \
             'PKG_HASH:=a231e3d5742c44b1cdaebfb98ad7b6200d12763e0b6db9e1e2c5891f2c083a18'
           do
             grep -Fx "$field" "$official_ffmpeg"
             grep -Fx "$field" "$package_dir/Makefile"
           done
+          grep -Fx 'PKG_RELEASE:=1' "$official_ffmpeg"
+          grep -Fx 'PKG_RELEASE:=2' "$package_dir/Makefile"
 
           official_patches="feeds/packages/multimedia/ffmpeg/patches"
           [ -d "$official_patches" ]
@@ -198,7 +199,14 @@ jobs:
           grep -Fx "openwrt_arch=$OPENWRT_ARCH" "$build_info"
           grep -Fx "sdk_sha256=$SDK_SHA256" "$build_info"
           grep -Fx "packages_feed_commit=$PACKAGES_FEED_COMMIT" "$build_info"
+          grep -Fx 'format=2' "$build_info"
           grep -Fx 'build_patented=y' "$build_info"
+          grep -Fx 'swresample_enabled=y' "$build_info"
+          grep -Fx 'audio_output=pcm_s16le' "$build_info"
+          grep -Fx 'audio_sample_rate=48000' "$build_info"
+          grep -Fx 'audio_channels=2' "$build_info"
+          grep -Fx 'audio_chunk_frames=12000' "$build_info"
+          grep -Fx 'audio_chunk_bytes=48000' "$build_info"
 
           target_staging="$(find staging_dir -mindepth 1 -maxdepth 1 -type d \
             -name 'target-aarch64_cortex-a53_musl*' -print -quit)"
