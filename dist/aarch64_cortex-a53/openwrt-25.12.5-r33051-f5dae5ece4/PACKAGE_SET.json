@@ -11,5 +11,5 @@
   "openwrt_revision": "r33051-f5dae5ece4",
   "package_format": "apk",
   "schema_version": 1,
-  "source_commit": "6bea4b028abddb56c847682e827d62d6f0c70d9c"
+  "source_commit": "40de85dd826298215fa95cb9c43fcb30e6b957ac"
 }
