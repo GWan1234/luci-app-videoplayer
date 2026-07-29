@@ -322,10 +322,12 @@ jobs:
           sysroot="$(find "$target_staging" -mindepth 1 -maxdepth 1 \
             -type d -name 'root-*' -print -quit)"
           [ -n "$sysroot" ] && [ -d "$sysroot/lib" ]
-          config_h="$(find build_dir -type f -path '*/ffmpeg-*/config.h' \
+          config_h="$(find build_dir -type f \
+            -path '*/.pkgdir/.videoplayer-validation/config.h' \
             -print -quit)"
           component_config="$(find build_dir -type f \
-            -path '*/ffmpeg-*/config_components.h' -print -quit)"
+            -path '*/.pkgdir/.videoplayer-validation/config_components.h' \
+            -print -quit)"
           [ -n "$config_h" ] && [ -n "$component_config" ]
           if [[ "$VALIDATION_MODE" == qemu ]]; then
             command -v "$QEMU_EXECUTABLE"

@@ -46,6 +46,9 @@ PKG_LICENSE_FILES:=COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3
 PKG_CPE_ID:=cpe:/a:ffmpeg:ffmpeg
 
 PKG_BUILD_PARALLEL:=1
+# FFmpeg's native H.264 CABAC inline assembly cannot be compiled as MIPS16.
+# OpenWrt's package flag removes -mips16 only on targets that enable it.
+PKG_BUILD_FLAGS:=no-mips16
 PKG_CONFIG_DEPENDS:=CONFIG_BUILD_PATENTED
 
 include $(INCLUDE_DIR)/package.mk
@@ -122,8 +125,8 @@ define Build/Configure
 			--prefix="/usr" \
 			--bindir="/usr/libexec/videoplayer-ffmpeg" \
 			--pkg-config=false \
-			--extra-ldflags="-static-libgcc" \
-			--extra-libs="-Wl,-Bstatic -latomic -Wl,-Bdynamic" \
+			--extra-ldflags="-static-libgcc -Wl,-Bstatic" \
+			--extra-libs="-latomic -Wl,-Bdynamic" \
 			--enable-ffmpeg \
 			--disable-ffplay \
 			--disable-ffprobe \
@@ -190,6 +193,10 @@ endef
 
 define Build/Compile
 	+$(MAKE) $(PKG_JOBS) -C $(PKG_BUILD_DIR) ffmpeg
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)/.pkgdir/.videoplayer-validation
+	$(CP) $(PKG_BUILD_DIR)/config.h \
+		$(PKG_BUILD_DIR)/config_components.h \
+		$(PKG_BUILD_DIR)/.pkgdir/.videoplayer-validation/
 endef
 
 define Package/luci-videoplayer-codec-runtime/install
