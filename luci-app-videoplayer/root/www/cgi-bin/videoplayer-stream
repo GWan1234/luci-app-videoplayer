@@ -416,8 +416,10 @@ else
 	canonical="$1"
 	source_fd="$2"
 	source_identity="$3"
-	[ -n "$canonical" ] && [ "${#canonical}" -le "$MAX_PATH_LENGTH" ] ||
+	if [ -z "$canonical" ] ||
+	   [ "${#canonical}" -gt "$MAX_PATH_LENGTH" ]; then
 		http_err "403 Forbidden" "Invalid renderer source"
+	fi
 	string_has_control "$canonical" &&
 		http_err "403 Forbidden" "Invalid renderer source"
 	case "$canonical" in
@@ -438,8 +440,9 @@ else
 			http_err "403 Forbidden" "Invalid renderer source descriptor"
 			;;
 	esac
-	[ "${#source_pid}" -le 10 ] && [ "$source_pid" -gt 1 ] ||
+	if [ "${#source_pid}" -gt 10 ] || [ "$source_pid" -le 1 ]; then
 		http_err "403 Forbidden" "Invalid renderer source descriptor"
+	fi
 	identity_device="${source_identity%%:*}"
 	identity_tail="${source_identity#*:}"
 	identity_inode="${identity_tail%%:*}"
@@ -456,9 +459,10 @@ else
 		[ "${#identity_part}" -le 20 ] ||
 			http_err "403 Forbidden" "Invalid renderer source identity"
 	done
-	[ "${#identity_size}" -le "$MAX_RANGE_DIGITS" ] &&
-		[ "$identity_size" -gt 0 ] ||
+	if [ "${#identity_size}" -gt "$MAX_RANGE_DIGITS" ] ||
+	   [ "$identity_size" -le 0 ]; then
 		http_err "403 Forbidden" "Invalid renderer source identity"
+	fi
 	exec 3< "$source_fd" ||
 		http_err "403 Forbidden" "Renderer source is no longer available"
 	[ "$(stat -L -c '%F' -- /proc/self/fd/3 2>/dev/null)" = \

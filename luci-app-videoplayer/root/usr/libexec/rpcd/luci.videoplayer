@@ -1068,10 +1068,10 @@ cmd_resolve_audio() {
 		json_error "renderer session is inactive or its source is unavailable"
 		return
 	}
-	[ -n "$path" ] && [ "${#path}" -le "$MAX_PATH_LENGTH" ] || {
+	if [ -z "$path" ] || [ "${#path}" -gt "$MAX_PATH_LENGTH" ]; then
 		json_error "renderer returned an invalid source"
 		return
-	}
+	fi
 	string_has_control "$path" && {
 		json_error "renderer returned an invalid source"
 		return
@@ -1112,10 +1112,11 @@ cmd_resolve_audio() {
 		json_error "renderer session ended before browser audio was authorized"
 		return
 	}
-	valid_token "$audio_token" && [ "$audio_token" != "$renderer_token" ] || {
+	if ! valid_token "$audio_token" ||
+	   [ "$audio_token" = "$renderer_token" ]; then
 		json_error "renderer returned an invalid browser-audio capability"
 		return
-	}
+	fi
 	position_ms="$(
 		"$RENDERER_HELPER" position-ms \
 			"$renderer_token" "$audio_token" 2>/dev/null
@@ -1129,11 +1130,11 @@ cmd_resolve_audio() {
 			return
 			;;
 	esac
-	[ "${#position_ms}" -le 12 ] &&
-		[ "$position_ms" -le $((TOKEN_TTL * 1000 + 5000)) ] || {
-			json_error "renderer returned an invalid playback position"
-			return
-		}
+	if [ "${#position_ms}" -gt 12 ] ||
+	   [ "$position_ms" -gt $((TOKEN_TTL * 1000 + 5000)) ]; then
+		json_error "renderer returned an invalid playback position"
+		return
+	fi
 
 	json_init
 	json_add_string "name" "$name"
