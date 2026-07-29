@@ -87,7 +87,7 @@ SMOKE_BUILD_IDS = {
     "apk-aarch64_cortex-a53",
     "apk-armeb_xscale",
     "apk-loongarch64_generic",
-    "apk-mipsel_24kc",
+    "ipk-mipsel_74kc",
     "ipk-mips_4kec",
     "ipk-powerpc_8548",
     "ipk-riscv64_riscv64",
@@ -149,6 +149,13 @@ def expected_qemu(architecture: str) -> str:
         if architecture.startswith(prefix):
             return executable
     raise MatrixError(f"No QEMU mapping exists for architecture {architecture!r}")
+
+
+def qemu_cpu_model(architecture: str) -> str:
+    """Return an explicit QEMU CPU model when the default ISA is insufficient."""
+    if architecture == "mipsel_74kc":
+        return "74Kf"
+    return ""
 
 
 def load_matrix(path: Path = DEFAULT_MATRIX) -> dict[str, Any]:
@@ -398,6 +405,7 @@ def build_entries(data: dict[str, Any]) -> list[dict[str, str]]:
                     "feeds_buildinfo_sha256": release["feeds_buildinfo_sha256"],
                     "packages_feed_commit": release["packages_feed_commit"],
                     "qemu": target["qemu"],
+                    "qemu_cpu": qemu_cpu_model(architecture),
                     "validation_mode": (
                         "static"
                         if architecture in STATIC_VALIDATION_ARCHITECTURES

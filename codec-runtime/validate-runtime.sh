@@ -19,6 +19,7 @@ validation_mode="$5"
 main_config="$6"
 component_config="$7"
 validation_timeout="${VALIDATION_TIMEOUT:-180}"
+qemu_cpu_model="${QEMU_CPU_MODEL:-}"
 
 if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
 	die "private FFmpeg binary is missing or not executable"
@@ -36,6 +37,12 @@ case "$validation_timeout" in
 		;;
 	0)
 		die "VALIDATION_TIMEOUT must be greater than zero"
+		;;
+esac
+case "$qemu_cpu_model" in
+	""|*[!A-Za-z0-9_.+-]*)
+		[ -z "$qemu_cpu_model" ] ||
+			die "QEMU_CPU_MODEL contains an unsafe character"
 		;;
 esac
 
@@ -128,8 +135,13 @@ command -v ffmpeg >/dev/null 2>&1 ||
 	die "host FFmpeg is unavailable"
 
 run_target() {
-	timeout "$validation_timeout" \
-		"$qemu" -L "$sysroot" "$binary" "$@"
+	if [ -n "$qemu_cpu_model" ]; then
+		timeout "$validation_timeout" \
+			"$qemu" -cpu "$qemu_cpu_model" -L "$sysroot" "$binary" "$@"
+	else
+		timeout "$validation_timeout" \
+			"$qemu" -L "$sysroot" "$binary" "$@"
+	fi
 }
 
 version="$work/version.txt"

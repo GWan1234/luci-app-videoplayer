@@ -270,6 +270,8 @@ required by the JPEG and PCM renderers.
 Each runtime is built from a checksum-pinned official OpenWrt SDK with
 `CONFIG_BUILD_PATENTED=y`. QEMU-compatible architectures are executed under
 their matching user emulator for H.264-to-JPEG and AAC-to-PCM smoke tests.
+The `mipsel_74kc` runtime uses QEMU's explicit `74Kf` CPU model so the
+validation environment matches the generated instruction set.
 The Octeon and embedded PowerPC ABIs receive static ELF, linkage,
 configuration, component, and package validation because QEMU user mode cannot
 faithfully execute those CPU-specific userspace ABIs. `armeb_xscale` receives

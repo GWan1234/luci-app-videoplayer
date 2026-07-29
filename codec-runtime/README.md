@@ -101,6 +101,9 @@ Each resulting executable is checked for:
 - AAC-to-PCM output in exact 48,000-byte quarter-second chunks under the same
   condition.
 
+The `mipsel_74kc` runtime is executed with QEMU's explicit `74Kf` CPU model;
+QEMU's default MIPS CPU does not implement all instructions emitted for 74Kc.
+
 The Octeon and embedded PowerPC ABIs use static ELF, linkage, FFmpeg
 configuration, component, and package validation because QEMU user mode cannot
 faithfully execute those CPU-specific userspace ABIs. `armeb_xscale` uses the
