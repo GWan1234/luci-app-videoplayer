@@ -1,7 +1,7 @@
 {
   "application": {
     "file": "luci-app-videoplayer-1.1.0.apk",
-    "sha256": "af8afcce7539e64dd93557bf3124c609c15af189f8c6ed0c53045deb349b0157"
+    "sha256": "a800c4e3da81d5fb52a62ffc1b9a8a6e73d79655082a319c9cd0e44abd5b696e"
   },
   "architecture": "aarch64_generic",
   "codec": null,
@@ -11,5 +11,5 @@
   "openwrt_revision": "r33051-f5dae5ece4",
   "package_format": "apk",
   "schema_version": 1,
-  "source_commit": "9dbba93d2b176e15f8450fcc972b78243c6c14d7"
+  "source_commit": "816af61b7d2cfd2643df687f83ffe96704005bba"
 }
