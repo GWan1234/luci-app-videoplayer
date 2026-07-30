@@ -1,0 +1,18 @@
+{
+  "application": {
+    "file": "luci-app-videoplayer_1.1.0_all.ipk",
+    "sha256": "65026f286c1924930233e165d72c43269d3336a33de97c0d85761eb2bc239ae1"
+  },
+  "architecture": "powerpc_464fp",
+  "codec": {
+    "file": "luci-videoplayer-codec-runtime_6.1.4-r3_powerpc_464fp.ipk",
+    "sha256": "ebe716b0dc1324e3e27f3a5f1389d7b3ee1cbfb5f36bf4bc84103401ca8803b1"
+  },
+  "folder_key": "DISTRIB_ARCH",
+  "manager": "opkg",
+  "openwrt_release": "24.10.8",
+  "openwrt_revision": "r29233-443ec4032a",
+  "package_format": "ipk",
+  "schema_version": 1,
+  "source_commit": "698a58bf5556971fc68be8dd9fd49d9019729c1f"
+}
