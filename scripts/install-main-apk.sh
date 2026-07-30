@@ -11,11 +11,14 @@ SNAPSHOT_BRANCH="snapshot"
 APP_VERSION="1.1.0"
 SNAPSHOT_APK="luci-app-videoplayer-$APP_VERSION.apk"
 SNAPSHOT_INDEX="INDEX.tsv"
+CODEC_INSTALLER_OBJECT="scripts/install-codec-runtime.sh"
+CODEC_INSTALLER_SHA256="6d8dc7f27760d92d1617650b888fc612c0fe8259c85991405aa5ff934bf140b3"
 API_BASE_URL="https://api.github.com/repos/$REPOSITORY"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
 # POSIX ulimit -f counts 512-byte blocks.
 MAX_METADATA_BLOCKS="128"
+MAX_INSTALLER_BLOCKS="128"
 MAX_PACKAGE_BLOCKS="8192"
 DOWNLOAD_TIMEOUT_SECONDS="30"
 DOWNLOAD_DEADLINE_SECONDS="180"
@@ -163,6 +166,17 @@ read_commit_sha() {
 	printf '%s\n' "$sha_value"
 }
 
+verify_sha256() {
+	expected_sha256="$1"
+	verified_path="$2"
+	description="$3"
+	actual_sha256="$(sha256sum "$verified_path")"
+	actual_sha256="${actual_sha256%% *}"
+
+	[ "$actual_sha256" = "$expected_sha256" ] ||
+		die "The downloaded $description failed SHA-256 verification."
+}
+
 # Keep all side effects behind the final entry-point call so the installer is
 # inert until a complete script has been parsed.
 main() {
@@ -175,7 +189,8 @@ case "$#" in
 				printf '%s\n' \
 					"Usage: sh install-main-apk.sh" \
 					"" \
-					"Downloads, verifies, and installs the APK built from the current main branch." \
+					"Downloads and verifies the required files, installs or updates the matching" \
+					"private FFmpeg runtime, then installs the APK built from the current main branch." \
 					"This installer supports only OpenWrt versions that use apk."
 				exit 0
 				;;
@@ -331,6 +346,27 @@ ACTUAL_SHA256="${ACTUAL_SHA256%% *}"
 printf '%s\n' \
 	"Verified source commit: $SOURCE_COMMIT" \
 	"Verified APK SHA-256: $ACTUAL_SHA256"
+
+CODEC_INSTALLER_PATH="$WORK_DIR/install-codec-runtime.sh"
+CODEC_INSTALLER_URL="$RAW_BASE_URL/$MAIN_COMMIT/$CODEC_INSTALLER_OBJECT"
+printf '%s\n' \
+	"Downloading the architecture-specific FFmpeg installer..."
+if ! download_file \
+	"$CODEC_INSTALLER_URL" \
+	"$CODEC_INSTALLER_PATH" \
+	"$MAX_INSTALLER_BLOCKS"; then
+	die "Could not download the architecture-specific FFmpeg installer."
+fi
+verify_sha256 \
+	"$CODEC_INSTALLER_SHA256" \
+	"$CODEC_INSTALLER_PATH" \
+	"FFmpeg installer"
+
+printf '%s\n' \
+	"Installing or updating the architecture-specific FFmpeg runtime first..."
+if ! /bin/sh "$CODEC_INSTALLER_PATH"; then
+	die "The architecture-specific FFmpeg installation or update failed."
+fi
 
 if ! apk update; then
 	warn "Could not refresh apk indexes; continuing with the current indexes."

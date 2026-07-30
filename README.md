@@ -205,13 +205,28 @@ It deliberately does not pipe partially downloaded network content into a
 shell.
 
 The installer currently installs the latest published release, not the newer
-1.1.0 source tree. It detects whether the router uses `apk` or `opkg`,
-downloads the matching 1.0.0 package from
+1.1.0 source tree. Before changing the application package, it downloads and
+SHA-256-verifies the architecture-specific FFmpeg installer. That installer
+selects the private runtime for the router's exact OpenWrt release, revision,
+package manager, and `DISTRIB_ARCH`. It installs a missing runtime, attempts a
+normal in-place update when one is already installed, and treats an
+already-current package as success before continuing without downloading the
+large FFmpeg package again. The release installer then detects whether the
+router uses `apk` or `opkg`, downloads the matching
+1.0.0 package from
 [Release 1.0.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.0.0),
 verifies its pinned SHA-256 checksum, attempts to refresh the package indexes,
 and installs the package. The released APK is unsigned, so installation on
 OpenWrt 25.12+ uses `apk add --allow-untrusted`. Downloads are size-limited to
 protect the router's RAM-backed `/tmp` filesystem.
+
+Because the FFmpeg step is mandatory, the release installer now requires an
+exact codec-matrix entry. At present that means OpenWrt 25.12.5
+`r33051-f5dae5ece4` or OpenWrt 24.10.8 `r29233-443ec4032a`; an unsupported
+release, revision, or architecture is rejected before the application package
+is changed. Release 1.0.0 itself remains browser-only, so it prepares the
+private runtime for a later 1.1.0 installation but does not use router CPU
+rendering.
 
 ### Current `main` APK (OpenWrt 25.12.5)
 
@@ -231,10 +246,13 @@ rebuilds the current source package and publishes the architecture-scoped
 generated `snapshot` branch. The installer resolves that branch immutably,
 matches the router's exact release, revision, and `DISTRIB_ARCH`, validates the
 indexed path and checksum, and confirms that the source commit still equals
-the current head of `main`. It refuses to install while a newer push is still
-being checked or if any verification fails. This path supports only `apk`; use
-the published-release installer above on OpenWrt versions that still use
-`opkg`.
+the current head of `main`. Before installing that verified application APK,
+it also installs or checks for an update to the same exact
+architecture-specific private FFmpeg runtime described below. An
+already-current runtime does not stop the application installation. The
+installer refuses to proceed while a newer push is still being checked or if
+any verification fails. This path supports only `apk`; use the
+published-release installer above on OpenWrt versions that still use `opkg`.
 OpenWrt 25.12.1 and newer can force a reinstall when two snapshots share the
 same package version. On 25.12.0, the first installation works, but an existing
 copy must be removed manually before installing any newer build, including a
@@ -253,9 +271,9 @@ folder. Other AArch64 routers may report `aarch64_cortex-a72`,
 `aarch64_cortex-a76`, or `aarch64_generic`; those are separate ABI folders
 with separately compiled codec binaries.
 
-Install the current 1.1.0 application package from the same exact architecture
-folder first: the APK on OpenWrt 25.12.5 or the IPK on OpenWrt 24.10.8. Then
-select **Router CPU rendering** in LuCI and run:
+Both quick application installers above perform this FFmpeg installation or
+update check automatically before changing the application package. To
+install, update, or verify only the codec runtime independently, run:
 
 ```sh
 (
@@ -277,9 +295,13 @@ The installer detects `apk` or `opkg`, reads `DISTRIB_RELEASE`,
 `DISTRIB_REVISION`, and `DISTRIB_ARCH`, and selects exactly one entry from the
 immutable `codec-snapshot` index. It rejects malformed metadata, unknown
 architectures, mismatched revisions, duplicate entries, unexpected paths, and
-checksum failures before installation. It then confirms that the private
-runtime exposes the native H.264, HEVC, and VC-1 decoders plus every component
-required by the continuous MJPEG and PCM renderers.
+checksum failures before installation. It compares the installed and published
+package versions: a missing or older runtime is installed, a matching current
+or newer runtime with compatible build metadata is kept, and a current-version
+runtime with missing or incompatible metadata is reinstalled from the verified
+package. It then confirms that the private runtime exposes the native H.264,
+HEVC, and VC-1 decoders plus every component required by the continuous MJPEG
+and PCM renderers.
 
 Each runtime is built from a checksum-pinned official OpenWrt SDK with
 `CONFIG_BUILD_PATENTED=y`. QEMU-compatible architectures are executed under

@@ -14,6 +14,7 @@ RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 PACKAGE_NAME="luci-videoplayer-codec-runtime"
 CODEC_VERSION="6.1.4"
 CODEC_RELEASE="3"
+TARGET_PACKAGE_VERSION="$CODEC_VERSION-r$CODEC_RELEASE"
 INDEX_OBJECT="dist/INDEX.tsv"
 SOURCE_COMMIT_OBJECT="dist/SOURCE_COMMIT"
 PRIVATE_FFMPEG="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
@@ -25,11 +26,16 @@ MAX_REPORT_BLOCKS="512"
 DOWNLOAD_TIMEOUT_SECONDS="30"
 DOWNLOAD_DEADLINE_SECONDS="180"
 FFMPEG_PROBE_DEADLINE_SECONDS="30"
+HAS_WORKING_TIMEOUT="0"
 WORK_DIR=""
 
 die() {
 	printf 'Error: %s\n' "$*" >&2
 	exit 1
+}
+
+warn() {
+	printf 'Warning: %s\n' "$*" >&2
 }
 
 cleanup() {
@@ -41,9 +47,57 @@ cleanup() {
 	esac
 }
 
+detect_working_timeout() {
+	HAS_WORKING_TIMEOUT="0"
+	if command -v timeout >/dev/null 2>&1 &&
+		timeout 1 /bin/sh -c ':' >/dev/null 2>&1; then
+		HAS_WORKING_TIMEOUT="1"
+	fi
+}
+
 read_release_value() {
 	release_key="$1"
 	sed -n "s/^${release_key}='\([^']*\)'$/\1/p" /etc/openwrt_release
+}
+
+installed_runtime_matches_router() {
+	build_info="/usr/share/luci-videoplayer-codec-runtime/build-info"
+	[ -r "$build_info" ] &&
+		[ -x "$PRIVATE_FFMPEG" ] &&
+		[ "$(sed -n 's/^openwrt_release=//p' "$build_info")" = \
+			"$DISTRIB_RELEASE_VALUE" ] &&
+		[ "$(sed -n 's/^openwrt_revision=//p' "$build_info")" = \
+			"$DISTRIB_REVISION_VALUE" ] &&
+		[ "$(sed -n 's/^compatible_arch=//p' "$build_info")" = \
+			"$DISTRIB_ARCH_VALUE" ] &&
+		[ "$(sed -n 's/^package_format=//p' "$build_info")" = \
+			"$PACKAGE_FORMAT" ]
+}
+
+select_runtime_action() {
+	version_order="$1"
+	metadata_matches="$2"
+
+	case "$version_order:$metadata_matches" in
+		"<:0"|"<:1")
+			printf '%s\n' "upgrade"
+			;;
+		"=:1")
+			printf '%s\n' "current"
+			;;
+		"=:0")
+			printf '%s\n' "repair"
+			;;
+		">:1")
+			printf '%s\n' "newer"
+			;;
+		">:0")
+			return 1
+			;;
+		*)
+			return 2
+			;;
+	esac
 }
 
 require_safe_component() {
@@ -57,7 +111,11 @@ require_safe_component() {
 }
 
 run_with_download_deadline() {
-	timeout "$DOWNLOAD_DEADLINE_SECONDS" "$@"
+	if [ "$HAS_WORKING_TIMEOUT" = "1" ]; then
+		timeout "$DOWNLOAD_DEADLINE_SECONDS" "$@"
+	else
+		"$@"
+	fi
 }
 
 check_download_size() {
@@ -180,9 +238,14 @@ run_ffmpeg_report() (
 	if ! ulimit -f "$MAX_REPORT_BLOCKS"; then
 		exit 1
 	fi
-	timeout "$FFMPEG_PROBE_DEADLINE_SECONDS" \
+	if [ "$HAS_WORKING_TIMEOUT" = "1" ]; then
+		timeout "$FFMPEG_PROBE_DEADLINE_SECONDS" \
+			"$PRIVATE_FFMPEG" -hide_banner "$report_option" \
+			>"$report_output" 2>"$report_error"
+	else
 		"$PRIVATE_FFMPEG" -hide_banner "$report_option" \
-		>"$report_output" 2>"$report_error"
+			>"$report_output" 2>"$report_error"
+	fi
 )
 
 check_component() {
@@ -198,18 +261,28 @@ check_component() {
 	return 1
 }
 
-case "${1:-}" in
-	"")
+# Keep all side effects behind the final entry-point call so the installer is
+# inert until a complete script has been parsed.
+main() {
+case "$#" in
+	0)
 		;;
-	-h|--help)
-		printf '%s\n' \
-			"Usage: sh install-codec-runtime.sh" \
-			"" \
-			"Installs the architecture-specific private FFmpeg runtime." \
-			"Supported package sets are selected from the generated matrix for:" \
-			"  OpenWrt 25.12.5 r33051-f5dae5ece4 (apk)" \
-			"  OpenWrt 24.10.8 r29233-443ec4032a (opkg)"
-		exit 0
+	1)
+		case "$1" in
+			-h|--help)
+				printf '%s\n' \
+					"Usage: sh install-codec-runtime.sh" \
+					"" \
+					"Installs or updates the architecture-specific private FFmpeg runtime." \
+					"Supported package sets are selected from the generated matrix for:" \
+					"  OpenWrt 25.12.5 r33051-f5dae5ece4 (apk)" \
+					"  OpenWrt 24.10.8 r29233-443ec4032a (opkg)"
+				exit 0
+				;;
+			*)
+				die "This installer does not accept arguments."
+				;;
+		esac
 		;;
 	*)
 		die "This installer does not accept arguments."
@@ -227,10 +300,10 @@ for required_command in grep mktemp sed sha256sum tr wc; do
 	command -v "$required_command" >/dev/null 2>&1 ||
 		die "Required command is missing: $required_command"
 done
-if ! command -v timeout >/dev/null 2>&1 ||
-	! timeout 1 /bin/sh -c ':' >/dev/null 2>&1; then
-	die \
-		"Required command is missing or unusable: timeout (install coreutils-timeout)."
+detect_working_timeout
+if [ "$HAS_WORKING_TIMEOUT" != "1" ]; then
+	warn \
+		"A working timeout command is unavailable; bounded file-size checks remain active, but network and FFmpeg probe deadlines cannot be enforced."
 fi
 if ! command -v uclient-fetch >/dev/null 2>&1 &&
 	! command -v wget >/dev/null 2>&1 &&
@@ -250,11 +323,9 @@ if [ "$HAS_APK" = "$HAS_OPKG" ]; then
 fi
 if [ "$HAS_APK" = "1" ]; then
 	PACKAGE_FORMAT="apk"
-	PACKAGE_MANAGER="apk"
 	PACKAGE_FILE="$PACKAGE_NAME-$CODEC_VERSION-r$CODEC_RELEASE.apk"
 else
 	PACKAGE_FORMAT="ipk"
-	PACKAGE_MANAGER="opkg"
 fi
 
 DISTRIB_ID_VALUE="$(read_release_value DISTRIB_ID)"
@@ -347,53 +418,192 @@ case "$EXPECTED_SHA256" in
 		;;
 esac
 
-printf 'Downloading codecs built from source commit %s...\n' "$SOURCE_COMMIT"
-if ! download_file \
-	"$SNAPSHOT_RAW_URL/dist/$CODEC_RELATIVE_PATH" \
-	"$PACKAGE_PATH" \
-	"$MAX_PACKAGE_BLOCKS"; then
-	die "Could not download the codec package."
-fi
-ACTUAL_SHA256="$(sha256sum "$PACKAGE_PATH")"
-ACTUAL_SHA256="${ACTUAL_SHA256%% *}"
-[ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] ||
-	die "The downloaded codec package failed SHA-256 verification."
-
 printf '%s\n' \
 	"Verified snapshot commit: $SNAPSHOT_COMMIT" \
-	"Verified source commit: $SOURCE_COMMIT" \
-	"Verified codec package SHA-256: $ACTUAL_SHA256"
+	"Verified source commit: $SOURCE_COMMIT"
 
-printf 'Installing %s with %s...\n' "$PACKAGE_FILE" "$PACKAGE_MANAGER"
+RUNTIME_ACTION="install"
+INSTALLED_RUNTIME_VERSION=""
 case "$PACKAGE_FORMAT" in
 	apk)
-		if apk info -e "$PACKAGE_NAME" >/dev/null 2>&1; then
-			if apk add --force-reinstall --help >/dev/null 2>&1; then
-				apk add --allow-untrusted --force-reinstall "$PACKAGE_PATH"
-			else
-				die "This apk version cannot safely reinstall $PACKAGE_NAME."
-			fi
-		else
+		APK_INFO_STATUS="0"
+		apk info -e "$PACKAGE_NAME" >/dev/null 2>&1 ||
 			APK_INFO_STATUS="$?"
-			[ "$APK_INFO_STATUS" -eq 1 ] ||
+		case "$APK_INFO_STATUS" in
+			0)
+				APK_MANIFEST="$(
+					apk list --installed --manifest "$PACKAGE_NAME" 2>/dev/null
+				)" ||
+					die "Could not read the installed $PACKAGE_NAME version."
+				case "$APK_MANIFEST" in
+					"$PACKAGE_NAME "*)
+						INSTALLED_RUNTIME_VERSION="${APK_MANIFEST#"$PACKAGE_NAME "}"
+						;;
+					*)
+						die "apk returned unexpected installed-package metadata for $PACKAGE_NAME."
+						;;
+				esac
+				require_safe_component \
+					"installed codec package version" \
+					"$INSTALLED_RUNTIME_VERSION"
+				APK_VERSION_ORDER="$(
+					apk version -t \
+						"$INSTALLED_RUNTIME_VERSION" \
+						"$TARGET_PACKAGE_VERSION"
+				)" ||
+					die "apk could not compare codec package versions."
+				case "$APK_VERSION_ORDER" in
+					"<"|"="|">")
+						;;
+					*)
+						die "apk returned an unexpected codec version comparison."
+						;;
+				esac
+				RUNTIME_METADATA_MATCHES="0"
+				installed_runtime_matches_router &&
+					RUNTIME_METADATA_MATCHES="1"
+				RUNTIME_ACTION="$(
+					select_runtime_action \
+						"$APK_VERSION_ORDER" \
+						"$RUNTIME_METADATA_MATCHES"
+				)" ||
+					die \
+						"A newer $PACKAGE_NAME is installed, but its build metadata does not match this router."
+				;;
+			1)
+				;;
+			*)
 				die "Could not determine whether $PACKAGE_NAME is installed."
-			apk add --allow-untrusted "$PACKAGE_PATH"
+				;;
+		esac
+		;;
+	ipk)
+		OPKG_INSTALLED="$(
+			opkg list-installed "$PACKAGE_NAME" 2>/dev/null
+		)" || die "Could not query the installed $PACKAGE_NAME package."
+		case "$OPKG_INSTALLED" in
+			"")
+				;;
+			"$PACKAGE_NAME - "*)
+				INSTALLED_RUNTIME_VERSION="${OPKG_INSTALLED#"$PACKAGE_NAME - "}"
+				require_safe_component \
+					"installed codec package version" \
+					"$INSTALLED_RUNTIME_VERSION"
+				if opkg compare-versions \
+					"$INSTALLED_RUNTIME_VERSION" \
+					"<<" "$TARGET_PACKAGE_VERSION"; then
+					OPKG_VERSION_ORDER="<"
+				elif opkg compare-versions \
+					"$INSTALLED_RUNTIME_VERSION" \
+					"=" "$TARGET_PACKAGE_VERSION"; then
+					OPKG_VERSION_ORDER="="
+				elif opkg compare-versions \
+					"$INSTALLED_RUNTIME_VERSION" \
+					">>" "$TARGET_PACKAGE_VERSION"; then
+					OPKG_VERSION_ORDER=">"
+				else
+					die "opkg could not compare codec package versions."
+				fi
+				RUNTIME_METADATA_MATCHES="0"
+				installed_runtime_matches_router &&
+					RUNTIME_METADATA_MATCHES="1"
+				RUNTIME_ACTION="$(
+					select_runtime_action \
+						"$OPKG_VERSION_ORDER" \
+						"$RUNTIME_METADATA_MATCHES"
+				)" ||
+					die \
+						"A newer $PACKAGE_NAME is installed, but its build metadata does not match this router."
+				;;
+			*)
+				die "opkg returned unexpected installed-package metadata for $PACKAGE_NAME."
+				;;
+		esac
+		;;
+esac
+
+case "$RUNTIME_ACTION" in
+	install)
+		printf 'Installing architecture-specific FFmpeg package %s...\n' \
+			"$PACKAGE_FILE"
+		;;
+	upgrade)
+		printf 'Updating %s from %s to %s...\n' \
+			"$PACKAGE_NAME" \
+			"$INSTALLED_RUNTIME_VERSION" \
+			"$TARGET_PACKAGE_VERSION"
+		;;
+	repair)
+		printf 'Reinstalling the current %s because its build metadata is incomplete or incompatible...\n' \
+			"$PACKAGE_NAME"
+		;;
+	current)
+		printf '%s %s is already current; continuing.\n' \
+			"$PACKAGE_NAME" "$INSTALLED_RUNTIME_VERSION"
+		;;
+	newer)
+		printf '%s %s is newer than %s; keeping the verified matching runtime.\n' \
+			"$PACKAGE_NAME" \
+			"$INSTALLED_RUNTIME_VERSION" \
+			"$TARGET_PACKAGE_VERSION"
+		;;
+esac
+
+case "$RUNTIME_ACTION" in
+	current|newer)
+		printf '%s\n' \
+			"No FFmpeg package download is needed."
+		;;
+	*)
+		printf 'Downloading codecs built from source commit %s...\n' \
+			"$SOURCE_COMMIT"
+		if ! download_file \
+			"$SNAPSHOT_RAW_URL/dist/$CODEC_RELATIVE_PATH" \
+			"$PACKAGE_PATH" \
+			"$MAX_PACKAGE_BLOCKS"; then
+			die "Could not download the codec package."
 		fi
+		ACTUAL_SHA256="$(sha256sum "$PACKAGE_PATH")"
+		ACTUAL_SHA256="${ACTUAL_SHA256%% *}"
+		[ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] ||
+			die "The downloaded codec package failed SHA-256 verification."
+		printf '%s\n' \
+			"Verified codec package SHA-256: $ACTUAL_SHA256"
+		;;
+esac
+
+case "$RUNTIME_ACTION:$PACKAGE_FORMAT" in
+	install:apk|upgrade:apk)
+		apk add --allow-untrusted "$PACKAGE_PATH"
+		;;
+	repair:apk)
+		apk add --allow-untrusted --force-reinstall "$PACKAGE_PATH"
+		;;
+	install:ipk|upgrade:ipk)
+		opkg install "$PACKAGE_PATH"
+		;;
+	repair:ipk)
+		opkg --force-reinstall install "$PACKAGE_PATH"
+		;;
+	current:*|newer:*)
+		;;
+esac
+
+case "$PACKAGE_FORMAT" in
+	apk)
 		apk info -e "$PACKAGE_NAME" >/dev/null 2>&1 ||
 			die "apk completed without registering $PACKAGE_NAME."
 		;;
 	ipk)
-		if opkg list-installed "$PACKAGE_NAME" 2>/dev/null |
-			grep -q "^$PACKAGE_NAME - "; then
-			opkg --force-reinstall --force-downgrade install "$PACKAGE_PATH"
-		else
-			opkg install "$PACKAGE_PATH"
-		fi
 		opkg list-installed "$PACKAGE_NAME" 2>/dev/null |
 			grep -q "^$PACKAGE_NAME - " ||
 			die "opkg completed without registering $PACKAGE_NAME."
 		;;
 esac
+if [ "$RUNTIME_ACTION" != "install" ]; then
+	printf '%s\n' \
+		"Architecture-specific FFmpeg update check complete; continuing."
+fi
 
 [ -x "$PRIVATE_FFMPEG" ] ||
 	die "The installed private FFmpeg is missing or not executable: $PRIVATE_FFMPEG"
@@ -471,3 +681,6 @@ printf '%s\n' \
 	"Verified audio decoders: aac, ac3, eac3, alac, dca, flac, mp3, opus, pcm_s16le, truehd, vorbis" \
 	"Verified video pipeline: mjpeg encoder, mpjpeg stream, image2 compatibility, fps, scale, format" \
 	"Verified audio pipeline: pcm_s16le, s16le, aresample, aformat, asetnsamples"
+}
+
+main "$@"
