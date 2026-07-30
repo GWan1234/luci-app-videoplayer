@@ -77,7 +77,7 @@ for component in \
 	EAC3_DECODER ALAC_DECODER DCA_DECODER FLAC_DECODER MP3_DECODER \
 	OPUS_DECODER PCM_S16LE_DECODER TRUEHD_DECODER VORBIS_DECODER \
 	MJPEG_ENCODER PCM_S16LE_ENCODER MOV_DEMUXER MATROSKA_DEMUXER \
-	AVI_DEMUXER MPEGTS_DEMUXER IMAGE2_MUXER PCM_S16LE_MUXER \
+	AVI_DEMUXER MPEGTS_DEMUXER IMAGE2_MUXER MPJPEG_MUXER PCM_S16LE_MUXER \
 	FPS_FILTER SCALE_FILTER FORMAT_FILTER ARESAMPLE_FILTER \
 	AFORMAT_FILTER ASETNSAMPLES_FILTER
 do
@@ -198,7 +198,7 @@ do
 	has_component "$demuxers" "$demuxer" ||
 		die "demuxer is missing: $demuxer"
 done
-for muxer in image2 s16le
+for muxer in image2 mpjpeg s16le
 do
 	has_component "$muxers" "$muxer" ||
 		die "muxer is missing: $muxer"
@@ -214,7 +214,7 @@ if awk '$2 ~ /_v4l2m2m$/ { found = 1 } END { exit found ? 0 : 1 }' "$decoders"; 
 fi
 
 sample="$work/h264-sample.mp4"
-frame="$work/frame.jpg"
+video_stream="$work/video.mjpeg"
 audio_pcm="$work/audio.pcm"
 [ ! -e "$audio_pcm" ] ||
 	die "audio smoke-test output already exists: $audio_pcm"
@@ -236,14 +236,23 @@ ffmpeg \
 		-filter_threads 1 \
 		-vf "fps=3,scale=160:90:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 		-frames:v 1 -threads 1 -c:v mjpeg -q:v 8 \
-		-f image2 -update 1 -atomic_writing 1 "$frame"
+		-f mpjpeg -boundary_tag videoplayer-validation "$video_stream"
 )
 
-[ -s "$frame" ] ||
-	die "H.264 decode-to-JPEG smoke test produced no frame"
-magic="$(od -An -tx1 -N2 "$frame" | tr -d ' \n')"
-[ "$magic" = "ffd8" ] ||
-	die "smoke-test output is not a JPEG file"
+[ -s "$video_stream" ] ||
+	die "H.264 decode-to-MJPEG smoke test produced no stream"
+first_line="$(
+	sed -n '1 { s/\r$//; p; q; }' "$video_stream"
+)"
+[ "$first_line" = "--videoplayer-validation" ] ||
+	die "MJPEG smoke-test output has the wrong boundary"
+prefix_hex="$(
+	od -An -tx1 -N512 "$video_stream" | tr -d ' \n'
+)"
+case "$prefix_hex" in
+	*0d0a0d0affd8*) ;;
+	*) die "MJPEG smoke-test output has no JPEG part" ;;
+esac
 
 (
 	exec 3< "$sample"

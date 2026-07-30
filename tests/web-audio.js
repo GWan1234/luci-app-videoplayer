@@ -69,9 +69,95 @@ const uci = {
 };
 
 const elements = Object.create(null);
+const domNodes = [];
+
+function fakeImageElement() {
+	const attributes = Object.create(null);
+	const node = {
+		id: '',
+		className: '',
+		src: '',
+		naturalWidth: 0,
+		hidden: true,
+		onload: null,
+		onerror: null,
+		parentNode: null,
+		setAttribute(name, value) {
+			attributes[name] = String(value);
+			if (name === 'id')
+				this.id = String(value);
+			else if (name === 'class')
+				this.className = String(value);
+		},
+		getAttribute(name) {
+			if (name === 'id')
+				return this.id || null;
+			if (name === 'class')
+				return this.className || null;
+			return attributes[name];
+		},
+		removeAttribute(name) {
+			delete attributes[name];
+			if (name === 'src') {
+				this.src = '';
+				this.naturalWidth = 0;
+			}
+			else if (name === 'id') {
+				this.id = '';
+			}
+		}
+	};
+	Object.defineProperty(node, 'nextSibling', {
+		get() {
+			if (!this.parentNode)
+				return null;
+			const index = this.parentNode.children.indexOf(this);
+			return index >= 0
+				? this.parentNode.children[index + 1] || null
+				: null;
+		}
+	});
+	domNodes.push(node);
+	return node;
+}
+
+function fakeImageParent(initialNode) {
+	const parent = {
+		children: [],
+		insertBefore(node, reference) {
+			if (node.parentNode)
+				node.parentNode.removeChild(node);
+			const index = reference ? this.children.indexOf(reference) : -1;
+			if (index >= 0)
+				this.children.splice(index, 0, node);
+			else
+				this.children.push(node);
+			node.parentNode = this;
+			return node;
+		},
+		removeChild(node) {
+			const index = this.children.indexOf(node);
+			if (index < 0)
+				throw new Error('node is not a child');
+			this.children.splice(index, 1);
+			node.parentNode = null;
+			return node;
+		}
+	};
+	if (initialNode)
+		parent.insertBefore(initialNode, null);
+	return parent;
+}
+
 global.document = {
 	hidden: false,
-	getElementById: id => elements[id] || null,
+	getElementById: id =>
+		domNodes.find(node => node.parentNode && node.id === id) ||
+		elements[id] || null,
+	createElement: tag => {
+		check(tag === 'img', `unexpected element creation: ${tag}`);
+		return fakeImageElement();
+	},
 	documentElement: {
 		contains: () => true
 	}
@@ -246,6 +332,65 @@ function deferred() {
 		reject = rejectPromise;
 	});
 	return { promise, resolve, reject };
+}
+
+function installFakeClock(start = 100000) {
+	const originalNow = Date.now;
+	const originalSetTimeout = window.setTimeout;
+	const originalClearTimeout = window.clearTimeout;
+	const timers = new Map();
+	let now = start;
+	let nextId = 1;
+
+	Date.now = () => now;
+	window.setTimeout = (callback, delay) => {
+		const id = nextId++;
+		timers.set(id, {
+			callback,
+			due: now + Math.max(0, Number(delay) || 0)
+		});
+		return id;
+	};
+	window.clearTimeout = id => {
+		timers.delete(id);
+	};
+
+	return {
+		now: () => now,
+		jump(milliseconds) {
+			now += Math.max(0, Number(milliseconds) || 0);
+		},
+		advance(milliseconds) {
+			const target = now + Math.max(0, Number(milliseconds) || 0);
+			let guard = 0;
+			for (;;) {
+				let selectedId = null;
+				let selected = null;
+				for (const [ id, timer ] of timers) {
+					if (timer.due <= target &&
+					    (!selected || timer.due < selected.due ||
+					     (timer.due === selected.due && id < selectedId))) {
+						selectedId = id;
+						selected = timer;
+					}
+				}
+				if (!selected)
+					break;
+				if (++guard > 10000)
+					fail('fake clock timer loop did not settle');
+				now = selected.due;
+				timers.delete(selectedId);
+				selected.callback();
+			}
+			now = target;
+		},
+		restore() {
+			Date.now = originalNow;
+			window.setTimeout = originalSetTimeout;
+			window.clearTimeout = originalClearTimeout;
+			timers.clear();
+		}
+	};
 }
 
 async function main() {
@@ -570,14 +715,13 @@ async function main() {
 	check(finishContext.closed, 'video EOF did not close drained AudioContext');
 	check(!finalVideoSource.stopped, 'video EOF stopped a naturally ended source');
 
-	/* Short video EOF can race resolve_audio, a pending play() promise, or a
-	 * delayed first JPEG. Keep each phase alive for the bounded drain window
-	 * instead of destroying its hidden audio or queued frame immediately. */
+	/* Short video EOF can race resolve_audio, a pending play() promise, or the
+	 * first streamed image. Keep each audio phase alive for the bounded drain
+	 * window instead of destroying its hidden audio immediately. */
 	const pendingEofCases = [
 		{ name: 'resolving', generation: 51, token: '5', audio: true },
 		{ name: 'playPending', generation: 52, token: '6', audio: true },
-		{ name: 'waitingForVideo', generation: 53, token: '7', audio: true },
-		{ name: 'queuedFrame', generation: 54, token: '8', audio: false }
+		{ name: 'waitingForVideo', generation: 53, token: '7', audio: true }
 	];
 	for (const pendingCase of pendingEofCases) {
 		const pendingPhase = pendingCase.name;
@@ -601,15 +745,6 @@ async function main() {
 			token: pendingCase.token.repeat(32),
 			label: `short-${pendingPhase}.mp4`,
 			fps: 8,
-			timer: null,
-			decodeTimer: null,
-			cancelDecode: null,
-			decoder: null,
-			nextObjectUrl: null,
-			objectUrl: null,
-			pendingFrames: pendingPhase === 'queuedFrame'
-				? [ { url: 'blob:queued-short-frame', timer: null } ]
-				: [],
 			audio: null,
 			browserAudio: pendingEofAudio,
 			firstFrameSeen: pendingPhase !== 'waitingForVideo',
@@ -632,12 +767,6 @@ async function main() {
 			pendingEofSession.finishing !== null,
 			`video EOF did not drain pending ${pendingPhase}`
 		);
-		if (pendingPhase === 'queuedFrame') {
-			check(
-				pendingEofSession.pendingFrames.length === 1,
-				'video EOF discarded the delayed final JPEG'
-			);
-		}
 		await app._finishCpuPlayback(
 			pendingEofSession, `finished-${pendingPhase}`, false, true
 		);
@@ -647,10 +776,10 @@ async function main() {
 		);
 	}
 
-	/* When router PCM is unavailable, keep CPU-rendered frames but resolve the
-	 * original protected stream into a hidden browser audio element. A delayed
-	 * audible play may be blocked, so muted playback starts the clock and the
-	 * visible Unmute button supplies the next user gesture. */
+	/* When router PCM is unavailable, keep the continuous CPU-rendered MJPEG
+	 * stream but resolve the original protected stream into a hidden browser
+	 * audio element. A delayed audible play may be blocked, so muted playback
+	 * starts the clock and the visible Unmute button supplies the next gesture. */
 	const browserElement = fakeMediaElement([
 		new Error('NotAllowedError'),
 		null,
@@ -659,15 +788,10 @@ async function main() {
 	const browserButton = fakeButton();
 	const browserNote = { textContent: '', hidden: false };
 	const browserNowPlaying = { textContent: '' };
-	const browserFrame = {
-		src: '',
-		hidden: true,
-		setAttribute() {},
-		removeAttribute(name) {
-			if (name === 'src')
-				this.src = '';
-		}
-	};
+	const browserFrame = fakeImageElement();
+	browserFrame.id = 'videoplayer-cpu-frame';
+	browserFrame.className = 'videoplayer-cpu-frame';
+	const browserFrameParent = fakeImageParent(browserFrame);
 	elements['videoplayer-cpu-audio'] = browserElement;
 	elements['videoplayer-cpu-frame'] = browserFrame;
 	elements['vp-mute-btn'] = browserButton;
@@ -686,28 +810,44 @@ async function main() {
 			media_offset_ms: 1750
 		};
 	};
+	rpcHandlers.renderer_status = () => ({ state: 'running' });
 	rpcCalls.length = 0;
-	const previousFrameScheduler = app._scheduleCpuFramePoll;
-	app._scheduleCpuFramePoll = () => {};
+	let unexpectedFrameRequests = 0;
+	request.get = () => {
+		unexpectedFrameRequests++;
+		return Promise.reject(new Error('unexpected per-frame HTTP request'));
+	};
 	app._playGeneration = 6;
-	await app._playCpuFrames({
+	await app._playCpuStream({
 		session_token: 'b'.repeat(32),
 		stream_url: '/cgi-bin/videoplayer-frame?token=' + 'b'.repeat(32),
+		render_mode: 'router',
+		stream_type: 'mjpeg-stream',
+		mime: 'multipart/x-mixed-replace',
+		stream_segment_seconds: 45,
 		has_audio: 0,
-		router_fps: 60,
-		frame_interval_ms: 17
+		router_fps: 60
 	}, 'bad apple.mp4', 6, null);
-	app._scheduleCpuFramePoll = previousFrameScheduler;
 
 	const browserSession = app._cpuSession;
 	const browserAudio = browserSession && browserSession.browserAudio;
 	check(browserSession && browserSession.active, 'CPU session was not retained');
 	check(browserSession.fps === 60, '60 FPS was normalized to another frame rate');
-	check(browserSession.frameIntervalMs === 17,
-		'60 FPS was normalized to another polling interval');
+	const firstStreamFrame = browserSession.streamPending &&
+		browserSession.streamPending.node;
+	check(firstStreamFrame && firstStreamFrame !== browserFrame,
+		'CPU stream reused a frame with stale decode state');
+	check(
+		firstStreamFrame.src ===
+			'/cgi-bin/videoplayer-frame?token=' + 'b'.repeat(32) +
+			'&stream=6-1',
+		'CPU video was not attached as one continuous multipart stream'
+	);
+	check(unexpectedFrameRequests === 0,
+		'continuous CPU video still issued per-frame HTTP requests');
 	check(browserAudio && browserAudio.active, 'browser audio fallback was not attached');
 	check(browserAudio.waitingForVideo,
-		'browser audio started before the first CPU-rendered frame');
+		'browser audio started before the first streamed image');
 	check(
 		rpcCalls.filter(call => call.method === 'resolve_audio').length === 1,
 		'browser audio fallback did not resolve exactly once'
@@ -718,10 +858,17 @@ async function main() {
 			'&audio=' + browserStreamToken,
 		'browser audio fallback did not use the protected stream URL'
 	);
-	app._presentCpuFrame(browserSession, 'blob:first-frame');
+	firstStreamFrame.naturalWidth = 640;
+	firstStreamFrame.onload();
 	await browserAudio.playPromise;
+	check(
+		document.getElementById('videoplayer-cpu-frame') === firstStreamFrame &&
+		browserFrame.parentNode === null &&
+		browserFrameParent.children.length === 1,
+		'first streamed image did not replace the blank staging surface'
+	);
 	check(browserSession.firstFrameSeen && browserSession.firstFrameAt,
-		'first frame did not establish the audio clock');
+		'first streamed image did not establish the audio clock');
 	check(
 		browserElement.currentTime >= 1.5 &&
 		browserElement.currentTime <= 2.5,
@@ -774,6 +921,11 @@ async function main() {
 	await app.handleStop();
 	check(app._cpuSession === null, 'Stop retained the CPU session');
 	check(!browserSession.active, 'Stop left the old CPU session active');
+	const stoppedFrame = document.getElementById('videoplayer-cpu-frame');
+	check(stoppedFrame && stoppedFrame.src === '',
+		'Stop retained the MJPEG stream URL');
+	check(stoppedFrame.onload === null && stoppedFrame.onerror === null,
+		'Stop retained MJPEG stream callbacks');
 	check(!browserAudio.active, 'Stop left browser audio active');
 	check(browserElement.pauseCalls > pauseCallsBeforeStop,
 		'Stop did not pause browser audio');
@@ -795,6 +947,409 @@ async function main() {
 			call.args[0] === 'b'.repeat(32)
 		),
 		'Stop did not stop the router renderer'
+	);
+
+	/* Browser audio is the synchronized primary output even when router PCM is
+	 * available. Autoplay fallback to muted playback is not a decode failure;
+	 * only a real media error promotes the dormant PCM context. */
+	const primaryElement = fakeMediaElement([
+		new Error('NotAllowedError'),
+		null
+	]);
+	elements['videoplayer-cpu-audio'] = primaryElement;
+	const primaryToken = '1'.repeat(32);
+	const primaryAudioToken = '9'.repeat(32);
+	const dormantPcm = {
+		active: true,
+		context: {
+			state: 'running',
+			currentTime: 1,
+			closed: false,
+			close() { this.closed = true; }
+		},
+		gain: null,
+		muted: false,
+		resumeFailed: false,
+		resumeAttempt: 0,
+		resumeRebasePending: false,
+		pollGeneration: 0,
+		timer: null,
+		inFlight: false,
+		inFlightGeneration: null,
+		sequence: null,
+		startedAt: Date.now(),
+		hasDecoded: false,
+		ended: false,
+		nextPlayTime: 0,
+		errors: 0,
+		warned: false,
+		sources: []
+	};
+	rpcHandlers.resolve_audio = rendererToken => {
+		check(rendererToken === primaryToken,
+			'primary browser audio resolved the wrong renderer');
+		return {
+			render_mode: 'browser',
+			stream_type: 'html5-video',
+			stream_url:
+				'/cgi-bin/videoplayer-stream?renderer=' + primaryToken +
+				'&audio=' + primaryAudioToken,
+			media_offset_ms: 500
+		};
+	};
+	const originalAudioScheduler = app._scheduleCpuAudioPoll;
+	let primaryPcmPolls = 0;
+	app._scheduleCpuAudioPoll = () => {
+		primaryPcmPolls++;
+	};
+	app._playGeneration = 60;
+	await app._playCpuStream({
+		session_token: primaryToken,
+		stream_url:
+			'/cgi-bin/videoplayer-frame?token=' + primaryToken,
+		render_mode: 'router',
+		stream_type: 'mjpeg-stream',
+		mime: 'multipart/x-mixed-replace',
+		stream_segment_seconds: 45,
+		has_audio: 1,
+		audio_url:
+			'/cgi-bin/videoplayer-audio?token=' + primaryToken,
+		audio_type: 'pcm-s16le-chunks',
+		audio_sample_rate: 48000,
+		audio_channels: 2,
+		audio_frames_per_chunk: 12000,
+		router_fps: 60
+	}, 'primary-audio.mp4', 60, dormantPcm);
+	const primarySession = app._cpuSession;
+	const primaryBrowserAudio = primarySession.browserAudio;
+	check(
+		primarySession.audio === null &&
+		primarySession.pendingAudio === dormantPcm &&
+		primaryPcmPolls === 0,
+		'router PCM started before synchronized browser audio failed'
+	);
+	primarySession.streamPending.node.naturalWidth = 640;
+	primarySession.streamPending.node.onload();
+	await primaryBrowserAudio.playPromise;
+	check(
+		primaryBrowserAudio.playing &&
+		primaryBrowserAudio.muted &&
+		primaryBrowserAudio.needsGesture &&
+		primarySession.audio === null &&
+		primaryPcmPolls === 0,
+		'autoplay mute fallback incorrectly activated router PCM'
+	);
+	primaryElement.onerror();
+	check(
+		primarySession.browserAudio === null &&
+		primarySession.browserAudioFailed &&
+		primarySession.audio === dormantPcm &&
+		primarySession.pendingAudio === null &&
+		primaryPcmPolls === 1,
+		'real browser-audio failure did not promote router PCM exactly once'
+	);
+	check(primaryElement.src === '' && !primaryBrowserAudio.active,
+		'PCM failover left browser audio active');
+	app._stopPlayback();
+	check(dormantPcm.context.closed,
+		'stopping PCM fallback did not close its AudioContext');
+	app._scheduleCpuAudioPoll = originalAudioScheduler;
+
+	/* A broken multipart connection is retried as a stream, not converted
+	 * back into per-frame fetches. Stop must invalidate even a captured stale
+	 * error callback so it cannot resurrect the request. */
+	const reconnectSession = {
+		active: true,
+		generation: 62,
+		token: '2'.repeat(32),
+		label: 'reconnect.mp4',
+		fps: 60,
+		streamUrl:
+			'/cgi-bin/videoplayer-frame?token=' + '2'.repeat(32),
+		streamSegmentMs: 45000,
+		visibleFrame: document.getElementById('videoplayer-cpu-frame'),
+		streamAttempt: 0,
+		streamPending: null,
+		streamVisibleAttempt: null,
+		streamOutageStartedAt: null,
+		streamNextHandoffAt: null,
+		streamProbeTimer: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamStatusTimer: null,
+		streamStatusInFlight: false,
+		streamStatusAgain: false,
+		streamStatusErrors: 0,
+		streamErrors: 0,
+		firstFrameSeen: true,
+		audio: null,
+		browserAudio: null,
+		finishing: null,
+		finishTimer: null
+	};
+	app._cpuSession = reconnectSession;
+	app._playGeneration = 62;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._openCpuStream(reconnectSession);
+	const reconnectFrame = reconnectSession.streamPending.node;
+	const staleStreamError = reconnectFrame.onerror;
+	staleStreamError();
+	check(reconnectSession.streamErrors === 1,
+		'MJPEG interruption was not counted');
+	check(reconnectSession.streamReconnectTimer !== null,
+		'MJPEG interruption did not schedule a bounded reconnect');
+	check(unexpectedFrameRequests === 0,
+		'MJPEG reconnect attempted a per-frame HTTP request');
+	app._stopPlayback();
+	staleStreamError();
+	check(
+		app._cpuSession === null &&
+		document.getElementById('videoplayer-cpu-frame').src === '',
+		'a stale MJPEG error callback resurrected stopped playback');
+
+	/* Every attempt must use a fresh image so naturalWidth from the previous
+	 * segment cannot produce a false success. Keep the last good node visible
+	 * while a bounded segment hands off, including a lock-conflict retry. */
+	const transportClock = installFakeClock();
+	const originalStatusScheduler = app._scheduleCpuStreamStatus;
+	app._scheduleCpuStreamStatus = () => {};
+	const handoffBase = document.getElementById('videoplayer-cpu-frame');
+	handoffBase.naturalWidth = 640;
+	const handoffSession = {
+		active: true,
+		generation: 65,
+		token: '7'.repeat(32),
+		label: 'handoff.mp4',
+		fps: 60,
+		streamUrl:
+			'/cgi-bin/videoplayer-frame?token=' + '7'.repeat(32),
+		streamSegmentMs: 1000,
+		visibleFrame: handoffBase,
+		streamAttempt: 0,
+		streamPending: null,
+		streamVisibleAttempt: null,
+		streamLastFrameAt: null,
+		streamOutageStartedAt: null,
+		streamNextHandoffAt: null,
+		streamHiddenAt: null,
+		streamProbeTimer: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamStatusTimer: null,
+		streamStatusInFlight: false,
+		streamStatusAgain: false,
+		streamStatusErrors: 0,
+		streamErrors: 0,
+		streamWarned: false,
+		firstFrameSeen: false,
+		audio: null,
+		pendingAudio: null,
+		browserAudio: null,
+		finishing: null,
+		finishTimer: null
+	};
+	app._cpuSession = handoffSession;
+	app._playGeneration = 65;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._openCpuStream(handoffSession);
+	const handoffFirst = handoffSession.streamPending;
+	check(handoffFirst && handoffFirst.node.naturalWidth === 0,
+		'new MJPEG attempt inherited the old image dimensions');
+	transportClock.advance(100);
+	check(handoffSession.streamPending === handoffFirst &&
+		!handoffSession.firstFrameSeen,
+		'stale dimensions made a fresh MJPEG attempt ready');
+	handoffFirst.node.naturalWidth = 640;
+	transportClock.advance(100);
+	check(
+		handoffSession.streamVisibleAttempt === handoffFirst &&
+		handoffBase.parentNode === null &&
+		browserFrameParent.children.length === 1,
+		'fresh MJPEG image was not promoted atomically'
+	);
+	const handoffVisible = handoffSession.visibleFrame;
+	transportClock.advance(1049);
+	check(!handoffSession.streamPending,
+		'MJPEG successor started before the bounded segment handoff');
+	transportClock.advance(1);
+	const conflictedAttempt = handoffSession.streamPending;
+	check(
+		conflictedAttempt &&
+		conflictedAttempt.node.src.endsWith('&stream=65-2') &&
+		handoffSession.visibleFrame === handoffVisible &&
+		handoffVisible.parentNode === browserFrameParent,
+		'planned MJPEG handoff did not preserve the last good image'
+	);
+	conflictedAttempt.node.onerror();
+	check(
+		!handoffSession.streamPending &&
+		handoffVisible.parentNode === browserFrameParent &&
+		handoffVisible.src.endsWith('&stream=65-1'),
+		'stream-lock conflict removed the last good image'
+	);
+	transportClock.advance(249);
+	check(!handoffSession.streamPending,
+		'stream-lock retry ignored its bounded delay');
+	transportClock.advance(1);
+	const retryAttempt = handoffSession.streamPending;
+	check(retryAttempt &&
+		retryAttempt.node.src.endsWith('&stream=65-3'),
+		'stream-lock retry did not use a fresh nonce');
+	retryAttempt.node.naturalWidth = 640;
+	retryAttempt.node.onload();
+	check(
+		handoffSession.visibleFrame === retryAttempt.node &&
+		handoffVisible.parentNode === null &&
+		browserFrameParent.children.length === 1,
+		'successful retry did not replace the old segment cleanly'
+	);
+
+	/* Brief tab switches do not disturb a healthy connection. If background
+	 * timer throttling carries the segment past its deadline, visibility
+	 * recovery starts exactly one fresh handoff. */
+	document.hidden = true;
+	app._handleCpuVisibilityChange();
+	transportClock.jump(100);
+	document.hidden = false;
+	app._handleCpuVisibilityChange();
+	transportClock.advance(0);
+	check(!handoffSession.streamPending &&
+		handoffSession.streamAttempt === 3,
+		'brief visibility change restarted a healthy MJPEG stream');
+	document.hidden = true;
+	app._handleCpuVisibilityChange();
+	transportClock.jump(2000);
+	document.hidden = false;
+	app._handleCpuVisibilityChange();
+	transportClock.advance(0);
+	check(
+		handoffSession.streamPending &&
+		handoffSession.streamAttempt === 4,
+		'overdue hidden MJPEG segment was not recovered'
+	);
+	app._stopPlayback();
+
+	/* A prior successful frame must not make later outages infinite. Audio can
+	 * keep the backend lease alive, so transport failure has its own deadline. */
+	const outageBase = document.getElementById('videoplayer-cpu-frame');
+	const outageSession = {
+		active: true,
+		generation: 66,
+		token: '8'.repeat(32),
+		label: 'outage.mp4',
+		fps: 60,
+		streamUrl:
+			'/cgi-bin/videoplayer-frame?token=' + '8'.repeat(32),
+		streamSegmentMs: 45000,
+		visibleFrame: outageBase,
+		streamAttempt: 0,
+		streamPending: null,
+		streamVisibleAttempt: null,
+		streamLastFrameAt: null,
+		streamOutageStartedAt: null,
+		streamNextHandoffAt: null,
+		streamHiddenAt: null,
+		streamProbeTimer: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamStatusTimer: null,
+		streamStatusInFlight: false,
+		streamStatusAgain: false,
+		streamStatusErrors: 0,
+		streamErrors: 0,
+		streamWarned: false,
+		firstFrameSeen: false,
+		audio: {
+			active: true,
+			timer: null,
+			inFlight: false,
+			inFlightGeneration: null,
+			sources: [],
+			gain: null,
+			context: null
+		},
+		pendingAudio: null,
+		browserAudio: null,
+		finishing: null,
+		finishTimer: null
+	};
+	app._cpuSession = outageSession;
+	app._playGeneration = 66;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._openCpuStream(outageSession);
+	outageSession.streamPending.node.naturalWidth = 640;
+	outageSession.streamPending.node.onload();
+	outageSession.streamVisibleAttempt.node.onerror();
+	for (let i = 0; i < 6 && app._cpuSession === outageSession; i++) {
+		transportClock.advance(3000);
+		if (outageSession.streamPending)
+			outageSession.streamPending.node.onerror();
+	}
+	check(app._cpuSession === null && !outageSession.active,
+		'post-success MJPEG outage retried forever while audio was active');
+	app._scheduleCpuStreamStatus = originalStatusScheduler;
+	transportClock.restore();
+
+	/* Renderer status is the authoritative EOF signal because image elements
+	 * do not expose multipart HTTP status or a reliable end event. */
+	const endedSession = {
+		active: true,
+		generation: 63,
+		token: '3'.repeat(32),
+		label: 'ended.mp4',
+		fps: 8,
+		streamAttempt: 0,
+		streamProbeTimer: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamStatusTimer: null,
+		streamStatusInFlight: false,
+		streamStatusAgain: false,
+		streamStatusErrors: 0,
+		firstFrameSeen: true,
+		audio: null,
+		browserAudio: null,
+		finishing: null,
+		finishTimer: null
+	};
+	app._cpuSession = endedSession;
+	app._playGeneration = 63;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	rpcHandlers.renderer_status = () => ({ state: 'ended' });
+	await app._pollCpuStreamStatus(endedSession);
+	check(app._cpuSession === null,
+		'ended renderer status retained the MJPEG session');
+
+	/* The backend URL is intentionally opaque. Extra query fields, a wrong
+	 * stream type, or a wrong MIME must fail closed instead of becoming an
+	 * arbitrary image request. */
+	const invalidStreamToken = '4'.repeat(32);
+	rpcCalls.length = 0;
+	app._playGeneration = 64;
+	await app._playCpuStream({
+		session_token: invalidStreamToken,
+		stream_url:
+			'/cgi-bin/videoplayer-frame?token=' + invalidStreamToken +
+			'&extra=1',
+		render_mode: 'router',
+		stream_type: 'mjpeg-stream',
+		mime: 'multipart/x-mixed-replace',
+		stream_segment_seconds: 45,
+		has_audio: 0,
+		router_fps: 60
+	}, 'invalid-stream.mp4', 64, null);
+	check(app._cpuSession === null,
+		'frontend accepted a noncanonical MJPEG URL');
+	check(
+		rpcCalls.some(call =>
+			call.method === 'stop_renderer' &&
+			call.args[0] === invalidStreamToken
+		),
+		'invalid MJPEG session was not stopped'
 	);
 
 	/* A frame token is intentionally insufficient for opening the original

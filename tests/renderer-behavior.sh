@@ -20,7 +20,7 @@ source_stream="$repo_root/luci-app-videoplayer/root/www/cgi-bin/videoplayer-stre
 [[ -f "$source_helper" ]] || fail "renderer helper not found"
 [[ -f "$source_stream" ]] || fail "stream CGI not found"
 
-for tool in cc flock python3 readlink sed stat; do
+for tool in cc flock python3 readlink sed stat timeout; do
 	command -v "$tool" >/dev/null || fail "$tool is required"
 done
 
@@ -107,6 +107,8 @@ grep -Fq '/usr/libexec/videoplayer-ffmpeg/ffmpeg' "$source_helper" ||
 	fail "unexpected private FFmpeg path"
 grep -Fq '/usr/lib/videoplayer-ffmpeg' "$source_helper" ||
 	fail "unexpected private FFmpeg library path"
+grep -Fq 'MJPEG_SEGMENT_SECONDS=45' "$source_helper" ||
+	fail "unexpected MJPEG segment duration"
 
 sed \
 	-e "s|export PATH=\"/usr/sbin:/usr/bin:/sbin:/bin\"|export PATH=\"$bin:/usr/sbin:/usr/bin:/sbin:/bin\"|" \
@@ -114,8 +116,9 @@ sed \
 	-e "s|/usr/libexec/videoplayer-renderer|$helper|g" \
 	-e "s|/usr/libexec/videoplayer-ffmpeg/ffmpeg|$private_ffmpeg|g" \
 	-e "s|/usr/lib/videoplayer-ffmpeg|$private_lib_dir|g" \
+	-e 's|MJPEG_SEGMENT_SECONDS=45|MJPEG_SEGMENT_SECONDS=2|' \
 	-e '/^[[:space:]]*ffmpeg_pid=\$!$/a\
-	sleep 0.05' \
+sleep 0.05' \
 	"$source_helper" > "$helper"
 
 chmod 0755 "$helper"
@@ -216,6 +219,17 @@ static int count_pair(
 	return count;
 }
 
+static const char *pair_value(int argc, char **argv, const char *left)
+{
+	int i;
+
+	for (i = 1; i + 1 < argc; ++i)
+		if (strcmp(argv[i], left) == 0)
+			return argv[i + 1];
+
+	return NULL;
+}
+
 static int ends_with(const char *text, const char *suffix)
 {
 	size_t text_len = strlen(text);
@@ -245,37 +259,101 @@ static int output_is_safe(const char *output, const char *suffix)
 	       ends_with(output, suffix);
 }
 
-static int publish(const char *output)
+static int boundary_matches_output(const char *boundary, const char *output)
 {
-	static const unsigned char frame[] = {
-		0xff, 0xd8, 0xff, 0xd9
-	};
-	char temporary[4096];
-	int fd;
+	const char *root = getenv("VIDEOPLAYER_TEST_RUNTIME");
+	const char *token;
+	size_t root_len;
 
-	if (snprintf(
-		    temporary,
-		    sizeof(temporary),
-		    "%s.tmp",
-		    output) >= (int)sizeof(temporary))
-		return -1;
+	if (root == NULL || boundary == NULL)
+		return 0;
+	root_len = strlen(root);
+	if (strncmp(output, root, root_len) != 0 ||
+	    strncmp(output + root_len, "/s-", 3) != 0)
+		return 0;
+	token = output + root_len + 3;
+	return strlen(boundary) == 44 &&
+	       strncmp(boundary, "videoplayer-", 12) == 0 &&
+	       strncmp(boundary + 12, token, 32) == 0 &&
+	       token[32] == '/';
+}
 
-	fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0)
-		return -1;
+static int write_all(int fd, const void *buffer, size_t size)
+{
+	const unsigned char *bytes = buffer;
+	size_t written = 0;
+	ssize_t result;
 
-	if (write(fd, frame, sizeof(frame)) != (ssize_t)sizeof(frame)) {
-		close(fd);
-		unlink(temporary);
+	while (written < size) {
+		result = write(fd, bytes + written, size - written);
+		if (result > 0) {
+			written += (size_t)result;
+			continue;
+		}
+		if (result < 0 && errno == EINTR) {
+			if (!running)
+				return -1;
+			continue;
+		}
 		return -1;
 	}
+	return 0;
+}
 
-	if (close(fd) != 0 || rename(temporary, output) != 0) {
-		unlink(temporary);
+static int publish_mjpeg(
+	int fd,
+	const char *boundary,
+	unsigned int sequence)
+{
+	unsigned char frame[4096];
+	char header[256];
+	int header_size;
+
+	memset(frame, 0x5a, sizeof(frame));
+	frame[0] = 0xff;
+	frame[1] = 0xd8;
+	frame[2] = 'V';
+	frame[3] = 'P';
+	frame[4] = (unsigned char)((sequence >> 24) & 0xffU);
+	frame[5] = (unsigned char)((sequence >> 16) & 0xffU);
+	frame[6] = (unsigned char)((sequence >> 8) & 0xffU);
+	frame[7] = (unsigned char)(sequence & 0xffU);
+	frame[sizeof(frame) - 2] = 0xff;
+	frame[sizeof(frame) - 1] = 0xd9;
+
+	header_size = snprintf(
+		header,
+		sizeof(header),
+		"--%s\r\n"
+		"Content-type: image/jpeg\r\n"
+		"Content-length: %zu\r\n"
+		"\r\n",
+		boundary,
+		sizeof(frame));
+	if (header_size < 0 || header_size >= (int)sizeof(header))
 		return -1;
-	}
+
+	if (write_all(fd, header, (size_t)header_size) != 0 ||
+	    write_all(fd, frame, sizeof(frame)) != 0 ||
+	    write_all(fd, "\r\n", 2) != 0)
+		return -1;
 
 	return 0;
+}
+
+static int publish_mjpeg_trailer(int fd, const char *boundary)
+{
+	char trailer[96];
+	int trailer_size;
+
+	trailer_size = snprintf(
+		trailer,
+		sizeof(trailer),
+		"--%s\r\n",
+		boundary);
+	if (trailer_size < 0 || trailer_size >= (int)sizeof(trailer))
+		return -1;
+	return write_all(fd, trailer, (size_t)trailer_size);
 }
 
 static int publish_audio(int fd, unsigned int sequence)
@@ -315,19 +393,24 @@ int main(int argc, char **argv)
 	struct stat input;
 	char marker[32] = {0};
 	char expected_video_filter[256];
+	char *fps_end = NULL;
+	const char *boundary;
 	const char *output;
 	int input_fd;
 	int is_audio;
 	int audio_fail;
 	int audio_finite;
 	int audio_output_fd;
+	int video_output_fd;
 	int delayed_video;
 	int fail_after_first_frame;
 	int finite_video;
 	int instant_video;
 	int line;
+	unsigned int frame_delay_us;
 	unsigned int audio_sequence = 0;
 	unsigned int video_sequence = 0;
+	unsigned long parsed_fps;
 	ssize_t marker_size;
 	const char *expected_private_lib;
 	const char *expected_fps;
@@ -338,6 +421,12 @@ int main(int argc, char **argv)
 	library_path = getenv("LD_LIBRARY_PATH");
 	if (expected_fps == NULL || expected_fps[0] == '\0')
 		expected_fps = "8";
+	errno = 0;
+	parsed_fps = strtoul(expected_fps, &fps_end, 10);
+	if (errno != 0 || fps_end == expected_fps || *fps_end != '\0' ||
+	    parsed_fps == 0 || parsed_fps > 1000)
+		return 78;
+	frame_delay_us = (unsigned int)(1000000UL / parsed_fps);
 	if (snprintf(
 		    expected_video_filter,
 		    sizeof(expected_video_filter),
@@ -361,8 +450,14 @@ int main(int argc, char **argv)
 	}
 
 	if (has_arg(argc, argv, "-muxers")) {
-		puts(" E image2 CI stub");
+		puts(" E mpjpeg CI stub");
 		puts(" E s16le CI stub");
+		return 0;
+	}
+
+	if (count_pair(argc, argv, "-h", "muxer=mpjpeg") == 1) {
+		puts("mpjpeg_muxer AVOptions:");
+		puts("  -boundary_tag <string> E.......... Boundary tag");
 		return 0;
 	}
 
@@ -377,6 +472,7 @@ int main(int argc, char **argv)
 	}
 
 	output = argv[argc - 1];
+	boundary = pair_value(argc, argv, "-boundary_tag");
 	is_audio = ends_with(output, "/audio.pipe");
 	input_fd = is_audio ? 4 : 3;
 	errno = 0;
@@ -421,10 +517,13 @@ int main(int argc, char **argv)
 		    "-vf",
 		    expected_video_filter) != 1 ||
 	    count_pair(argc, argv, "-c:v", "mjpeg") != 1 ||
-	    count_pair(argc, argv, "-f", "image2") != 1 ||
-	    count_pair(argc, argv, "-update", "1") != 1 ||
-	    count_pair(argc, argv, "-atomic_writing", "1") != 1 ||
-	    !output_is_safe(output, "/frame.jpg"))
+	    count_pair(argc, argv, "-f", "mpjpeg") != 1 ||
+	    boundary == NULL ||
+	    count_pair(argc, argv, "-boundary_tag", boundary) != 1 ||
+	    has_arg(argc, argv, "-update") ||
+	    has_arg(argc, argv, "-atomic_writing") ||
+	    !output_is_safe(output, "/video.pipe") ||
+	    !boundary_matches_output(boundary, output))
 		return 64;
 
 	marker_size = pread(input_fd, marker, sizeof(marker) - 1, 0);
@@ -521,7 +620,7 @@ int main(int argc, char **argv)
 		return 74;
 	if (marker_is(marker, marker_size, "unsupported-option")) {
 		fputs(
-			"Unrecognized option 'atomic_writing'.\n"
+			"Unrecognized option 'boundary_tag'.\n"
 			"Error splitting the argument list: Option not found\n",
 			stderr);
 		return 75;
@@ -540,7 +639,7 @@ int main(int argc, char **argv)
 		for (line = 0; line < 200; line++)
 			fputc('X', stderr);
 		fputs(
-			"\n[out#0/image2 @ 0x5678] Error opening output file "
+			"\n[out#0/mpjpeg @ 0x5678] Error opening output file "
 			"/tmp/private.\n"
 			"Conversion failed!\n",
 			stderr);
@@ -562,23 +661,42 @@ int main(int argc, char **argv)
 
 	if (delayed_video)
 		sleep(4);
+	video_output_fd = open(output, O_WRONLY);
+	if (video_output_fd < 0)
+		return 66;
 	while (running) {
-		if (publish(output) != 0)
+		if (publish_mjpeg(video_output_fd, boundary, video_sequence) != 0) {
+			close(video_output_fd);
 			return 66;
+		}
 		video_sequence++;
-		if (instant_video)
+		if (instant_video) {
+			if (publish_mjpeg_trailer(video_output_fd, boundary) != 0) {
+				close(video_output_fd);
+				return 66;
+			}
+			close(video_output_fd);
 			return 0;
-		if (finite_video && video_sequence >= 4)
+		}
+		if (finite_video && video_sequence >= 4) {
+			if (publish_mjpeg_trailer(video_output_fd, boundary) != 0) {
+				close(video_output_fd);
+				return 66;
+			}
+			close(video_output_fd);
 			return 0;
+		}
 		if (fail_after_first_frame) {
 			sleep(4);
 			fputs("Cannot allocate memory while decoding frame\n", stderr);
+			close(video_output_fd);
 			return 69;
 		}
 
-		usleep(100000);
+		usleep(frame_delay_us);
 	}
 
+	close(video_output_fd);
 	return 0;
 }
 C
@@ -620,30 +738,120 @@ printf '%s\n%s\n%s\n' \
 	> "$stream_token_dir/t-cdc"
 chmod 0600 "$stream_token_dir/t-aba" "$stream_token_dir/t-cdc"
 
-check_response() {
+check_mjpeg_response() {
+	python3 - "$1" "$2" "$3" "$4" <<'PY'
+from pathlib import Path
+import sys
+
+payload = Path(sys.argv[1]).read_bytes()
+token = sys.argv[2]
+minimum_parts = int(sys.argv[3])
+mode = sys.argv[4]
+assert mode in {"initial", "reconnect", "finite"}, mode
+head, marker, body = payload.partition(b"\r\n\r\n")
+assert marker, "MJPEG CGI response has no CRLF header terminator"
+
+lines = head.decode("ascii").split("\r\n")
+assert lines[0] == "Status: 200 OK", lines[0]
+headers = dict(line.split(": ", 1) for line in lines[1:])
+boundary = f"videoplayer-{token}".encode("ascii")
+assert headers["Content-Type"] == (
+	"multipart/x-mixed-replace; boundary=" + boundary.decode("ascii")
+), headers["Content-Type"]
+assert "Content-Length" not in headers
+assert headers["Cache-Control"].startswith("no-store")
+assert headers["Cross-Origin-Resource-Policy"] == "same-origin"
+
+delimiter = b"--" + boundary
+first_boundary = body.find(delimiter)
+assert first_boundary >= 0, (
+	f"MJPEG body has no complete boundary: file={sys.argv[1]!r}, "
+	f"bytes={len(body)}, preview={body[:160]!r}"
+)
+if mode in {"initial", "finite"}:
+	assert first_boundary == 0, first_boundary
+else:
+	assert first_boundary <= 8192, first_boundary
+
+offset = first_boundary
+sequences = []
+trailer = False
+partial_tail = False
+while True:
+	assert body.startswith(delimiter, offset), (offset, body[offset : offset + 80])
+	offset += len(delimiter)
+	if not body.startswith(b"\r\n", offset):
+		if body[offset:] in {b"", b"\r"}:
+			partial_tail = True
+			offset = len(body)
+			break
+		raise AssertionError((offset, body[offset : offset + 80]))
+	offset += 2
+
+	# FFmpeg's mpjpeg muxer ends a clean stream with a bare boundary followed
+	# by CRLF. It deliberately does not append RFC 2046's optional "--".
+	if offset == len(body):
+		trailer = True
+		break
+
+	part_head_end = body.find(b"\r\n\r\n", offset)
+	if part_head_end < 0:
+		partial_tail = True
+		offset = len(body)
+		break
+	raw_part_headers = body[offset:part_head_end]
+	assert raw_part_headers == (
+		b"Content-type: image/jpeg\r\nContent-length: 4096"
+	), raw_part_headers
+	length = 4096
+	offset = part_head_end + 4
+	if offset + length + 2 > len(body):
+		partial_tail = True
+		offset = len(body)
+		break
+	frame = body[offset : offset + length]
+	assert frame[:4] == b"\xff\xd8VP", frame[:8]
+	assert frame[-2:] == b"\xff\xd9", frame[-8:]
+	sequence = int.from_bytes(frame[4:8], "big")
+	if sequences:
+		assert sequence == sequences[-1] + 1, (sequences[-1], sequence)
+	sequences.append(sequence)
+	offset += length
+	assert body.startswith(b"\r\n", offset)
+	offset += 2
+	if offset == len(body):
+		break
+	if not body.startswith(delimiter, offset):
+		assert delimiter.startswith(body[offset:]), body[offset : offset + 80]
+		partial_tail = True
+		offset = len(body)
+		break
+
+assert offset == len(body), (offset, len(body))
+assert len(sequences) >= minimum_parts, (len(sequences), minimum_parts)
+if mode == "finite":
+	assert trailer, "finite FFmpeg stream has no bare-boundary trailer"
+	assert not partial_tail, "finite FFmpeg stream ended mid-part"
+print(f"{len(sequences)}:{sequences[0]}:{sequences[-1]}:{first_boundary}")
+PY
+}
+
+check_mjpeg_head() {
 	python3 - "$1" "$2" <<'PY'
 from pathlib import Path
 import sys
 
 payload = Path(sys.argv[1]).read_bytes()
 head, marker, body = payload.partition(b"\r\n\r\n")
-assert marker, "CGI response has no CRLF header terminator"
-
+assert marker, "MJPEG HEAD response has no CRLF header terminator"
 lines = head.decode("ascii").split("\r\n")
 assert lines[0] == "Status: 200 OK", lines[0]
-
 headers = dict(line.split(": ", 1) for line in lines[1:])
-assert headers["Content-Type"] == "image/jpeg"
-assert headers["Cache-Control"].startswith("no-store")
-
-length = int(headers["Content-Length"])
-
-if sys.argv[2] == "GET":
-	assert body == b"\xff\xd8\xff\xd9", body
-	assert length == len(body)
-else:
-	assert body == b"", body
-	assert length == 4
+assert headers["Content-Type"] == (
+	f"multipart/x-mixed-replace; boundary=videoplayer-{sys.argv[2]}"
+)
+assert "Content-Length" not in headers
+assert body == b"", body
 PY
 }
 
@@ -753,10 +961,38 @@ assert_audio_storage_bound() {
 		fail "audio storage exceeded its byte bound: $AUDIO_TOTAL_BYTES"
 }
 
-run_cgi() {
-	REQUEST_METHOD="$1" \
-	QUERY_STRING="token=$2&frame=$3" \
-		"$helper" cgi > "$4"
+run_mjpeg_cgi() {
+	REQUEST_METHOD=GET \
+	QUERY_STRING="token=$1&stream=$2" \
+		"$helper" cgi > "$3"
+}
+
+run_mjpeg_disconnect() {
+	local -a statuses
+
+	set +e
+	REQUEST_METHOD=GET \
+	QUERY_STRING="token=$1&stream=$2" \
+		timeout 5 "$helper" cgi |
+		head -c 10000 > "$3"
+	statuses=("${PIPESTATUS[@]}")
+	set -e
+
+	[[ "${statuses[1]}" -eq 0 ]] ||
+		fail "MJPEG disconnect sink failed: ${statuses[*]}"
+	case "${statuses[0]}" in
+		0|141)
+			;;
+		*)
+			fail "MJPEG producer ignored disconnect: ${statuses[*]}"
+			;;
+	esac
+}
+
+run_mjpeg_head() {
+	REQUEST_METHOD=HEAD \
+	QUERY_STRING="token=$1" \
+		"$helper" cgi > "$2"
 }
 
 run_audio_cgi() {
@@ -1039,6 +1275,7 @@ assert_eq \
 	"$("$helper" status "$noisy_diagnostics")" \
 	running \
 	"status after large diagnostic stream"
+noisy_worker="$(session_pid "$noisy_diagnostics" worker)"
 diagnostic_size="$(stat -c '%s' "$runtime/s-$noisy_diagnostics/ffmpeg.log")"
 [[ "$diagnostic_size" -gt 0 && "$diagnostic_size" -le 65536 ]] ||
 	fail "diagnostic capture exceeded its 64 KiB limit: $diagnostic_size"
@@ -1046,9 +1283,19 @@ assert_eq \
 	"$("$helper" stop "$noisy_diagnostics")" \
 	stopped \
 	"stop after large diagnostic stream"
-[[ ! -e "$runtime/s-$noisy_diagnostics/ffmpeg.log" &&
-   ! -e "$runtime/s-$noisy_diagnostics/ffmpeg-log.pipe" ]] ||
-	fail "large diagnostic stream artifacts were not cleaned"
+if [[ -e "$runtime/s-$noisy_diagnostics/ffmpeg.log" ||
+      -e "$runtime/s-$noisy_diagnostics/ffmpeg-log.pipe" ]]; then
+	noisy_artifacts="$(
+		stat -c '%n:%F:%u:%a:%s' -- \
+			"$runtime/s-$noisy_diagnostics/ffmpeg.log" \
+			"$runtime/s-$noisy_diagnostics/ffmpeg-log.pipe" \
+			2>/dev/null || true
+	)"
+	noisy_status="$("$helper" status "$noisy_diagnostics" 2>&1 || true)"
+	noisy_worker_alive=no
+	kill -0 "$noisy_worker" 2>/dev/null && noisy_worker_alive=yes
+	fail "large diagnostic stream artifacts were not cleaned: $noisy_artifacts; status=$noisy_status; worker_alive=$noisy_worker_alive"
+fi
 
 assert_eq \
 	"$("$helper" start "$runtime_failure" "$work/media/runtime.mp4")" \
@@ -1112,8 +1359,9 @@ position_ms="$("$helper" position-ms "$no_audio" "$no_audio_capability")"
 [[ "$position_ms" =~ ^[0-9]+$ && "$position_ms" -le 21605000 ]] ||
 	fail "invalid renderer playback offset: $position_ms"
 assert_eq "$("$helper" has-audio "$no_audio")" 0 "video-only audio capability"
-run_cgi GET "$no_audio" 1 "$work/response"
-check_response "$work/response" GET
+run_mjpeg_cgi "$no_audio" 1-1 "$work/no-audio-mjpeg"
+check_mjpeg_response \
+	"$work/no-audio-mjpeg" "$no_audio" 1 initial >/dev/null
 run_audio_cgi GET "$no_audio" live "$work/audio-response"
 check_status_line "$work/audio-response" "409 Conflict"
 run_stream_cgi HEAD "$no_audio" "$no_audio_capability" \
@@ -1174,8 +1422,8 @@ mv -- "$work/media/no-audio-extensionless.opened" \
 	"$work/media/no-audio-extensionless"
 
 # A one-frame input may exit before the worker's first monitoring pass. Its
-# completed frame must still make start succeed and remain fetchable long
-# enough for the web UI to observe the session.
+# complete mpjpeg stream must still make start succeed and remain fetchable
+# long enough for the web UI to observe the session.
 assert_eq \
 	"$("$helper" start "$instant_media" "$work/media/instant-media.mp4")" \
 	started \
@@ -1185,8 +1433,9 @@ assert_eq \
 	"$("$helper" status "$instant_media")" \
 	running \
 	"instant-media startup grace"
-run_cgi GET "$instant_media" 1 "$work/response"
-check_response "$work/response" GET
+run_mjpeg_cgi "$instant_media" 1-1 "$work/instant-mjpeg"
+check_mjpeg_response \
+	"$work/instant-mjpeg" "$instant_media" 1 finite >/dev/null
 for _ in {1..200}; do
 	[[ "$("$helper" status "$instant_media")" == ended ]] && break
 	sleep 0.05
@@ -1258,6 +1507,9 @@ assert_eq \
 	"finite-media start"
 finite_media_worker="$(session_pid "$finite_media" worker)"
 finite_media_ffmpeg="$(session_pid "$finite_media" ffmpeg)"
+run_mjpeg_cgi "$finite_media" 1-1 "$work/finite-media-mjpeg"
+check_mjpeg_response \
+	"$work/finite-media-mjpeg" "$finite_media" 4 finite >/dev/null
 for _ in {1..200}; do
 	[[ "$("$helper" status "$finite_media")" == ended ]] && break
 	sleep 0.05
@@ -1296,8 +1548,9 @@ for _ in {1..100}; do
 done
 assert_eq "$audio_failure_audio" 0 "audio-failure state"
 assert_eq "$audio_failure_video" running "audio-failure video status"
-run_cgi GET "$audio_failure" 1 "$work/response"
-check_response "$work/response" GET
+run_mjpeg_cgi "$audio_failure" 1-1 "$work/audio-failure-mjpeg"
+check_mjpeg_response \
+	"$work/audio-failure-mjpeg" "$audio_failure" 1 initial >/dev/null
 assert_eq "$("$helper" stop "$audio_failure")" stopped "audio-failure stop"
 
 # Killing only the chunker must make the optional audio track fail closed,
@@ -1335,8 +1588,9 @@ assert_eq \
 	"$("$helper" status "$chunker_failure")" \
 	running \
 	"chunker-failure video status"
-run_cgi GET "$chunker_failure" 1 "$work/response"
-check_response "$work/response" GET
+run_mjpeg_cgi "$chunker_failure" 1-1 "$work/chunker-failure-mjpeg"
+check_mjpeg_response \
+	"$work/chunker-failure-mjpeg" "$chunker_failure" 1 initial >/dev/null
 assert_eq \
 	"$("$helper" stop "$chunker_failure")" \
 	stopped \
@@ -1353,9 +1607,11 @@ assert_eq \
 	"runtime permissions"
 
 assert_eq \
-	"$(stat -c '%u:%a' -- "$runtime/s-$token1/frame.jpg")" \
-	0:600 \
-	"frame permissions"
+	"$(stat -c '%u:%a:%F' -- "$runtime/s-$token1/video.pipe")" \
+	0:600:fifo \
+	"video FIFO permissions"
+[[ ! -e "$runtime/s-$token1/frame.jpg" ]] ||
+	fail "legacy frame snapshot unexpectedly exists"
 
 worker1="$(session_pid "$token1" worker)"
 ffmpeg1="$(session_pid "$token1" ffmpeg)"
@@ -1369,6 +1625,10 @@ assert_eq \
 	"$(tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" | sed -n '1p')" \
 	"$private_ffmpeg" \
 	"private FFmpeg process identity"
+assert_eq \
+	"$(tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" | tail -n 1)" \
+	"$runtime/s-$token1/video.pipe" \
+	"video FFmpeg process identity"
 assert_eq \
 	"$(tr '\000' '\n' < "/proc/$audio1/cmdline" | tail -n 1)" \
 	"$runtime/s-$token1/audio.pipe" \
@@ -1405,15 +1665,128 @@ kill -CONT "$chunker1"
 heartbeat="$runtime/s-$token1/heartbeat"
 before="$(< "$heartbeat")"
 
+# Token-only requests expose FFmpeg's continuous multipart MJPEG stream. HEAD
+# describes it without acquiring the single-viewer lock or renewing playback.
+run_mjpeg_head "$token1" "$work/mjpeg-head"
+check_mjpeg_head "$work/mjpeg-head" "$token1"
+assert_eq "$(< "$heartbeat")" "$before" "MJPEG HEAD heartbeat"
+
+# Keep one stream open long enough to prove that 60 FPS FFmpeg output shares
+# one HTTP response. A concurrent viewer must fail fast instead of consuming
+# all of uhttpd's bounded CGI worker slots.
 while [[ "$(date +%s)" -le "$before" ]]; do
 	sleep 0.05
 done
-
-run_cgi GET "$token1" 1-1 "$work/response"
-check_response "$work/response" GET
-
+ffmpeg_identity_before="$(< "$runtime/s-$token1/ffmpeg")"
+run_mjpeg_cgi "$token1" 1-1 "$work/mjpeg-response" &
+mjpeg_pid=$!
+for _ in {1..100}; do
+	grep -aFq 'Content-Type: multipart/x-mixed-replace; boundary=' \
+		"$work/mjpeg-response" 2>/dev/null && break
+	sleep 0.02
+done
+grep -aFq 'Content-Type: multipart/x-mixed-replace; boundary=' \
+	"$work/mjpeg-response" ||
+	fail "MJPEG stream did not publish its headers"
+assert_eq \
+	"$(stat -c '%u:%a' -- "$runtime/s-$token1/stream.lock")" \
+	0:600 \
+	"MJPEG stream lock permissions"
+run_mjpeg_cgi "$token1" 1-2 "$work/mjpeg-conflict"
+check_status_line "$work/mjpeg-conflict" "409 Conflict"
+wait "$mjpeg_pid"
+IFS=: read -r \
+	mjpeg_parts mjpeg_first mjpeg_last mjpeg_preamble <<< "$(
+		check_mjpeg_response \
+			"$work/mjpeg-response" "$token1" 40 initial
+	)"
+[[ "$mjpeg_parts" -ge 40 && "$mjpeg_first" -le "$mjpeg_last" ]] ||
+	fail "invalid initial MJPEG sequence summary"
+assert_eq "$mjpeg_preamble" 0 "initial MJPEG preamble"
 after="$(< "$heartbeat")"
-[[ "$after" -gt "$before" ]] || fail "GET did not refresh heartbeat"
+[[ "$after" -gt "$before" ]] || fail "MJPEG stream did not refresh heartbeat"
+assert_eq \
+	"$(< "$runtime/s-$token1/ffmpeg")" \
+	"$ffmpeg_identity_before" \
+	"FFmpeg identity after bounded stream"
+
+# A new bounded segment must acquire the lock after the previous response
+# closes. It may begin with the tail of the in-flight part, but complete parts
+# must continue the same producer's increasing sequence.
+run_mjpeg_cgi "$token1" 1-3 "$work/mjpeg-reconnected"
+IFS=: read -r \
+	reconnected_parts reconnected_first reconnected_last \
+	reconnected_preamble <<< "$(
+		check_mjpeg_response \
+			"$work/mjpeg-reconnected" "$token1" 20 reconnect
+	)"
+[[ "$reconnected_parts" -ge 20 &&
+   "$reconnected_preamble" -le 8192 &&
+   "$reconnected_first" -le "$reconnected_last" ]] ||
+	fail "invalid reconnected MJPEG sequence summary"
+[[ "$reconnected_first" -gt "$mjpeg_last" ]] ||
+	fail "MJPEG reconnect replayed an old frame sequence"
+assert_eq \
+	"$(< "$runtime/s-$token1/ffmpeg")" \
+	"$ffmpeg_identity_before" \
+	"FFmpeg identity after reconnect"
+
+# A browser may close a response without reading its remainder. SIGPIPE must
+# release the viewer lock without killing or restarting the persistent FFmpeg
+# producer, and the following reconnect must resume at a later frame.
+run_mjpeg_disconnect "$token1" 1-4 "$work/mjpeg-disconnected"
+IFS=: read -r \
+	disconnected_parts disconnected_first disconnected_last \
+	disconnected_preamble <<< "$(
+		check_mjpeg_response \
+			"$work/mjpeg-disconnected" "$token1" 1 reconnect
+	)"
+[[ "$disconnected_parts" -ge 1 &&
+   "$disconnected_preamble" -le 8192 &&
+   "$disconnected_first" -le "$disconnected_last" ]] ||
+	fail "invalid disconnected MJPEG sequence summary"
+[[ "$disconnected_first" -gt "$reconnected_last" ]] ||
+	fail "MJPEG disconnect stream replayed an old frame sequence"
+kill -0 "$ffmpeg1"
+assert_eq \
+	"$(< "$runtime/s-$token1/ffmpeg")" \
+	"$ffmpeg_identity_before" \
+	"FFmpeg identity after client disconnect"
+assert_eq "$("$helper" status "$token1")" running \
+	"status after MJPEG client disconnect"
+
+run_mjpeg_cgi "$token1" 1-5 "$work/mjpeg-after-disconnect"
+IFS=: read -r \
+	after_disconnect_parts after_disconnect_first after_disconnect_last \
+	after_disconnect_preamble <<< "$(
+		check_mjpeg_response \
+			"$work/mjpeg-after-disconnect" "$token1" 20 reconnect
+	)"
+[[ "$after_disconnect_parts" -ge 20 &&
+   "$after_disconnect_preamble" -le 8192 &&
+   "$after_disconnect_first" -le "$after_disconnect_last" ]] ||
+	fail "invalid post-disconnect MJPEG sequence summary"
+[[ "$after_disconnect_first" -gt "$disconnected_last" ]] ||
+	fail "MJPEG stream did not advance after client disconnect"
+assert_eq \
+	"$(< "$runtime/s-$token1/ffmpeg")" \
+	"$ffmpeg_identity_before" \
+	"FFmpeg identity after disconnect reconnect"
+
+before="$(< "$heartbeat")"
+REQUEST_METHOD=GET \
+QUERY_STRING="token=$token1&stream=not-a-number" \
+	"$helper" cgi > "$work/mjpeg-invalid"
+check_status_line "$work/mjpeg-invalid" "400 Bad Request"
+REQUEST_METHOD=GET \
+QUERY_STRING="token=$token1&stream=1&extra=1" \
+	"$helper" cgi > "$work/mjpeg-invalid"
+check_status_line "$work/mjpeg-invalid" "400 Bad Request"
+REQUEST_METHOD=POST \
+QUERY_STRING="token=$token1&stream=1" \
+	"$helper" cgi > "$work/mjpeg-invalid"
+check_status_line "$work/mjpeg-invalid" "405 Method Not Allowed"
+assert_eq "$(< "$heartbeat")" "$before" "invalid MJPEG request heartbeat"
 
 for _ in {1..30}; do
 	run_audio_cgi GET "$token1" live "$work/audio-response"
@@ -1442,17 +1815,6 @@ QUERY_STRING="token=$token1&chunk=$audio_sequence" \
 	"$helper" cgi-audio > "$work/audio-response"
 check_status_line "$work/audio-response" "416 Range Not Satisfiable"
 assert_eq "$(< "$heartbeat")" "$before" "audio Range heartbeat"
-
-# Repeated requests exercise atomic frame replacements.
-for sequence in 2 3 4 5 6; do
-	run_cgi GET "$token1" "$sequence" "$work/response"
-	check_response "$work/response" GET
-done
-
-before="$(< "$heartbeat")"
-run_cgi HEAD "$token1" 7 "$work/response"
-check_response "$work/response" HEAD
-assert_eq "$(< "$heartbeat")" "$before" "HEAD heartbeat"
 
 set +e
 stale_output="$("$helper" stop "$stale" 2>&1)"
@@ -1513,19 +1875,19 @@ assert_eq \
 	"dead-worker status"
 
 before="$(< "$runtime/s-$token2/heartbeat")"
-run_cgi GET "$token2" 8 "$work/response"
-check_status_line "$work/response" "503 Service Unavailable"
+run_mjpeg_cgi "$token2" 8 "$work/mjpeg-error"
+check_status_line "$work/mjpeg-error" "503 Service Unavailable"
 
 assert_eq \
 	"$(< "$runtime/s-$token2/heartbeat")" \
 	"$before" \
 	"failed CGI heartbeat"
 
-# Video FFmpeg is independent and remains for identity-based cleanup.
-kill -0 "$ffmpeg2"
+# Closing the worker-owned FIFO anchor must also release the video writer.
+# A crashed wrapper therefore cannot leave an orphaned FFmpeg process behind.
+wait_dead "$ffmpeg2"
 
 "$helper" cleanup
-wait_dead "$ffmpeg2"
 
 [[ ! -e "$runtime" && ! -L "$runtime" ]] ||
 	fail "cleanup left runtime state"

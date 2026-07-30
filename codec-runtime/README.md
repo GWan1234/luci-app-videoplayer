@@ -22,13 +22,13 @@ dist/
 └── aarch64_cortex-a53/
     ├── openwrt-25.12.5-r33051-f5dae5ece4/
     │   ├── luci-app-videoplayer-1.1.0.apk
-    │   ├── luci-videoplayer-codec-runtime-6.1.4-r2.apk
+    │   ├── luci-videoplayer-codec-runtime-6.1.4-r3.apk
     │   ├── BUILD_INFO
     │   ├── PACKAGE_SET.json
     │   └── SHA256SUMS
     └── openwrt-24.10.8-r29233-443ec4032a/
         ├── luci-app-videoplayer_1.1.0_all.ipk
-        ├── luci-videoplayer-codec-runtime_6.1.4-r2_aarch64_cortex-a53.ipk
+        ├── luci-videoplayer-codec-runtime_6.1.4-r3_aarch64_cortex-a53.ipk
         ├── BUILD_INFO
         ├── PACKAGE_SET.json
         └── SHA256SUMS
@@ -55,11 +55,12 @@ Network protocols, AV devices, hardware accelerators, and auto-detected
 external libraries are disabled.
 
 The build enables native software decoders and the components required for
-H.264-to-JPEG video output and AAC-to-48 kHz stereo PCM audio output. This
-includes H.264, HEVC, VC-1, MPEG-4, VP8, VP9, AV1, MJPEG, AAC, AC-3, E-AC-3,
-DTS, FLAC, MP3, Opus, TrueHD, and Vorbis, subject to what FFmpeg 6.1.4
-supports. It is not a promise to decode every existing or future media format,
-DRM system, encrypted stream, or damaged file.
+H.264-to-continuous-MJPEG video output and AAC-to-48 kHz stereo PCM audio
+output. This includes the `mpjpeg` streaming muxer plus H.264, HEVC, VC-1,
+MPEG-4, VP8, VP9, AV1, MJPEG, AAC, AC-3, E-AC-3, DTS, FLAC, MP3, Opus,
+TrueHD, and Vorbis, subject to what FFmpeg 6.1.4 supports. It is not a promise
+to decode every existing or future media format, DRM system, encrypted stream,
+or damaged file.
 
 ## Pinned builds
 
@@ -96,8 +97,8 @@ Each resulting executable is checked for:
 - exact package name, version, ABI, internal build metadata, and ELF target;
 - no dynamic libav dependency, RPATH, or unexpected shared library;
 - required decoder, encoder, demuxer, muxer, and filter lists;
-- H.264-to-JPEG decoding under the architecture's QEMU user emulator when the
-  ISA is faithfully supported;
+- H.264-to-multipart-MJPEG decoding under the architecture's QEMU user
+  emulator when the ISA is faithfully supported;
 - AAC-to-PCM output in exact 48,000-byte quarter-second chunks under the same
   condition.
 

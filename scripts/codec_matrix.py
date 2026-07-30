@@ -16,7 +16,7 @@ DEFAULT_MATRIX = ROOT / "codec-runtime" / "matrix.json"
 
 APP_VERSION = "1.1.0"
 CODEC_VERSION = "6.1.4"
-CODEC_RELEASE = 2
+CODEC_RELEASE = 3
 CODEC_SOURCE_SHA256 = "a231e3d5742c44b1cdaebfb98ad7b6200d12763e0b6db9e1e2c5891f2c083a18"
 
 EXPECTED_RELEASES = {
@@ -173,22 +173,42 @@ def load_matrix(path: Path = DEFAULT_MATRIX) -> dict[str, Any]:
 
 def validate_application_version_references() -> None:
     expected_lines = {
-        ROOT / "luci-app-videoplayer" / "Makefile": f"PKG_VERSION:={APP_VERSION}",
-        ROOT / "scripts" / "build-packages.py": f'PKG_VERSION = "{APP_VERSION}"',
-        ROOT / "scripts" / "verify_packages.py": f'PKG_VERSION = "{APP_VERSION}"',
-        ROOT / "scripts" / "install-main-apk.sh": f'APP_VERSION="{APP_VERSION}"',
+        ROOT / "luci-app-videoplayer" / "Makefile": (
+            f"PKG_VERSION:={APP_VERSION}",
+        ),
+        ROOT / "scripts" / "build-packages.py": (
+            f'PKG_VERSION = "{APP_VERSION}"',
+        ),
+        ROOT / "scripts" / "verify_packages.py": (
+            f'PKG_VERSION = "{APP_VERSION}"',
+        ),
+        ROOT / "scripts" / "install-main-apk.sh": (
+            f'APP_VERSION="{APP_VERSION}"',
+        ),
+        ROOT / "codec-runtime" / "package" / "Makefile": (
+            f"PKG_VERSION:={CODEC_VERSION}",
+            f"PKG_RELEASE:={CODEC_RELEASE}",
+        ),
+        ROOT / "scripts" / "install-codec-runtime.sh": (
+            f'CODEC_VERSION="{CODEC_VERSION}"',
+            f'CODEC_RELEASE="{CODEC_RELEASE}"',
+        ),
+        ROOT / "scripts" / "verify_codec_package.py": (
+            f'PACKAGE_VERSION = "{CODEC_VERSION}-r{CODEC_RELEASE}"',
+        ),
     }
-    for path, expected_line in expected_lines.items():
+    for path, expected_for_path in expected_lines.items():
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as exc:
             raise MatrixError(
                 f"Cannot read application version reference {path}: {exc}"
             ) from exc
-        require(
-            lines.count(expected_line) == 1,
-            f"Application version reference differs in {path.relative_to(ROOT)}",
-        )
+        for expected_line in expected_for_path:
+            require(
+                lines.count(expected_line) == 1,
+                f"Version reference differs in {path.relative_to(ROOT)}",
+            )
 
 
 def validate_matrix(data: dict[str, Any]) -> None:

@@ -165,29 +165,65 @@ missing() {
 	failed=1
 }
 
-for command_name in uci ubus sort stat flock ffmpeg; do
+for command_name in uci ubus sort stat flock; do
 	command -v "$command_name" >/dev/null 2>&1 ||
 		missing "command '$command_name'"
 done
 
-if command -v ffmpeg >/dev/null 2>&1; then
-	ffmpeg -hide_banner -encoders 2>/dev/null |
+renderer_ffmpeg=""
+renderer_ffmpeg_private=0
+renderer_candidate_found=0
+
+run_renderer_ffmpeg() {
+	if [ "$renderer_ffmpeg_private" -eq 1 ]; then
+		LD_LIBRARY_PATH="/usr/lib/videoplayer-ffmpeg" \
+			"$renderer_ffmpeg" "$@"
+	else
+		"$renderer_ffmpeg" "$@"
+	fi
+}
+
+renderer_pipeline_usable() {
+	run_renderer_ffmpeg -hide_banner -encoders 2>/dev/null |
 		grep -Eq '^[[:space:]]*V[^[:space:]]*[[:space:]]+mjpeg([[:space:]]|$)' ||
-		missing "an ffmpeg build with the MJPEG encoder"
-	ffmpeg -hide_banner -muxers 2>/dev/null |
-		grep -Eq '^[[:space:]]*E[[:space:]]+image2([[:space:]]|$)' ||
-		missing "an ffmpeg build with the image2 muxer"
-	ffmpeg_filters="$(ffmpeg -hide_banner -filters 2>/dev/null)" ||
-		ffmpeg_filters=""
+		return 1
+	run_renderer_ffmpeg -hide_banner -muxers 2>/dev/null |
+		grep -Eq '^[[:space:]]*E[[:space:]]+mpjpeg([[:space:]]|$)' ||
+		return 1
+	ffmpeg_filters="$(run_renderer_ffmpeg -hide_banner -filters 2>/dev/null)" ||
+		return 1
 	printf '%s\n' "$ffmpeg_filters" |
 		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+fps[[:space:]]' ||
-		missing "an ffmpeg build with the fps filter"
+		return 1
 	printf '%s\n' "$ffmpeg_filters" |
 		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+scale[[:space:]]' ||
-		missing "an ffmpeg build with the scale filter"
+		return 1
 	printf '%s\n' "$ffmpeg_filters" |
 		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+format[[:space:]]' ||
-		missing "an ffmpeg build with the format filter"
+		return 1
+	return 0
+}
+
+if [ -x /usr/libexec/videoplayer-ffmpeg/ffmpeg ]; then
+	renderer_candidate_found=1
+	renderer_ffmpeg="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
+	renderer_ffmpeg_private=1
+	renderer_pipeline_usable || renderer_ffmpeg=""
+fi
+if [ -z "$renderer_ffmpeg" ] &&
+   command -v ffmpeg >/dev/null 2>&1; then
+	renderer_candidate_found=1
+	renderer_ffmpeg="ffmpeg"
+	renderer_ffmpeg_private=0
+	renderer_pipeline_usable || renderer_ffmpeg=""
+fi
+
+if [ -n "$renderer_ffmpeg" ]; then
+	echo "Router CPU renderer will use: $renderer_ffmpeg"
+elif [ "$renderer_candidate_found" -eq 1 ]; then
+	echo "No installed FFmpeg has the complete MJPEG pipeline; continuing with browser rendering." >&2
+else
+	echo "No FFmpeg runtime found; continuing with browser rendering only." >&2
 fi
 
 if command -v stat >/dev/null 2>&1; then

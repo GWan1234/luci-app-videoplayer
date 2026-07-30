@@ -3,10 +3,11 @@
 # shellcheck shell=sh
 #
 # Single-session router CPU renderer for luci-app-videoplayer.
-# Separate FFmpeg workers decode one validated local file into an atomically
-# refreshed JPEG and raw PCM. A dedicated chunker serializes that PCM into a
-# hard-bounded ring in tmpfs. Short CGI requests serve both streams, avoiding
-# uhttpd's long-running CGI timeout.
+# Separate FFmpeg workers decode one validated local file into a persistent
+# multipart MJPEG FIFO and raw PCM. A dedicated chunker serializes that PCM into
+# a hard-bounded ring in tmpfs. Bounded CGI relays keep the MJPEG producer alive
+# across transparent reconnects without approaching stock uhttpd's deadline;
+# audio remains a sequence of short requests.
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export LC_ALL=C
@@ -20,14 +21,13 @@ WORKER_LOCK="/tmp/videoplayer-render-v1.worker.lock"
 LAYOUT="snapshot-v1"
 TOKEN_TTL=21600
 HEARTBEAT_TIMEOUT=12
-FRAME_STALL_TIMEOUT=8
 STARTUP_TIMEOUT=15
 STARTUP_POLL_INTERVAL=0.1
 SHORT_MEDIA_START_GRACE=5
 SHORT_MEDIA_GRACE_POLL_INTERVAL=0.25
 STOP_TIMEOUT=6
 MAX_PATH_LENGTH=4096
-MAX_FRAME_BYTES=4194304
+MJPEG_SEGMENT_SECONDS=45
 MAX_AUDIO_BYTES=48000
 AUDIO_SAMPLE_RATE=48000
 AUDIO_CHANNELS=2
@@ -704,8 +704,8 @@ probe_selected_ffmpeg() {
 		return 1
 	}
 	printf '%s\n' "$output" |
-		grep -Eq '^[[:space:]]*E[[:space:]]+image2([[:space:]]|$)' || {
-			FFMPEG_PROBE_REASON="$label has no image2 muxer"
+		grep -Eq '^[[:space:]]*E[[:space:]]+mpjpeg([[:space:]]|$)' || {
+			FFMPEG_PROBE_REASON="$label has no MPJPEG muxer"
 			return 1
 		}
 	output="$(invoke_selected_ffmpeg -hide_banner -filters 2>/dev/null)" || {
@@ -950,16 +950,6 @@ direct_child_matches() {
 	[ "$actual" = "$start" ]
 }
 
-frame_is_fresh() {
-	local path="$1" now="$2" mtime
-
-	valid_decimal "$now" 12 || return 1
-	mtime="$(stat -L -c '%Y' -- "$path" 2>/dev/null)" || return 1
-	valid_decimal "$mtime" 12 || return 1
-	[ "$mtime" -le "$now" ] || return 1
-	[ $((now - mtime)) -le $((FRAME_STALL_TIMEOUT + 2)) ]
-}
-
 process_matches_worker() {
 	local pid="$1" start="$2" token="$3"
 	local actual cmdline old_ifs noglob=0
@@ -1076,7 +1066,7 @@ process_matches_ffmpeg_role() {
 		*) return 1 ;;
 	esac
 	case "$role" in
-		video) output="$RUNTIME_DIR/s-$token/frame.jpg" ;;
+		video) output="$RUNTIME_DIR/s-$token/video.pipe" ;;
 		audio) output="$RUNTIME_DIR/s-$token/audio.pipe" ;;
 		*) return 1 ;;
 	esac
@@ -1416,6 +1406,19 @@ safe_audio_fifo() {
 	[ "$metadata" = "0:600:fifo" ]
 }
 
+safe_video_fifo() {
+	local path="$1" canonical metadata
+
+	[ -p "$path" ] && [ ! -L "$path" ] || return 1
+	canonical="$(readlink -f -- "$path" 2>/dev/null)" || return 1
+	case "$canonical" in
+		"$RUNTIME_DIR"/s-*/video.pipe) ;;
+		*) return 1 ;;
+	esac
+	metadata="$(stat -c '%u:%a:%F' -- "$path" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:600:fifo" ]
+}
+
 audio_published_high() {
 	local token="$1"
 
@@ -1590,12 +1593,22 @@ worker_current() {
 }
 
 monotonic_centiseconds() {
-	local value
+	local value whole fraction hundredths
 
-	value="$(awk 'NR == 1 { printf "%.0f\n", $1 * 100; exit }' \
-		/proc/uptime 2>/dev/null)" || return 1
-	valid_decimal "$value" 18 || return 1
-	printf '%s\n' "$value"
+	IFS=' ' read -r value _ < /proc/uptime 2>/dev/null || return 1
+	case "$value" in
+		*.*)
+			whole="${value%%.*}"
+			fraction="${value#*.}00"
+			hundredths="${fraction%"${fraction#??}"}"
+			;;
+		*) return 1 ;;
+	esac
+	valid_decimal "$whole" 16 && valid_decimal "$hundredths" 2 || return 1
+	# Avoid an octal interpretation of values such as 08 in shell arithmetic.
+	hundredths="${hundredths#0}"
+	[ -n "$hundredths" ] || hundredths=0
+	printf '%s\n' "$((whole * 100 + hundredths))"
 }
 
 write_video_clock() {
@@ -1655,7 +1668,9 @@ load_video_clock() {
 }
 
 cmd_worker() {
-	local token="$1" dir frame log_pipe log_file log_pid="" log_start=""
+	local token="$1" dir video_pipe boundary cr prefetch prefetch_tmp
+	local prefetch_pid="" prefetch_start="" prefetch_rc=1 prefetch_launching=0
+	local log_pipe log_file log_pid="" log_start=""
 	local now pid start ffmpeg_pid ffmpeg_start candidate_pid rc=1
 	local audio_pipe audio_pid="" audio_start="" audio_rc=1
 	local chunker_pid="" chunker_start="" chunker_rc=1
@@ -1663,11 +1678,12 @@ cmd_worker() {
 	local chunker_launching=0 audio_anchor_open=0
 	local audio_fd_open=0 audio_file last_audio router_fps ffmpeg_launching=0
 	local audio_launch_time=""
-	local frame_mtime="" last_frame_mtime="" last_frame_change=""
 	local running_written=0 stopping=0 failure_reason=""
-	local log_anchor_open=0 log_launching=0
+	local log_anchor_open=0 log_launching=0 video_anchor_open=0
+	local video_reader_open=0 video_path_metadata video_anchor_metadata
+	local video_reader_metadata
 	local video_started_cs="" short_media_deadline_cs="" current_cs=""
-	local _audio_wait _chunker_wait
+	local prefetch_line extra _audio_wait _chunker_wait _prefetch_wait
 
 	valid_token "$token" || exit 2
 	ensure_lock_file "$WORKER_LOCK" || exit 1
@@ -1690,11 +1706,16 @@ cmd_worker() {
 	fi
 	router_fps="$(get_router_fps)"
 	dir="$RUNTIME_DIR/s-$token"
-	frame="$dir/frame.jpg"
+	video_pipe="$dir/video.pipe"
+	boundary="videoplayer-$token"
+	cr="$(printf '\r')"
+	prefetch="$dir/video.prefetch"
+	prefetch_tmp="$dir/.video-prefetch.$$"
 	audio_pipe="$dir/audio.pipe"
 	log_pipe="$dir/ffmpeg-log.pipe"
 	log_file="$dir/ffmpeg.log"
-	rm -f -- "$frame" "$frame.tmp" "$log_pipe" "$log_file" \
+	rm -f -- "$dir/frame.jpg" "$dir/frame.jpg.tmp" \
+		"$video_pipe" "$prefetch" "$prefetch_tmp" "$log_pipe" "$log_file" \
 		"$dir/audio-state" "$dir/audio" "$dir/chunker" "$audio_pipe" \
 		"$dir/video-clock" "$dir/browser-audio-capability" \
 		2>/dev/null || :
@@ -1787,40 +1808,60 @@ cmd_worker() {
 		fi
 	}
 
-	observe_video_frame() {
-		local observed_now="$1" observed_size
+	observe_video_prefetch() {
+		local observed_now="$1"
 
-		[ -f "$frame" ] && [ ! -L "$frame" ] || return 0
-		safe_regular_file "$frame" 600 || return 0
-		observed_size="$(stat -L -c '%s' -- "$frame" 2>/dev/null)" ||
-			return 0
-		valid_decimal "$observed_size" 18 &&
-			[ "$observed_size" -gt 0 ] &&
-			[ "$observed_size" -le "$MAX_FRAME_BYTES" ] ||
-			return 0
-		frame_mtime="$(stat -L -c '%Y' -- "$frame" 2>/dev/null)" ||
-			frame_mtime=""
-		valid_decimal "$frame_mtime" 12 &&
-			[ "$frame_mtime" -le "$observed_now" ] ||
-			return 0
-		if [ "$frame_mtime" != "$last_frame_mtime" ]; then
-			last_frame_mtime="$frame_mtime"
-			last_frame_change="$observed_now"
+		[ "$running_written" -eq 0 ] || return 0
+		[ -n "$prefetch_pid" ] || return 0
+		process_is_running "$prefetch_pid" && return 0
+
+		wait "$prefetch_pid" 2>/dev/null
+		prefetch_rc=$?
+		prefetch_pid=""
+		if [ "$prefetch_rc" -ne 0 ] ||
+		   ! safe_regular_file "$prefetch_tmp" 600; then
+			rm -f -- "$prefetch_tmp" 2>/dev/null || :
+			failure_reason="FFmpeg did not start a valid MJPEG stream"
+			return 1
 		fi
-		if [ "$running_written" -eq 0 ]; then
-			video_started_cs="$(monotonic_centiseconds 2>/dev/null)" || {
-				failure_reason="Cannot initialize renderer clock"
-				return 1
-			}
-			if ! refresh_heartbeat "$token" "$observed_now" ||
-			   ! write_video_clock "$token" "$video_started_cs" ||
-			   ! write_status "$token" running ""; then
-				rm -f -- "$dir/video-clock" 2>/dev/null || :
-				failure_reason="Cannot publish renderer state"
-				return 1
-			fi
-			running_written=1
+		exec 6< "$prefetch_tmp" || {
+			failure_reason="Cannot inspect MJPEG startup data"
+			return 1
+		}
+		IFS= read -r prefetch_line <&6 || {
+			exec 6<&-
+			failure_reason="FFmpeg emitted incomplete MJPEG startup data"
+			return 1
+		}
+		if IFS= read -r extra <&6; then
+			: "$extra"
+			exec 6<&-
+			failure_reason="FFmpeg emitted invalid MJPEG startup data"
+			return 1
 		fi
+		exec 6<&-
+		if [ "$prefetch_line" != "--$boundary$cr" ]; then
+			failure_reason="FFmpeg emitted an invalid MJPEG boundary"
+			return 1
+		fi
+		if ! chmod 0600 "$prefetch_tmp" 2>/dev/null ||
+		   ! mv -f -- "$prefetch_tmp" "$prefetch"; then
+			rm -f -- "$prefetch_tmp" 2>/dev/null || :
+			failure_reason="Cannot publish MJPEG startup data"
+			return 1
+		fi
+		video_started_cs="$(monotonic_centiseconds 2>/dev/null)" || {
+			failure_reason="Cannot initialize renderer clock"
+			return 1
+		}
+		if ! refresh_heartbeat "$token" "$observed_now" ||
+		   ! write_video_clock "$token" "$video_started_cs" ||
+		   ! write_status "$token" running ""; then
+			rm -f -- "$prefetch" "$dir/video-clock" 2>/dev/null || :
+			failure_reason="Cannot publish renderer state"
+			return 1
+		fi
+		running_written=1
 		return 0
 	}
 
@@ -1864,6 +1905,17 @@ cmd_worker() {
 				)" || chunker_start=""
 			fi
 		fi
+		if [ -z "${prefetch_pid:-}" ] &&
+		   [ "${prefetch_launching:-0}" -eq 1 ]; then
+			candidate_pid=$!
+			if valid_decimal "$candidate_pid" 10 &&
+			   process_is_direct_child "$candidate_pid"; then
+				prefetch_pid="$candidate_pid"
+				prefetch_start="$(
+					process_start_time "$prefetch_pid" 2>/dev/null
+				)" || prefetch_start=""
+			fi
+		fi
 		if [ -z "${ffmpeg_pid:-}" ] &&
 		   [ "${ffmpeg_launching:-0}" -eq 1 ]; then
 			candidate_pid=$!
@@ -1874,6 +1926,21 @@ cmd_worker() {
 					process_start_time "$ffmpeg_pid" 2>/dev/null
 				)" || ffmpeg_start=""
 			fi
+		fi
+		if [ -n "${prefetch_pid:-}" ]; then
+			stop_direct_child_bounded \
+				"$prefetch_pid" "${prefetch_start:-}" || :
+		fi
+		if [ "${video_reader_open:-0}" -eq 1 ]; then
+			exec 6<&-
+			video_reader_open=0
+		fi
+		# Drop the worker's FIFO reader before waiting for FFmpeg. Otherwise a
+		# producer blocked in write(2) can keep the wrapper inside its trap
+		# until the external controller has to SIGKILL it.
+		if [ "${video_anchor_open:-0}" -eq 1 ]; then
+			exec 9>&-
+			video_anchor_open=0
 		fi
 		if [ -n "${ffmpeg_pid:-}" ]; then
 			stop_direct_child_bounded \
@@ -1903,7 +1970,8 @@ cmd_worker() {
 			stop_direct_child_bounded "$log_pid" "${log_start:-}" || :
 		fi
 		rm -f -- "$log_pipe" "$log_file" "$dir/ffmpeg" "$dir/audio" \
-			"$dir/chunker" "$audio_pipe" 2>/dev/null || :
+			"$dir/chunker" "$audio_pipe" "$video_pipe" "$prefetch" \
+			"$prefetch_tmp" 2>/dev/null || :
 		if worker_current "$token" 2>/dev/null; then
 			if [ -n "${failure_reason:-}" ]; then
 				write_status "$token" error "$failure_reason" 2>/dev/null || :
@@ -2102,6 +2170,67 @@ cmd_worker() {
 		audio_fd_open=0
 	fi
 
+	if ! mkfifo "$video_pipe" ||
+	   ! safe_video_fifo "$video_pipe" ||
+	   ! exec 9<> "$video_pipe"; then
+		failure_reason="Cannot initialize MJPEG stream"
+		stop_child
+	fi
+	video_anchor_open=1
+	video_path_metadata="$(
+		stat -L -c '%d:%i:%F:%u:%a' -- "$video_pipe" 2>/dev/null
+	)" || {
+		failure_reason="Cannot inspect MJPEG stream"
+		stop_child
+	}
+	video_anchor_metadata="$(
+		stat -L -c '%d:%i:%F:%u:%a' -- /proc/self/fd/9 2>/dev/null
+	)" || {
+		failure_reason="Cannot inspect MJPEG stream"
+		stop_child
+	}
+	if [ "$video_anchor_metadata" != "$video_path_metadata" ] ||
+	   [ "${video_anchor_metadata#*:*:}" != "fifo:0:600" ]; then
+		failure_reason="MJPEG stream changed while opening"
+		stop_child
+	fi
+	# Give the startup reader a read-only description of the verified FIFO.
+	# Its bounded timeout survives an untrappable worker crash and guarantees
+	# that neither it nor FFmpeg can remain alive forever by holding its own
+	# writer endpoint.
+	exec 6< /proc/self/fd/9 || {
+		failure_reason="Cannot open MJPEG startup stream"
+		stop_child
+	}
+	video_reader_open=1
+	video_reader_metadata="$(
+		stat -L -c '%d:%i:%F:%u:%a' -- /proc/self/fd/6 2>/dev/null
+	)" || {
+		failure_reason="Cannot inspect MJPEG startup stream"
+		stop_child
+	}
+	if [ "$video_reader_metadata" != "$video_path_metadata" ]; then
+		failure_reason="MJPEG startup stream changed while opening"
+		stop_child
+	fi
+	prefetch_launching=1
+	# Positional parameters are intentionally expanded by the bounded child.
+	# shellcheck disable=SC2016
+	timeout -k 1 "$STARTUP_TIMEOUT" sh -c '
+		IFS= read -r line || exit 1
+		[ "$line" = "--$1$2" ] || exit 1
+		printf "%s\n" "$line"
+	' sh "$boundary" "$cr" \
+		<&6 > "$prefetch_tmp" \
+		3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9>&- &
+	prefetch_pid=$!
+	prefetch_launching=0
+	exec 6<&-
+	video_reader_open=0
+	prefetch_start="$(
+		process_start_time "$prefetch_pid" 2>/dev/null
+	)" || prefetch_start=""
+
 	set -- \
 		-y \
 		-hide_banner \
@@ -2124,18 +2253,18 @@ cmd_worker() {
 		-threads 1 \
 		-c:v mjpeg \
 		-q:v 8 \
-		-f image2 \
-		-update 1 \
-		-atomic_writing 1 \
-		"$frame"
+		-flush_packets 1 \
+		-f mpjpeg \
+		-boundary_tag "$boundary" \
+		"$video_pipe"
 	ffmpeg_launching=1
 	if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
 		LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
 			nice -n 10 "$FFMPEG_BIN" "$@" \
-			4<&- 8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
+			4<&- 8<&- 9>&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
 	else
 		nice -n 10 "$FFMPEG_BIN" "$@" \
-			4<&- 8<&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
+			4<&- 8<&- 9>&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
 	fi
 	ffmpeg_pid=$!
 	ffmpeg_launching=0
@@ -2148,6 +2277,10 @@ cmd_worker() {
 	     ! write_worker_identity \
 			"$token" "$ffmpeg_pid" "$ffmpeg_start" ffmpeg; }; then
 		stop_direct_child_bounded "$ffmpeg_pid" "$ffmpeg_start" || :
+		if [ -n "$prefetch_pid" ]; then
+			stop_direct_child_bounded "$prefetch_pid" "$prefetch_start" || :
+			prefetch_pid=""
+		fi
 		if [ -n "$audio_pid" ]; then
 			stop_direct_child_bounded "$audio_pid" "$audio_start" || :
 		fi
@@ -2156,15 +2289,18 @@ cmd_worker() {
 				"$chunker_pid" "$chunker_start" || :
 		fi
 		stop_direct_child_bounded "$log_pid" "$log_start" || :
+		exec 9>&-
+		video_anchor_open=0
 		rm -f -- "$log_pipe" "$log_file" "$dir/audio" "$dir/chunker" \
-			"$audio_pipe" 2>/dev/null || :
+			"$audio_pipe" "$video_pipe" "$prefetch" "$prefetch_tmp" \
+			2>/dev/null || :
 		write_status "$token" error "Cannot track FFmpeg process" 2>/dev/null || :
 		exec 3<&-
 		exit 1
 	fi
 	# A short-lived child may already be a zombie before /proc yields its
 	# start time. It is still our unreaped direct child, so the common wait,
-	# final-frame observation, and diagnostic classification below are safe.
+	# final-prefetch observation, and diagnostic classification below are safe.
 
 	while process_is_running "$ffmpeg_pid"; do
 		now="$(date +%s 2>/dev/null)" || now=""
@@ -2258,19 +2394,12 @@ cmd_worker() {
 			fi
 		fi
 
-		if ! observe_video_frame "$now"; then
+		if ! observe_video_prefetch "$now"; then
 			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
-			break
-		fi
-		if [ "$running_written" -eq 1 ] &&
-		   valid_decimal "$last_frame_change" 12 &&
-		   [ $((now - last_frame_change)) -gt "$FRAME_STALL_TIMEOUT" ]; then
-			kill -TERM "$ffmpeg_pid" 2>/dev/null || :
-			failure_reason="FFmpeg stopped producing video frames"
 			break
 		fi
 		if [ "$running_written" -eq 0 ]; then
-			# Observe the first frame closely enough that the browser-audio
+			# Observe the first boundary closely enough that the browser-audio
 			# clock neither includes decoder startup nor trails media time by
 			# a full one-second steady-state polling interval.
 			sleep "$STARTUP_POLL_INTERVAL"
@@ -2290,6 +2419,10 @@ cmd_worker() {
 	rm -f -- "$dir/audio" "$dir/chunker" "$audio_pipe" 2>/dev/null || :
 	if [ "$stopping" -eq 1 ] || [ -n "$failure_reason" ]; then
 		stop_direct_child_bounded "$ffmpeg_pid" "$ffmpeg_start" || :
+		if [ -n "$prefetch_pid" ]; then
+			stop_direct_child_bounded "$prefetch_pid" "$prefetch_start" || :
+			prefetch_pid=""
+		fi
 	fi
 	if process_is_running "$ffmpeg_pid"; then
 		rc=1
@@ -2303,14 +2436,23 @@ cmd_worker() {
 	   [ -z "$failure_reason" ] &&
 	   [ "$rc" -eq 0 ] &&
 	   [ "$running_written" -eq 0 ]; then
+		for _prefetch_wait in 1 2 3 4 5 6 7 8 9 10; do
+			[ -n "$prefetch_pid" ] || break
+			process_is_running "$prefetch_pid" || break
+			sleep 0.05
+		done
 		now="$(date +%s 2>/dev/null)" || now=""
 		if valid_decimal "$now" 12 &&
 		   worker_current "$token" &&
 		   load_heartbeat "$token" &&
 		   [ "$HEARTBEAT_TIME" -le "$now" ] &&
 		   [ $((now - HEARTBEAT_TIME)) -le $((STARTUP_TIMEOUT + 3)) ]; then
-			observe_video_frame "$now" || :
+			observe_video_prefetch "$now" || :
 		fi
+	fi
+	if [ "$running_written" -eq 0 ] && [ -n "$prefetch_pid" ]; then
+		stop_direct_child_bounded "$prefetch_pid" "$prefetch_start" || :
+		prefetch_pid=""
 	fi
 	if [ "$stopping" -eq 0 ] &&
 	   [ -z "$failure_reason" ] &&
@@ -2318,7 +2460,7 @@ cmd_worker() {
 	   [ "$running_written" -eq 1 ] &&
 	   valid_decimal "$video_started_cs" 18; then
 		# Keep every successful short input observable for a bounded interval
-		# after its first frame. This covers both an FFmpeg process that exits
+		# after its first boundary. This covers both an FFmpeg process that exits
 		# before the first monitor pass and one that exits immediately after
 		# that pass, while giving the UI time to open its protected streams.
 		short_media_deadline_cs=$((video_started_cs +
@@ -2332,6 +2474,10 @@ cmd_worker() {
 			}
 			sleep "$SHORT_MEDIA_GRACE_POLL_INTERVAL"
 		done
+	fi
+	if [ "$video_anchor_open" -eq 1 ]; then
+		exec 9>&-
+		video_anchor_open=0
 	fi
 	if [ "$stopping" -eq 0 ] &&
 	   [ -z "$failure_reason" ] &&
@@ -2360,7 +2506,8 @@ cmd_worker() {
 	fi
 	ffmpeg_pid=""
 	rm -f -- "$dir/ffmpeg" 2>/dev/null || :
-	rm -f -- "$log_pipe" "$log_file" 2>/dev/null || :
+	rm -f -- "$log_pipe" "$log_file" "$video_pipe" "$prefetch" \
+		"$prefetch_tmp" 2>/dev/null || :
 	exec 3<&-
 
 	if worker_current "$token" 2>/dev/null; then
@@ -2443,6 +2590,7 @@ cmd_start() {
 	if ! write_session_request "$token" "$expiry" "$path" ||
 	   ! write_status "$token" starting "" ||
 	   ! write_heartbeat "$token" "$now" ||
+	   ! ensure_lock_file "$dir/stream.lock" ||
 	   ! write_current "$token" "$expiry"; then
 		remove_session_dir "$token" 2>/dev/null || :
 		rm -f -- "$CURRENT_FILE" 2>/dev/null || :
@@ -2483,7 +2631,7 @@ cmd_start() {
 					;;
 				error|ended|stopped)
 					message="$SESSION_REASON"
-					[ -n "$message" ] || message="Renderer stopped before producing a frame"
+					[ -n "$message" ] || message="Renderer stopped before producing MJPEG data"
 					stop_current_locked "$token" 2>/dev/null || :
 					printf '%s\n' "$message" >&2
 					return 1
@@ -2500,7 +2648,7 @@ cmd_start() {
 	done
 
 	stop_current_locked "$token" 2>/dev/null || :
-	printf 'Renderer did not produce a frame in time\n' >&2
+	printf 'Renderer did not produce MJPEG data in time\n' >&2
 	return 1
 }
 
@@ -2554,7 +2702,7 @@ cmd_status() {
 	esac
 	if [ "$SESSION_STATUS" = "running" ]; then
 		dir="$RUNTIME_DIR/s-$token"
-		if ! frame_is_fresh "$dir/frame.jpg" "$now"; then
+		if ! safe_video_fifo "$dir/video.pipe"; then
 			printf 'error\n'
 			return 0
 		fi
@@ -2751,29 +2899,42 @@ http_no_content() {
 	exit 0
 }
 
+valid_cgi_nonce() {
+	local value="$1" left right
+
+	case "$value" in
+		*-*)
+			left="${value%%-*}"
+			right="${value#*-}"
+			case "$right" in *-*) return 1 ;; esac
+			valid_decimal "$left" 16 && valid_decimal "$right" 16
+			;;
+		*) valid_decimal "$value" 16 ;;
+	esac
+}
+
 parse_frame_query() {
-	local query="$1" first rest value left right
+	local query="$1" first rest value
 
 	CGI_TOKEN=""
+	CGI_FRAME_MODE="stream"
 	[ -n "$query" ] || return 1
 	case "$query" in
 		*'&'*)
 			first="${query%%&*}"
 			rest="${query#*&}"
+			case "$rest" in *'&'*) return 1 ;; esac
 			case "$rest" in
-				frame=*) value="${rest#frame=}" ;;
+				frame=*)
+					CGI_FRAME_MODE="single"
+					value="${rest#frame=}"
+					;;
+				stream=*)
+					value="${rest#stream=}"
+					;;
 				*) return 1 ;;
 			esac
-			case "$value" in
-				*-*)
-					left="${value%%-*}"
-					right="${value#*-}"
-					case "$right" in *-*) return 1 ;; esac
-					valid_decimal "$left" 16 && valid_decimal "$right" 16 ||
-						return 1
-					;;
-				*) valid_decimal "$value" 16 || return 1 ;;
-			esac
+			valid_cgi_nonce "$value" || return 1
 			;;
 		*) first="$query" ;;
 	esac
@@ -2811,9 +2972,205 @@ parse_audio_query() {
 	return 0
 }
 
-cmd_cgi() {
-	local now dir frame opened metadata kind size status
+open_cgi_video_fifo() {
+	local token="$1" path fd_metadata reader_metadata path_metadata
 
+	valid_token "$token" || return 1
+	path="$RUNTIME_DIR/s-$token/video.pipe"
+	safe_video_fifo "$path" || return 1
+	exec 7<> "$path" || return 1
+	fd_metadata="$(
+		stat -L -c '%d:%i:%F:%u:%a' -- /proc/self/fd/7 2>/dev/null
+	)" || {
+		exec 7<&-
+		return 1
+	}
+	path_metadata="$(
+		stat -L -c '%d:%i:%F:%u:%a' -- "$path" 2>/dev/null
+	)" || {
+		exec 7<&-
+		return 1
+	}
+	if [ "$fd_metadata" != "$path_metadata" ] ||
+	   [ "${fd_metadata#*:*:}" != "fifo:0:600" ]; then
+		exec 7<&-
+		return 1
+	fi
+	# Reopen the already-verified FIFO as read-only while descriptor 7 keeps
+	# one writer present, so this open cannot block. The copier must not
+	# inherit an O_RDWR stdin: otherwise an abruptly killed CGI parent could
+	# leave an orphaned reader holding its own writer and therefore never
+	# observing EOF when the renderer stops.
+	exec 5< /proc/self/fd/7 || {
+		exec 7<&-
+		return 1
+	}
+	reader_metadata="$(
+		stat -L -c '%d:%i:%F:%u:%a' -- /proc/self/fd/5 2>/dev/null
+	)" || {
+		exec 5<&-
+		exec 7<&-
+		return 1
+	}
+	if [ "$reader_metadata" != "$path_metadata" ]; then
+		exec 5<&-
+		exec 7<&-
+		return 1
+	fi
+	return 0
+}
+
+claim_mjpeg_prefetch() {
+	local token="$1" boundary="$2" dir prefetch claim cr line extra
+
+	CGI_MJPEG_PREFETCH=0
+	valid_token "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	prefetch="$dir/video.prefetch"
+	claim="$dir/.video-prefetch.claim.$$"
+	cr="$(printf '\r')"
+	if [ ! -e "$prefetch" ] && [ ! -L "$prefetch" ]; then
+		return 0
+	fi
+	safe_regular_file "$prefetch" 600 || return 1
+	rm -f -- "$claim" || return 1
+	mv -f -- "$prefetch" "$claim" || return 1
+	safe_regular_file "$claim" 600 || {
+		rm -f -- "$claim" 2>/dev/null || :
+		return 1
+	}
+	exec 6< "$claim" || {
+		rm -f -- "$claim" 2>/dev/null || :
+		return 1
+	}
+	IFS= read -r line <&6 || {
+		exec 6<&-
+		rm -f -- "$claim" 2>/dev/null || :
+		return 1
+	}
+	if IFS= read -r extra <&6; then
+		: "$extra"
+		exec 6<&-
+		rm -f -- "$claim" 2>/dev/null || :
+		return 1
+	fi
+	exec 6<&-
+	rm -f -- "$claim" 2>/dev/null || return 1
+	[ "$line" = "--$boundary$cr" ] || return 1
+	CGI_MJPEG_PREFETCH=1
+	return 0
+}
+
+mjpeg_read_boundary() {
+	local boundary="$1" cr line
+
+	cr="$(printf '\r')"
+	while IFS= read -r line; do
+		[ "$line" = "--$boundary$cr" ] && return 0
+	done
+	return 1
+}
+
+mjpeg_copy_aligned() {
+	local boundary="$1" prefetched="$2"
+
+	exec 5<&-
+	exec 7<&-
+	if [ "$prefetched" = "1" ]; then
+		printf '%s\r\n' "--$boundary" || exit 1
+	else
+		mjpeg_read_boundary "$boundary" || exit 1
+		printf '%s\r\n' "--$boundary" || exit 1
+	fi
+	exec cat
+}
+
+process_read_chars() {
+	local pid="$1" value
+
+	valid_decimal "$pid" 10 || return 1
+	value="$(
+		awk '$1 == "rchar:" { print $2; found = 1; exit }
+		     END { if (!found) exit 1 }' \
+			"/proc/$pid/io" 2>/dev/null
+	)" || return 1
+	valid_decimal "$value" 20 || return 1
+	printf '%s\n' "$value"
+}
+
+stop_cgi_copy() {
+	local i=0 child_start="${CGI_COPY_START:-}"
+
+	if valid_decimal "${CGI_COPY_PID:-}" 10; then
+		if [ -z "$child_start" ] &&
+		   process_is_direct_child "$CGI_COPY_PID"; then
+			child_start="$(
+				process_start_time "$CGI_COPY_PID" 2>/dev/null
+			)" || child_start=""
+		fi
+	fi
+	if valid_decimal "${CGI_COPY_PID:-}" 10 &&
+	   { direct_child_matches "$CGI_COPY_PID" "$child_start" ||
+	     { [ -z "$child_start" ] &&
+	       process_is_direct_child "$CGI_COPY_PID"; }; }; then
+		kill -TERM "$CGI_COPY_PID" 2>/dev/null || :
+		while direct_child_matches "$CGI_COPY_PID" "$child_start" &&
+		      process_is_running "$CGI_COPY_PID"; do
+			i=$((i + 1))
+			[ "$i" -lt 10 ] || break
+			sleep 0.05
+		done
+		if direct_child_matches "$CGI_COPY_PID" "$child_start" &&
+		   process_is_running "$CGI_COPY_PID"; then
+			kill -KILL "$CGI_COPY_PID" 2>/dev/null || :
+		fi
+	fi
+	if valid_decimal "${CGI_COPY_PID:-}" 10; then
+		wait "$CGI_COPY_PID" 2>/dev/null || :
+	fi
+	CGI_COPY_PID=""
+	CGI_COPY_START=""
+}
+
+mjpeg_session_is_live() {
+	local token="$1" now="$2" dir
+
+	valid_token "$token" && valid_decimal "$now" 12 || return 1
+	get_enabled || return 1
+	[ "$(get_render_mode)" = "router" ] || return 1
+	load_current || return 1
+	[ "$CURRENT_TOKEN" = "$token" ] &&
+		[ "$CURRENT_EXPIRY" -gt "$now" ] || return 1
+	load_status "$token" || return 1
+	[ "$SESSION_STATUS" = "running" ] || return 1
+	load_worker_identity "$token" worker || return 1
+	process_matches_worker "$WORKER_PID" "$WORKER_START" "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	safe_video_fifo "$dir/video.pipe"
+}
+
+write_mjpeg_headers() {
+	local boundary="$1"
+
+	printf 'Status: 200 OK\r\n'
+	printf 'Content-Type: multipart/x-mixed-replace; boundary=%s\r\n' "$boundary"
+	printf 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n'
+	printf 'Pragma: no-cache\r\n'
+	printf 'Expires: 0\r\n'
+	printf 'X-Content-Type-Options: nosniff\r\n'
+	printf 'Referrer-Policy: no-referrer\r\n'
+	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
+	printf 'Cross-Origin-Resource-Policy: same-origin\r\n'
+	printf 'Connection: close\r\n'
+	printf '\r\n'
+}
+
+cmd_cgi() {
+	local now dir status boundary started_cs deadline_cs current_cs
+	local last_check_cs last_progress_cs last_rchar=0 rchar
+
+	CGI_COPY_PID=""
+	CGI_COPY_START=""
 	case "${REQUEST_METHOD:-GET}" in
 		GET|HEAD) ;;
 		*)
@@ -2824,16 +3181,20 @@ cmd_cgi() {
 			exit 0
 			;;
 	esac
-	parse_frame_query "${QUERY_STRING:-}" || http_error "400 Bad Request" "Invalid query"
+	parse_frame_query "${QUERY_STRING:-}" ||
+		http_error "400 Bad Request" "Invalid query"
 	get_enabled || http_error "403 Forbidden" "Local playback is disabled"
 	[ "$(get_render_mode)" = "router" ] ||
 		http_error "409 Conflict" "Router CPU rendering is not selected"
 	load_current || http_error "404 Not Found" "Renderer session not found"
 	[ "$CURRENT_TOKEN" = "$CGI_TOKEN" ] ||
 		http_error "404 Not Found" "Renderer session not found"
-	now="$(date +%s 2>/dev/null)" || http_error "503 Service Unavailable" "Clock unavailable"
-	valid_decimal "$now" 12 || http_error "503 Service Unavailable" "Clock unavailable"
-	[ "$CURRENT_EXPIRY" -gt "$now" ] || http_error "410 Gone" "Renderer session expired"
+	now="$(date +%s 2>/dev/null)" ||
+		http_error "503 Service Unavailable" "Clock unavailable"
+	valid_decimal "$now" 12 ||
+		http_error "503 Service Unavailable" "Clock unavailable"
+	[ "$CURRENT_EXPIRY" -gt "$now" ] ||
+		http_error "410 Gone" "Renderer session expired"
 	load_status "$CGI_TOKEN" ||
 		http_error "503 Service Unavailable" "Renderer state is invalid"
 	status="$SESSION_STATUS"
@@ -2847,66 +3208,95 @@ cmd_cgi() {
 	   ! process_matches_worker "$WORKER_PID" "$WORKER_START" "$CGI_TOKEN"; then
 		http_error "503 Service Unavailable" "Renderer worker is not running"
 	fi
+	if [ "$CGI_FRAME_MODE" = "single" ]; then
+		http_error "410 Gone" \
+			"Single-frame playback is obsolete; reload the Video Player page"
+	fi
 
 	dir="$RUNTIME_DIR/s-$CGI_TOKEN"
-	frame="$dir/frame.jpg"
-	if [ ! -f "$frame" ] || [ -L "$frame" ]; then
-		http_error "202 Accepted" "Frame is not ready"
-	fi
-	exec 7< "$frame" || http_error "503 Service Unavailable" "Cannot open frame"
-	opened="$(readlink -f -- /proc/self/fd/7 2>/dev/null)" || {
-		exec 7<&-
-		http_error "503 Service Unavailable" "Cannot verify frame"
-	}
-	case "$opened" in
-		"$frame"|"$frame (deleted)") ;;
-		*)
-			exec 7<&-
-			http_error "503 Service Unavailable" "Cannot verify frame"
-			;;
-	esac
-	metadata="$(stat -L -c '%F:%s:%u:%a' -- /proc/self/fd/7 2>/dev/null)" || {
-		exec 7<&-
-		http_error "503 Service Unavailable" "Cannot inspect frame"
-	}
-	kind="${metadata%%:*}"
-	metadata="${metadata#*:}"
-	size="${metadata%%:*}"
-	metadata="${metadata#*:}"
-	if [ "$kind" != "regular file" ] ||
-	   ! valid_decimal "$size" 10 ||
-	   [ "$size" -le 0 ] ||
-	   [ "$size" -gt "$MAX_FRAME_BYTES" ] ||
-	   [ "$metadata" != "0:600" ]; then
-		exec 7<&-
-		http_error "503 Service Unavailable" "Invalid frame"
-	fi
-	frame_is_fresh /proc/self/fd/7 "$now" || {
-		exec 7<&-
-		http_error "503 Service Unavailable" "Renderer frame is stale"
-	}
-
-	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
-		refresh_heartbeat "$CGI_TOKEN" "$now" || {
-			exec 7<&-
-			http_error "503 Service Unavailable" "Cannot refresh renderer lease"
-		}
+	boundary="videoplayer-$CGI_TOKEN"
+	safe_video_fifo "$dir/video.pipe" ||
+		http_error "202 Accepted" "MJPEG stream is not ready"
+	if [ "${REQUEST_METHOD:-GET}" = "HEAD" ]; then
+		write_mjpeg_headers "$boundary"
+		exit 0
 	fi
 
-	printf 'Status: 200 OK\r\n'
-	printf 'Content-Type: image/jpeg\r\n'
-	printf 'Content-Length: %s\r\n' "$size"
-	printf 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n'
-	printf 'Pragma: no-cache\r\n'
-	printf 'Expires: 0\r\n'
-	printf 'X-Content-Type-Options: nosniff\r\n'
-	printf 'Referrer-Policy: no-referrer\r\n'
-	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
-	printf '\r\n'
-	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
-		dd bs=65536 <&7 2>/dev/null
-	fi
+	ensure_lock_file "$dir/stream.lock" ||
+		http_error "503 Service Unavailable" "Cannot initialize video stream"
+	exec 8< "$dir/stream.lock" ||
+		http_error "503 Service Unavailable" "Cannot initialize video stream"
+	flock -x -n 8 2>/dev/null ||
+		http_error "409 Conflict" "A video stream is already active"
+	now="$(date +%s 2>/dev/null)" ||
+		http_error "503 Service Unavailable" "Clock unavailable"
+	mjpeg_session_is_live "$CGI_TOKEN" "$now" ||
+		http_error "410 Gone" "Playback ended"
+	claim_mjpeg_prefetch "$CGI_TOKEN" "$boundary" ||
+		http_error "503 Service Unavailable" "Invalid MJPEG startup data"
+	# Keep this open last: the secure state loaders above intentionally use
+	# descriptor 7 internally, while the copier needs it until stdin is
+	# duplicated into the direct child below.
+	open_cgi_video_fifo "$CGI_TOKEN" ||
+		http_error "503 Service Unavailable" "Cannot open MJPEG stream"
+	started_cs="$(monotonic_centiseconds 2>/dev/null)" || {
+		exec 5<&-
+		exec 7<&-
+		http_error "503 Service Unavailable" "Monotonic clock unavailable"
+	}
+	deadline_cs=$((started_cs + MJPEG_SEGMENT_SECONDS * 100))
+	last_check_cs="$started_cs"
+	last_progress_cs="$started_cs"
+
+	write_mjpeg_headers "$boundary"
+	mjpeg_copy_aligned "$boundary" "$CGI_MJPEG_PREFETCH" \
+		<&5 3<&- 4<&- 5<&- 6<&- 7<&- 9<&- &
+	CGI_COPY_PID=$!
+	exec 5<&-
 	exec 7<&-
+	CGI_COPY_START="$(
+		process_start_time "$CGI_COPY_PID" 2>/dev/null
+	)" || CGI_COPY_START=""
+	if [ -z "$CGI_COPY_START" ] ||
+	   ! direct_child_matches "$CGI_COPY_PID" "$CGI_COPY_START"; then
+		stop_cgi_copy
+		exec 8<&-
+		exit 0
+	fi
+	trap 'stop_cgi_copy; exec 8<&-; exit 0' HUP INT TERM
+	trap 'stop_cgi_copy' 0
+
+	# The direct child remains unreaped until stop_cgi_copy(), so its PID
+	# cannot be reused during this loop after the identity check above.
+	while process_is_running "$CGI_COPY_PID"; do
+		sleep 0.5
+		current_cs="$(monotonic_centiseconds 2>/dev/null)" || break
+		[ "$current_cs" -lt "$deadline_cs" ] || break
+		[ $((current_cs - last_check_cs)) -ge 100 ] || continue
+		last_check_cs="$current_cs"
+		now="$(date +%s 2>/dev/null)" || break
+		valid_decimal "$now" 12 || break
+		mjpeg_session_is_live "$CGI_TOKEN" "$now" || break
+		rchar="$(process_read_chars "$CGI_COPY_PID" 2>/dev/null)" ||
+			rchar=""
+		if valid_decimal "$rchar" 20 &&
+		   [ "$rchar" -gt "$last_rchar" ]; then
+			refresh_heartbeat "$CGI_TOKEN" "$now" || break
+			last_rchar="$rchar"
+			last_progress_cs="$current_cs"
+		elif [ -z "$rchar" ]; then
+			# Some minimal kernels omit per-task I/O accounting. The bounded
+			# CGI lifetime and worker/status checks remain safe; only the
+			# progress-sensitive lease optimization is unavailable there.
+			refresh_heartbeat "$CGI_TOKEN" "$now" || break
+			last_progress_cs="$current_cs"
+		fi
+		[ $((current_cs - last_progress_cs)) -le \
+			$((HEARTBEAT_TIMEOUT * 100)) ] || break
+	done
+	stop_cgi_copy
+	trap - 0 HUP INT TERM
+	exec 8<&-
 	exit 0
 }
 

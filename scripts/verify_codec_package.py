@@ -15,7 +15,7 @@ import codec_matrix
 import verify_packages
 
 PACKAGE_NAME = "luci-videoplayer-codec-runtime"
-PACKAGE_VERSION = "6.1.4-r2"
+PACKAGE_VERSION = "6.1.4-r3"
 FFMPEG_PATH = "usr/libexec/videoplayer-ffmpeg/ffmpeg"
 BUILD_INFO_PATH = "usr/share/luci-videoplayer-codec-runtime/build-info"
 APK_LIST_PATH = f"lib/apk/packages/{PACKAGE_NAME}.list"

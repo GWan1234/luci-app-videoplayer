@@ -13,7 +13,7 @@ RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
 PACKAGE_NAME="luci-videoplayer-codec-runtime"
 CODEC_VERSION="6.1.4"
-CODEC_RELEASE="2"
+CODEC_RELEASE="3"
 INDEX_OBJECT="dist/INDEX.tsv"
 SOURCE_COMMIT_OBJECT="dist/SOURCE_COMMIT"
 PRIVATE_FFMPEG="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
@@ -449,7 +449,7 @@ check_component "$ENCODERS_REPORT" \
 	'^[[:space:]]*A[^[:space:]]*[[:space:]]+pcm_s16le([[:space:]]|$)' \
 	"the PCM S16LE audio encoder" ||
 	COMPONENTS_OK="0"
-for MUXER in image2 s16le; do
+for MUXER in image2 mpjpeg s16le; do
 	check_component "$MUXERS_REPORT" \
 		"^[[:space:]]*E[[:space:]]+$MUXER([[:space:]]|$)" \
 		"the $MUXER muxer" ||
@@ -469,5 +469,5 @@ printf '%s\n' \
 	"Verified private FFmpeg: $PRIVATE_FFMPEG" \
 	"Verified video decoders: h264, hevc, vc1" \
 	"Verified audio decoders: aac, ac3, eac3, alac, dca, flac, mp3, opus, pcm_s16le, truehd, vorbis" \
-	"Verified video pipeline: mjpeg, image2, fps, scale, format" \
+	"Verified video pipeline: mjpeg encoder, mpjpeg stream, image2 compatibility, fps, scale, format" \
 	"Verified audio pipeline: pcm_s16le, s16le, aresample, aformat, asetnsamples"

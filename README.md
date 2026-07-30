@@ -2,11 +2,11 @@
 
 A joke but functional video player for **OpenWrt**, integrated into **LuCI**.
 Local videos can either be decoded normally by the client browser or decoded
-by the router CPU with FFmpeg and delivered as JPEG frames. Router mode uses
-router-decoded PCM audio when possible and falls back to browser-decoded audio
-while keeping video rendering on the router. In both cases, playback stays
-inside the LuCI web interface. The application does not use HDMI or a
-framebuffer.
+by the router CPU with FFmpeg and delivered as a continuous MJPEG stream.
+Router mode normally uses browser-decoded audio for tighter synchronization
+and keeps router-decoded PCM as a fallback, while video rendering remains on
+the router. In both cases, playback stays inside the LuCI web interface. The
+application does not use HDMI or a framebuffer.
 
 Current source package version: **1.1.0**. The latest published GitHub release
 is still **1.0.0**. The release installer below remains pinned to that release,
@@ -18,7 +18,7 @@ while a separate APK-only installer follows the latest successfully tested
 | Mode | How it works |
 |---|---|
 | Browser decoding | Browse local storage and stream the original file to the HTML5 `<video>` element with HTTP Range support |
-| Router CPU rendering | FFmpeg decodes a local file on the router and publishes JPEG frames at selectable presets from 5 to 60 FPS; audio uses router-generated PCM when available and otherwise the original protected stream in a hidden browser audio element |
+| Router CPU rendering | FFmpeg decodes, scales, and MJPEG-encodes a local file on the router at selectable targets from 5 to 60 FPS; the browser receives one continuous multipart stream instead of fetching each frame separately, while a protected hidden browser audio element supplies synchronized sound and router-generated PCM remains the fallback |
 | Remote URLs | Play `http://` and `https://` URLs directly in the browser; remote URLs are never fetched by FFmpeg on the router |
 | Interface | **Services → Video Player** page in LuCI |
 
@@ -44,12 +44,15 @@ luci.videoplayer ── authenticated list / resolve / renderer control
     ├── Browser mode ── /cgi-bin/videoplayer-stream?token=…
     │                    └── original file with HTTP Range (206)
     │
-    └── Router mode ─── FFmpeg workers ── JPEG frames + optional PCM in /tmp
+    └── Router mode ─── FFmpeg workers ── MJPEG FIFO + optional PCM in /tmp
                          ├── /cgi-bin/videoplayer-frame?token=…
+                         │    └── continuous multipart MJPEG video
                          ├── /cgi-bin/videoplayer-audio?token=…&chunk=…
-                         └── PCM unavailable or failed
-                              └── /cgi-bin/videoplayer-stream
-                                  ?renderer=…&audio=… → hidden <audio>
+                         ├── /cgi-bin/videoplayer-stream
+                         │    ?renderer=…&audio=… → hidden <audio>
+                         └── browser audio failed
+                              └── /cgi-bin/videoplayer-audio
+                                  ?token=…&chunk=… → PCM fallback
 
 UCI videoplayer.main.media_path ── root of the accessible media library
 ```
@@ -62,7 +65,7 @@ read-only `list` method retains the video extension allowlist. Browser-audio
 resolution accepts only the canonical source of the current active renderer
 session, so the client cannot exchange an arbitrary path for an unrestricted
 stream. It creates a second random nonce that is distinct from and bound to the
-active renderer token; possession of the JPEG-frame token alone cannot open the
+active renderer token; possession of the MJPEG token alone cannot open the
 original file. The CGI reopens the source descriptor already held by the live
 renderer and verifies its device, inode, and size before serving it. Stop,
 expiry, worker failure, or session replacement invalidates new audio requests.
@@ -78,15 +81,22 @@ overwriting it.
 Router CPU mode has a separate single-session runtime. Only one CPU-rendering
 session may run at a time, and selecting another local video replaces the
 previous session. Each session uses its own random token directory under
-`/tmp`; video frames are written with FFmpeg's atomic image update mode and,
-when supported, audio is divided into bounded raw PCM chunks. If that PCM path
-is unavailable or fails while playing, LuCI requests the session-bound
-browser-audio capability and uses the renderer's already-open original-file
-descriptor only as browser audio. The renderer also reports its current media
-offset so the hidden audio element starts near the frame already visible in
-LuCI. The UI renews a short heartbeat while it is receiving media. Closing the
-page or losing the client stops CPU work after the heartbeat timeout, and every
-session also has an absolute expiry.
+`/tmp`; FFmpeg writes its native multipart MJPEG output into a root-only,
+bounded FIFO and one long-lived CGI copier forwards it directly to the browser.
+There is no temporary JPEG, filesystem scan, or process launch per frame.
+Stock uhttpd applies an absolute CGI deadline, so each response is bounded to
+45 seconds and LuCI transparently reconnects the next segment; this is one
+request per segment rather than one request per frame. Only one MJPEG viewer
+may hold the session stream at a time, which prevents duplicate tabs from
+exhausting uhttpd's small CGI worker pool. LuCI normally requests a
+session-bound browser-audio capability and uses the renderer's already-open
+original-file descriptor only as browser audio. The renderer also reports its
+current media offset so the hidden audio element starts near the video already
+visible in LuCI. If browser audio resolution or decoding fails, LuCI switches
+once to bounded raw PCM chunks decoded by the router. The stream renews a
+short heartbeat while it is active. Closing the page or losing the client stops
+CPU work after the heartbeat timeout, and every session also has an absolute
+expiry.
 
 ## Requirements
 
@@ -100,7 +110,7 @@ remains `all` for IPK and `noarch` for APK.
 FFmpeg is large for router software. Depending on architecture and repository
 configuration, `libffmpeg-full` alone may consume roughly 14–23 MiB after
 installation, before its other dependencies. Router CPU mode also requires an
-FFmpeg build containing the native MJPEG encoder, the `image2` muxer, and the
+FFmpeg build containing the native MJPEG encoder, the `mpjpeg` muxer, and the
 `fps`, `scale`, and `format` filters. Router-decoded PCM audio additionally
 requires the `pcm_s16le` encoder, the `s16le` muxer, and the `aresample`,
 `aformat`, and `asetnsamples` filters. The UI checks these capabilities before
@@ -232,7 +242,7 @@ genuine version upgrade.
 
 ### Architecture-specific Codec Runtime (APK or IPK)
 
-The generated codec package version is **6.1.4-r2**. The current matrix covers:
+The generated codec package version is **6.1.4-r3**. The current matrix covers:
 
 - OpenWrt `25.12.5` revision `r33051-f5dae5ece4`: 35 APK architectures;
 - OpenWrt `24.10.8` revision `r29233-443ec4032a`: 36 IPK architectures;
@@ -269,11 +279,12 @@ immutable `codec-snapshot` index. It rejects malformed metadata, unknown
 architectures, mismatched revisions, duplicate entries, unexpected paths, and
 checksum failures before installation. It then confirms that the private
 runtime exposes the native H.264, HEVC, and VC-1 decoders plus every component
-required by the JPEG and PCM renderers.
+required by the continuous MJPEG and PCM renderers.
 
 Each runtime is built from a checksum-pinned official OpenWrt SDK with
 `CONFIG_BUILD_PATENTED=y`. QEMU-compatible architectures are executed under
-their matching user emulator for H.264-to-JPEG and AAC-to-PCM smoke tests.
+their matching user emulator for H.264-to-multipart-MJPEG and AAC-to-PCM smoke
+tests.
 The `mipsel_74kc` runtime uses QEMU's explicit `74Kf` CPU model so the
 validation environment matches the generated instruction set.
 The Octeon and embedded PowerPC ABIs receive static ELF, linkage,
@@ -349,10 +360,10 @@ dist/
 ├── aarch64_cortex-a53/
 │   ├── openwrt-25.12.5-r33051-f5dae5ece4/
 │   │   ├── luci-app-videoplayer-1.1.0.apk
-│   │   └── luci-videoplayer-codec-runtime-6.1.4-r2.apk
+│   │   └── luci-videoplayer-codec-runtime-6.1.4-r3.apk
 │   └── openwrt-24.10.8-r29233-443ec4032a/
 │       ├── luci-app-videoplayer_1.1.0_all.ipk
-│       └── luci-videoplayer-codec-runtime_6.1.4-r2_aarch64_cortex-a53.ipk
+│       └── luci-videoplayer-codec-runtime_6.1.4-r3_aarch64_cortex-a53.ipk
 ├── aarch64_cortex-a72/
 ├── …
 └── x86_64/
@@ -497,19 +508,24 @@ on the package manager and whether the file has been modified.
   selectable at 5, 8, 12, 15, 20, 24, 30, 48, 50, or 60 FPS. The default is
   8 FPS; higher settings progressively increase CPU and network load, and
   60 FPS may overload even fast routers. Actual playback can be slower when the
-  router or browser cannot decode, publish, transfer, and display a frame every
-  17 milliseconds. Selecting a rate above the source video's frame rate
+  router or browser cannot decode, encode, transfer, and display a frame every
+  17 milliseconds. The continuous MJPEG transport removes per-frame HTTP and
+  blob-processing overhead, but it cannot make an underpowered CPU encode 60
+  frames per second. Selecting a rate above the source video's frame rate
   duplicates frames; it does not perform motion interpolation.
-- Router CPU audio first uses signed 16-bit stereo PCM chunks at 48 kHz and the
-  browser Web Audio API. If PCM is unavailable or fails, video remains
-  router-rendered while a hidden HTML media element decodes the original audio
-  track in the browser. Browser autoplay policies may require pressing
-  **Unmute** once. If neither the router nor the browser can decode the audio,
-  playback remains silent. For uncommon or extensionless containers, browser
-  audio support can still depend on the browser's media sniffing behavior.
-- Router CPU mode has no pause, seeking, duration, or timeline. Its independently
-  delivered JPEG frames and audio output provide approximate synchronization,
-  so slow routers or networks may introduce stutter, gaps, or audio/video drift.
+- Router CPU audio first uses a hidden HTML media element to decode the
+  original protected audio track in the browser and align it to the current
+  renderer offset. If browser resolution or decoding fails, the player switches
+  once to signed 16-bit stereo PCM chunks decoded by the router at 48 kHz and
+  played through Web Audio. Browser autoplay policies may require pressing
+  **Unmute** once. If neither path can decode the audio, playback remains
+  silent. For uncommon or extensionless containers, browser audio support can
+  still depend on the browser's media sniffing behavior.
+- Router CPU mode has no pause, seeking, duration, or timeline. Its continuous
+  MJPEG video and independently delivered audio provide approximate
+  synchronization, so slow routers or networks may introduce stutter, gaps, or
+  audio/video drift. LuCI transparently reconnects the video stream between
+  bounded CGI segments and keeps the last displayed image during the handoff.
 - If router-side FFmpeg cannot start for a local file, the UI reports the
   classified failure and automatically retries that file with browser
   decoding. Automatic browser fallback starts muted; audio can be enabled with
@@ -520,7 +536,9 @@ on the package manager and whether the file has been modified.
   low-powered router.
 - The source file is read incrementally through a validated file descriptor;
   it is not copied into RAM. FFmpeg still needs working memory for compressed
-  packets, decoded frames, reference frames, scaling, and JPEG output.
+  packets, decoded frames, reference frames, scaling, and JPEG output. The
+  MJPEG transport uses a bounded kernel pipe and network backpressure instead
+  of building an unbounded frame queue.
 - No player can guarantee every existing or future codec. Unsupported
   decoders, DRM, encryption, damaged files, CPU performance, available RAM,
   thermal limits, and storage throughput remain real constraints.
@@ -548,6 +566,7 @@ OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
 exercises browser extension filtering and extensionless CPU media discovery,
 exercises successful renderer and PCM-audio lifecycle, validates the
 session-bound browser-audio nonce, stable source-descriptor Range streaming,
+continuous multipart MJPEG framing, single-viewer locking, heartbeat renewal,
 path-replacement resistance, browser PCM conversion, queueing, resume
 recovery, browser-audio fallback, autoplay recovery, synchronization, and
 cleanup, checks modern and legacy missing-decoder diagnostics,
@@ -569,8 +588,8 @@ OpenWrt SDKs, pins each release's packages-feed commit, applies that feed's
 FFmpeg patches, and cross-compiles 35 private APK executables plus 36 private
 IPK executables. Every binary is checked for an isolated payload and target
 `libc` as its only dynamic dependency, then exercised under the matching QEMU
-user emulator for H.264-to-JPEG and AAC-to-PCM output where that ISA is
-faithfully supported. Octeon and embedded PowerPC use the strict static
+user emulator for H.264-to-multipart-MJPEG and AAC-to-PCM output where that ISA
+is faithfully supported. Octeon and embedded PowerPC use the strict static
 validation path described above. Pushes and pull requests use the eight-entry
 smoke matrix; the complete matrix is an explicit manual run. The validated tree
 is published atomically to the generated `codec-snapshot` branch only after all

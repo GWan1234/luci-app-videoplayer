@@ -368,7 +368,7 @@ cmd_resolve '{}' router >/dev/null
 	fail "router mode allocated a browser stream token"
 [[ -e "$renderer_token_marker" ]] ||
 	fail "router mode did not allocate a renderer token"
-assert_eq "${json_fields[stream_type]:-}" "jpeg-frames" \
+assert_eq "${json_fields[stream_type]:-}" "mjpeg-stream" \
 	"router stream type"
 assert_eq "${json_fields[stream_url]:-}" \
 	"/cgi-bin/videoplayer-frame?token=22222222222222222222222222222222" \
@@ -387,6 +387,10 @@ assert_eq "${json_fields[audio_frames_per_chunk]:-}" "12000" \
 assert_eq "${json_fields[router_fps]:-}" "60" "router FPS"
 assert_eq "${json_fields[frame_interval_ms]:-}" "17" \
 	"router frame interval"
+assert_eq "${json_fields[mime]:-}" "multipart/x-mixed-replace" \
+	"router stream MIME"
+assert_eq "${json_fields[stream_segment_seconds]:-}" "45" \
+	"router stream segment duration"
 
 test_request_path="movie.mp4"
 # Invoked indirectly by cmd_resolve from the sourced rpcd backend.

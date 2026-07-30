@@ -1021,9 +1021,10 @@ cmd_resolve() {
 		router_fps="$(get_router_fps)"
 		frame_interval="$(frame_interval_for_fps "$router_fps")"
 		json_add_string "stream_url" "/cgi-bin/videoplayer-frame?token=$token"
-		json_add_string "stream_type" "jpeg-frames"
+		json_add_string "stream_type" "mjpeg-stream"
 		json_add_string "session_token" "$token"
-		json_add_string "mime" "image/jpeg"
+		json_add_string "mime" "multipart/x-mixed-replace"
+		json_add_int "stream_segment_seconds" 45
 		json_add_boolean "has_audio" "$has_audio"
 		if [ "$has_audio" -eq 1 ]; then
 			json_add_string "audio_url" "/cgi-bin/videoplayer-audio?token=$token"

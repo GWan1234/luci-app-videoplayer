@@ -20,13 +20,12 @@ const callStopRenderer   = rpc.declare({
 });
 const PAGE_SIZE = 100;
 const CPU_ROUTER_FPS_OPTIONS = [ 5, 8, 12, 15, 20, 24, 30, 48, 50, 60 ];
-const CPU_DEFAULT_FRAME_INTERVAL_MS = 125;
-const CPU_MIN_FRAME_INTERVAL_MS = 17;
-const CPU_MAX_FRAME_INTERVAL_MS = 200;
-const CPU_HIDDEN_INTERVAL_MS = 2000;
-const CPU_FRAME_REQUEST_TIMEOUT_MS = 2500;
-const CPU_START_TIMEOUT_MS = 15000;
-const CPU_MAX_FRAME_BYTES = 4194304;
+const CPU_STREAM_ATTEMPT_TIMEOUT_MS = 5000;
+const CPU_STREAM_STATUS_INTERVAL_MS = 3000;
+const CPU_STREAM_PROBE_INTERVAL_MS = 100;
+const CPU_STREAM_HANDOFF_GRACE_MS = 250;
+const CPU_STREAM_OUTAGE_TIMEOUT_MS = 15000;
+const CPU_STREAM_MAX_RECONNECT_MS = 3000;
 const CPU_AUDIO_SAMPLE_RATE = 48000;
 const CPU_AUDIO_CHANNELS = 2;
 const CPU_AUDIO_FRAMES_PER_CHUNK = 12000;
@@ -37,8 +36,6 @@ const CPU_AUDIO_START_TIMEOUT_MS = 10000;
 const CPU_AUDIO_DRAIN_TIMEOUT_MS = 5000;
 const CPU_AUDIO_INITIAL_LEAD_SECONDS = 0.12;
 const CPU_AUDIO_MAX_LEAD_SECONDS = 0.75;
-const CPU_VIDEO_AUDIO_DELAY_MS =
-	CPU_AUDIO_CHUNK_MS + Math.round(CPU_AUDIO_INITIAL_LEAD_SECONDS * 1000);
 const CPU_MAX_MEDIA_OFFSET_MS = 21605000;
 
 function formatSize(bytes) {
@@ -60,15 +57,6 @@ function normalizeRenderMode(value) {
 function normalizeRouterFps(value) {
 	value = Number(value);
 	return CPU_ROUTER_FPS_OPTIONS.indexOf(value) !== -1 ? value : 8;
-}
-
-function normalizeFrameInterval(value) {
-	value = Number(value);
-	if (!Number.isFinite(value) ||
-	    value < CPU_MIN_FRAME_INTERVAL_MS ||
-	    value > CPU_MAX_FRAME_INTERVAL_MS)
-		return CPU_DEFAULT_FRAME_INTERVAL_MS;
-	return Math.round(value);
 }
 
 function errorText(err) {
@@ -175,6 +163,11 @@ return view.extend({
 			self._clearCpuBrowserAudioElement();
 		if (self._pageHideHandler)
 			window.removeEventListener('pagehide', self._pageHideHandler);
+		if (self._visibilityHandler &&
+		    typeof document.removeEventListener === 'function')
+			document.removeEventListener(
+				'visibilitychange', self._visibilityHandler
+			);
 
 		const enabled = uci.get('videoplayer', 'main', 'enabled');
 		const mediaPath = uci.get('videoplayer', 'main', 'media_path') || status.media_path || '/mnt/video';
@@ -239,7 +232,7 @@ return view.extend({
 					margin-bottom: 10px;
 				}
 				#videoplayer-root video#videoplayer-video,
-				#videoplayer-root img#videoplayer-cpu-frame {
+				#videoplayer-root img.videoplayer-cpu-frame {
 					width: 100%;
 					max-height: 70vh;
 					background: #000;
@@ -258,6 +251,21 @@ return view.extend({
 					border-radius: 0;
 					object-fit: contain;
 					background: #000;
+				}
+				#videoplayer-root .vp-player-wrap:fullscreen,
+				#videoplayer-root .vp-player-wrap:-webkit-full-screen {
+					width: 100vw;
+					height: 100vh;
+					padding: 0;
+					border-radius: 0;
+					background: #000;
+				}
+				#videoplayer-root .vp-player-wrap:fullscreen img.videoplayer-cpu-frame,
+				#videoplayer-root .vp-player-wrap:-webkit-full-screen img.videoplayer-cpu-frame {
+					width: 100vw;
+					height: 100vh;
+					max-height: none;
+					border-radius: 0;
 				}
 				#videoplayer-root .vp-toolbar {
 					display: flex;
@@ -343,7 +351,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-render-mode-desc',
 								class: 'cbi-value-description'
-							}, _('Local files only. Router mode uses FFmpeg for video and, when possible, streams short PCM audio chunks to Web Audio in this page. If router-side audio is unavailable, the browser plays the original audio track while the router continues rendering video frames. This mode has no pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build and browser. If video decoding cannot start, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
+							}, _('Local files only. Router mode uses FFmpeg to decode, scale, and encode video on the router, then sends one continuous MJPEG stream to this page instead of requesting every frame separately. For tighter synchronization, the browser normally plays the original audio track; router-decoded PCM is used when the browser cannot decode that audio. This mode has no pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build and browser. If video decoding cannot start, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
 							E('div', {
 								id: 'vp-render-mode-status',
 								class: rendererAvailable === false
@@ -376,7 +384,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-router-fps-desc',
 								class: 'cbi-value-description'
-							}, _('Used only for router CPU rendering. 8 FPS is the balanced default and 5 reduces load. Higher settings are progressively heavier; 60 FPS is the maximum target, may overload even fast routers, and is not guaranteed.'))
+							}, _('Used only for router CPU rendering. This is the FFmpeg target rate for the continuous MJPEG stream; slow routers or networks may drop frames. 8 FPS is the balanced default and 5 reduces load. Higher settings are progressively heavier; 60 FPS is the maximum target, may overload even fast routers, and is not guaranteed.'))
 						])
 					]),
 					E('div', { class: 'cbi-value' }, [
@@ -467,7 +475,10 @@ return view.extend({
 			E('h3', {}, _('Player')),
 			E('div', { class: 'cbi-section' }, [
 				E('div', { class: 'cbi-section-node' }, [
-					E('div', { class: 'vp-player-wrap' }, [
+					E('div', {
+						id: 'videoplayer-player-wrap',
+						class: 'vp-player-wrap'
+					}, [
 						E('video', {
 							id: 'videoplayer-video',
 							controls: 'controls',
@@ -489,8 +500,9 @@ return view.extend({
 						}),
 						E('img', {
 							id: 'videoplayer-cpu-frame',
+							class: 'videoplayer-cpu-frame',
 							hidden: 'hidden',
-							'alt': _('Router-rendered video frame')
+							'alt': _('Continuous router-rendered video stream')
 						})
 					]),
 					E('div', {
@@ -523,7 +535,7 @@ return view.extend({
 						id: 'vp-cpu-player-note',
 						class: 'cbi-value-description',
 						hidden: 'hidden'
-					}, _('Router CPU mode has no pause, seeking, or timeline. Video frames are rendered by the router. Audio uses router-decoded PCM when available and otherwise falls back to browser decoding.'))
+					}, _('Router CPU mode has no pause, seeking, or timeline. FFmpeg renders video on the router and sends it as one continuous MJPEG stream. Browser audio is preferred for synchronization, with router-decoded PCM as a fallback.'))
 				])
 			]),
 
@@ -699,6 +711,13 @@ return view.extend({
 			self.handleStop();
 		};
 		window.addEventListener('pagehide', self._pageHideHandler);
+		self._visibilityHandler = function () {
+			self._handleCpuVisibilityChange();
+		};
+		if (typeof document.addEventListener === 'function')
+			document.addEventListener(
+				'visibilitychange', self._visibilityHandler
+			);
 
 		return root;
 	},
@@ -1029,8 +1048,8 @@ return view.extend({
 
 	handleFullscreen: function () {
 		const v = document.getElementById('videoplayer-video');
-		const frame = document.getElementById('videoplayer-cpu-frame');
-		const target = this._currentRenderMode === 'router' ? frame : v;
+		const wrap = document.getElementById('videoplayer-player-wrap');
+		const target = this._currentRenderMode === 'router' ? wrap : v;
 		let request;
 
 		if (!target)
@@ -1212,7 +1231,7 @@ return view.extend({
 			);
 		}
 		else if (this._rendererAvailable === true && this._renderMode === 'router') {
-			statusEl.textContent = _('The FFmpeg output pipeline is available. Router playback uses %d FPS. Audio uses router-decoded PCM when available and otherwise falls back to browser decoding. Expect high CPU usage; video startup failures fall back to full browser decoding.').format(this._routerFps);
+			statusEl.textContent = _('The FFmpeg output pipeline is available. Router playback uses %d FPS. Browser-decoded audio is preferred for synchronization, with router-decoded PCM as a fallback. Expect high CPU usage; video startup failures fall back to full browser decoding.').format(this._routerFps);
 		}
 		else {
 			statusEl.textContent = '';
@@ -1699,17 +1718,17 @@ return view.extend({
 		if (note && session) {
 			if (pcm) {
 				note.textContent = pcmSuspended
-					? _('Video frames are rendered by the router CPU. PCM audio is ready; press Unmute to allow browser audio output.')
-					: _('Video frames are rendered by the router CPU. Audio is decoded to PCM by the router and played by this browser.');
+					? _('The continuous MJPEG video stream is rendered by the router CPU. PCM audio is ready; press Unmute to allow browser audio output.')
+					: _('The continuous MJPEG video stream is rendered by the router CPU. Audio is decoded to PCM by the router and played by this browser.');
 			}
 			else if (browserAudio) {
 				if (browserAudio.resolving || browserAudio.waitingForVideo) {
-					note.textContent = _('Video frames are rendered by the router CPU. Preparing browser-decoded audio…');
+					note.textContent = _('The continuous MJPEG video stream is rendered by the router CPU. Preparing browser-decoded audio…');
 				}
 				else {
 					note.textContent = browserAudio.needsGesture || browserAudio.muted
-						? _('Video frames are rendered by the router CPU. Audio is decoded by the browser; press Unmute to enable sound.')
-						: _('Video frames are rendered by the router CPU while audio is decoded and played by the browser.');
+						? _('The continuous MJPEG video stream is rendered by the router CPU. Audio is decoded by the browser; press Unmute to enable sound.')
+						: _('The continuous MJPEG video stream is rendered by the router CPU while audio is decoded and played by the browser.');
 				}
 			}
 			else if (session.audioFailureReason) {
@@ -1723,19 +1742,19 @@ return view.extend({
 			return;
 		if (pcm) {
 			this._setNowPlaying(
-				_('Router CPU playback: %s (%d FPS, PCM audio)')
+				_('Router CPU playback: %s (target %d FPS, PCM audio)')
 					.format(session.label, session.fps)
 			);
 		}
 		else if (browserAudio) {
 			this._setNowPlaying(
-				_('Router CPU playback: %s (%d FPS, browser audio)')
+				_('Router CPU playback: %s (target %d FPS, browser audio)')
 					.format(session.label, session.fps)
 			);
 		}
 		else {
 			this._setNowPlaying(
-				_('Router CPU playback: %s (%d FPS, silent)')
+				_('Router CPU playback: %s (target %d FPS, silent)')
 					.format(session.label, session.fps)
 			);
 		}
@@ -1757,8 +1776,7 @@ return view.extend({
 			target = Math.max(
 				0,
 				(mediaOffsetMs +
-				 Date.now() - offsetReceivedAt -
-				 Math.max(0, Number(session && session.videoDelayMs) || 0)) /
+				 Date.now() - offsetReceivedAt) /
 					1000
 			);
 		}
@@ -1782,22 +1800,40 @@ return view.extend({
 		}
 	},
 
+	_activatePendingCpuAudio: function (session) {
+		const audio = session && session.pendingAudio;
+
+		if (!this._isCurrentCpuSession(session) || session.finishing ||
+		    !audio || !audio.active || session.audio)
+			return false;
+		session.pendingAudio = null;
+		session.audio = audio;
+		audio.startedAt = Date.now();
+		audio.sequence = null;
+		audio.errors = 0;
+		audio.ended = false;
+		audio.inFlight = false;
+		audio.inFlightGeneration = null;
+		this._resetCpuAudioQueue(audio);
+		this._scheduleCpuAudioPoll(session, 0);
+		this._updateCpuAudioPresentation(session);
+		return true;
+	},
+
 	_failCpuBrowserAudio: function (session, browserAudio, message) {
+		let pcmActivated = false;
+
 		if (!session || !browserAudio ||
 		    session.browserAudio !== browserAudio)
 			return;
 		session.browserAudio = null;
+		session.browserAudioFailed = true;
 		session.audioFailureReason = String(
 			message || _('The browser could not play this audio track.')
 		);
 		this._disposeCpuBrowserAudio(browserAudio);
 		if (!this._isCurrentCpuSession(session))
 			return;
-		this._updateCpuAudioPresentation(session);
-		if (!session.browserAudioWarned) {
-			session.browserAudioWarned = true;
-			notify(null, E('p', {}, session.audioFailureReason), 7000, 'warning');
-		}
 		if (session.finishing) {
 			const finishing = session.finishing;
 			session.finishing = null;
@@ -1806,7 +1842,19 @@ return view.extend({
 			session.finishTimer = null;
 			this._finishCpuPlayback(
 				session, finishing.message, finishing.isError, true);
+			return;
 		}
+		pcmActivated = this._activatePendingCpuAudio(session);
+		if (!session.browserAudioWarned) {
+			session.browserAudioWarned = true;
+			notify(null, E('p', {},
+				pcmActivated
+					? _('%s Using router-decoded PCM audio instead.')
+						.format(session.audioFailureReason)
+					: session.audioFailureReason),
+			7000, pcmActivated ? 'info' : 'warning');
+		}
+		this._updateCpuAudioPresentation(session);
 	},
 
 	_playCpuBrowserAudio: function (session, browserAudio, fromGesture) {
@@ -2113,13 +2161,13 @@ return view.extend({
 			}
 			if (message && !session.audioWarned) {
 				session.audioWarned = true;
-				notify(null, E('p', {},
-					_('%s Switching to browser audio.').format(message)),
-				5000, 'info');
+				notify(null, E('p', {}, message), 5000, 'warning');
 			}
-			return this._startCpuBrowserAudioFallback(
-				session, session.audioFailureReason
-			);
+			if (!session.browserAudioFailed)
+				return this._startCpuBrowserAudioFallback(
+					session, session.audioFailureReason
+				);
+			this._updateCpuAudioPresentation(session);
 		}
 		return Promise.resolve(false);
 	},
@@ -2160,6 +2208,32 @@ return view.extend({
 		this._finishCpuAudioDrain(session, audio);
 	},
 
+	_handleCpuVisibilityChange: function () {
+		const session = this._cpuSession;
+		const now = Date.now();
+		let hiddenFor = 0;
+
+		if (!this._isCurrentCpuSession(session) || session.finishing)
+			return;
+		if (document.hidden) {
+			session.streamHiddenAt = now;
+			return;
+		}
+		if (Number.isFinite(session.streamHiddenAt))
+			hiddenFor = Math.max(0, now - session.streamHiddenAt);
+		session.streamHiddenAt = null;
+		this._scheduleCpuStreamStatus(session, 0);
+		if (session.audio && session.audio.active &&
+		    hiddenFor > CPU_AUDIO_CHUNK_MS * 2)
+			this._rebaseCpuAudio(session, session.audio);
+		if (!session.streamPending &&
+		    (!session.streamVisibleAttempt ||
+		     session.streamVisibleAttempt.ended ||
+		     (Number.isFinite(session.streamNextHandoffAt) &&
+		      now >= session.streamNextHandoffAt)))
+			this._scheduleCpuStreamReconnect(session, 0);
+	},
+
 	_setPlayerSurface: function (surface) {
 		const video = document.getElementById('videoplayer-video');
 		const frame = document.getElementById('videoplayer-cpu-frame');
@@ -2188,59 +2262,75 @@ return view.extend({
 		}
 	},
 
-	_revokeObjectUrl: function (url) {
-		if (!url || !window.URL || typeof window.URL.revokeObjectURL !== 'function')
+	_disposeCpuStreamNode: function (node, removeNode) {
+		if (!node)
 			return;
-		try {
-			window.URL.revokeObjectURL(url);
-		}
-		catch (err) {
-			/* Ignore cleanup failures from browsers with partial blob support. */
+		node.onload = null;
+		node.onerror = null;
+		try { node.removeAttribute('src'); }
+		catch (err) { node.src = ''; }
+		if (removeNode && node.parentNode) {
+			try { node.parentNode.removeChild(node); }
+			catch (err) {}
 		}
 	},
 
-	_cancelCpuPolling: function (session, clearFrame) {
-		const self = this;
-		const frame = document.getElementById('videoplayer-cpu-frame');
+	_clearCpuStreamRequest: function (session, clearFrame) {
+		const visible = session && (
+			session.visibleFrame ||
+			document.getElementById('videoplayer-cpu-frame')
+		);
 
 		if (!session)
 			return;
+		if (session.streamProbeTimer != null)
+			window.clearTimeout(session.streamProbeTimer);
+		session.streamProbeTimer = null;
+		if (session.streamRefreshTimer != null)
+			window.clearTimeout(session.streamRefreshTimer);
+		session.streamRefreshTimer = null;
+		if (session.streamReconnectTimer != null)
+			window.clearTimeout(session.streamReconnectTimer);
+		session.streamReconnectTimer = null;
+		if (session.streamPending) {
+			this._disposeCpuStreamNode(session.streamPending.node, true);
+			session.streamPending = null;
+		}
+		if (session.streamVisibleAttempt) {
+			session.streamVisibleAttempt.node.onload = null;
+			session.streamVisibleAttempt.node.onerror = null;
+			session.streamVisibleAttempt = null;
+		}
+		session.streamNextHandoffAt = null;
+		if (clearFrame && visible)
+			this._disposeCpuStreamNode(visible, false);
+	},
+
+	_stopCpuStreamTransport: function (session, clearFrame) {
+		if (!session)
+			return;
+		this._clearCpuStreamRequest(session, clearFrame);
+		if (session.streamStatusTimer != null)
+			window.clearTimeout(session.streamStatusTimer);
+		session.streamStatusTimer = null;
+	},
+
+	_cancelCpuStream: function (session, clearFrame) {
+		if (!session)
+			return;
 		session.active = false;
-		if (session.timer != null)
-			window.clearTimeout(session.timer);
-		session.timer = null;
-		if (session.decodeTimer != null)
-			window.clearTimeout(session.decodeTimer);
-		session.decodeTimer = null;
+		this._stopCpuStreamTransport(session, clearFrame);
 		if (session.finishTimer != null)
 			window.clearTimeout(session.finishTimer);
 		session.finishTimer = null;
 		session.finishing = null;
-		if (typeof session.cancelDecode === 'function')
-			session.cancelDecode();
-		session.cancelDecode = null;
-		if (session.decoder) {
-			session.decoder.onload = null;
-			session.decoder.onerror = null;
-			session.decoder.src = '';
-		}
-		session.decoder = null;
-		this._revokeObjectUrl(session.nextObjectUrl);
-		session.nextObjectUrl = null;
-		(session.pendingFrames || []).forEach(function (queued) {
-			if (queued.timer != null)
-				window.clearTimeout(queued.timer);
-			self._revokeObjectUrl(queued.url);
-		});
-		session.pendingFrames = [];
-
-		if (clearFrame && frame)
-			frame.removeAttribute('src');
-		this._revokeObjectUrl(session.objectUrl);
-		session.objectUrl = null;
 		if (session.audio) {
 			this._disposeCpuAudio(session.audio);
 			session.audio = null;
+		}
+		if (session.pendingAudio) {
+			this._disposeCpuAudio(session.pendingAudio);
+			session.pendingAudio = null;
 		}
 		if (session.browserAudio) {
 			this._disposeCpuBrowserAudio(session.browserAudio);
@@ -2254,7 +2344,7 @@ return view.extend({
 		if (!session)
 			return null;
 		this._cpuSession = null;
-		this._cancelCpuPolling(session, clearFrame !== false);
+		this._cancelCpuStream(session, clearFrame !== false);
 		return session;
 	},
 
@@ -2355,33 +2445,54 @@ return view.extend({
 			this._currentRenderMode === 'router';
 	},
 
-	_scheduleCpuFramePoll: function (session, delay) {
-		const self = this;
+	_markCpuStreamStarted: function (session, attempt) {
+		const frame = attempt && attempt.node;
+		const previous = session && session.visibleFrame;
 
-		if (!self._isCurrentCpuSession(session) || session.finishing)
+		if (!this._isCurrentCpuSession(session) || !attempt || !frame ||
+		    session.streamPending !== attempt || attempt.ready)
 			return;
-		if (session.timer != null)
-			window.clearTimeout(session.timer);
-		session.timer = window.setTimeout(function () {
-			session.timer = null;
-			self._pollCpuFrame(session);
-		}, Math.max(0, Number(delay) || 0));
-	},
-
-	_presentCpuFrame: function (session, objectUrl) {
-		const frame = document.getElementById('videoplayer-cpu-frame');
-
-		if (!this._isCurrentCpuSession(session) || !frame) {
-			this._revokeObjectUrl(objectUrl);
-			return;
+		attempt.ready = true;
+		session.streamPending = null;
+		if (session.streamProbeTimer != null)
+			window.clearTimeout(session.streamProbeTimer);
+		session.streamProbeTimer = null;
+		if (previous && previous !== frame) {
+			previous.onload = null;
+			previous.onerror = null;
+			if (previous.id === 'videoplayer-cpu-frame')
+				previous.removeAttribute('id');
 		}
-		const previous = session.objectUrl;
-		frame.src = objectUrl;
-		session.objectUrl = objectUrl;
-		this._revokeObjectUrl(previous);
+		frame.id = 'videoplayer-cpu-frame';
+		frame.hidden = false;
+		frame.setAttribute('aria-hidden', 'false');
+		session.visibleFrame = frame;
+		session.streamVisibleAttempt = attempt;
+		if (previous && previous !== frame)
+			this._disposeCpuStreamNode(previous, true);
+		session.streamLastFrameAt = Date.now();
+		session.streamOutageStartedAt = null;
+		session.streamErrors = 0;
+		session.streamWarned = false;
+		session.streamNextHandoffAt =
+			attempt.openedAt + session.streamSegmentMs +
+			CPU_STREAM_HANDOFF_GRACE_MS;
+		if (session.streamRefreshTimer != null)
+			window.clearTimeout(session.streamRefreshTimer);
+		{
+			const self = this;
+			session.streamRefreshTimer = window.setTimeout(function () {
+				session.streamRefreshTimer = null;
+				if (self._isCurrentCpuSession(session) &&
+				    !session.finishing &&
+				    session.streamVisibleAttempt === attempt &&
+				    !session.streamPending)
+					self._scheduleCpuStreamReconnect(session, 0);
+			}, Math.max(0, session.streamNextHandoffAt - Date.now()));
+		}
 		if (!session.firstFrameSeen) {
 			session.firstFrameSeen = true;
-			session.firstFrameAt = Date.now();
+			session.firstFrameAt = session.streamLastFrameAt;
 			if (session.browserAudio &&
 			    session.browserAudio.active &&
 			    session.browserAudio.waitingForVideo) {
@@ -2391,84 +2502,258 @@ return view.extend({
 						session, session.browserAudio, false
 					);
 			}
-			this._updateCpuAudioPresentation(session);
 		}
+		this._setPlayerSurface('cpu');
+		this._updateCpuAudioPresentation(session);
 	},
 
-	_queueCpuFrame: function (session, objectUrl) {
-		const self = this;
-		const queued = { url: objectUrl, timer: null };
-
-		session.pendingFrames.push(queued);
-		queued.timer = window.setTimeout(function () {
-			const index = session.pendingFrames.indexOf(queued);
-			if (index !== -1)
-				session.pendingFrames.splice(index, 1);
-			queued.timer = null;
-			self._presentCpuFrame(session, objectUrl);
-		}, Math.max(0, Number(session.videoDelayMs) || 0));
-	},
-
-	_installCpuFrame: function (session, blob) {
+	_scheduleCpuStreamProbe: function (session, attempt) {
 		const self = this;
 
-		return new Promise(function (resolve, reject) {
-			if (!self._isCurrentCpuSession(session)) {
-				resolve();
+		if (!self._isCurrentCpuSession(session) || session.finishing ||
+		    !attempt || attempt.ready || session.streamPending !== attempt)
+			return;
+		if (session.streamProbeTimer != null)
+			window.clearTimeout(session.streamProbeTimer);
+		session.streamProbeTimer = window.setTimeout(function () {
+			const frame = attempt.node;
+
+			session.streamProbeTimer = null;
+			if (!self._isCurrentCpuSession(session) || session.finishing ||
+			    session.streamPending !== attempt)
+				return;
+			if (frame && Number(frame.naturalWidth) > 0) {
+				self._markCpuStreamStarted(session, attempt);
 				return;
 			}
+			if (Date.now() - attempt.openedAt >=
+			    CPU_STREAM_ATTEMPT_TIMEOUT_MS) {
+				self._handleCpuStreamFailure(session, attempt);
+				return;
+			}
+			self._scheduleCpuStreamProbe(session, attempt);
+		}, CPU_STREAM_PROBE_INTERVAL_MS);
+	},
 
-			const objectUrl = window.URL.createObjectURL(blob);
-			const decoder = new Image();
-			let settled = false;
+	_scheduleCpuStreamReconnect: function (session, delay) {
+		const self = this;
 
-			session.nextObjectUrl = objectUrl;
-			session.decoder = decoder;
+		if (!self._isCurrentCpuSession(session) || session.finishing ||
+		    session.streamPending)
+			return;
+		if (session.streamReconnectTimer != null)
+			window.clearTimeout(session.streamReconnectTimer);
+		session.streamReconnectTimer = window.setTimeout(function () {
+			session.streamReconnectTimer = null;
+			self._openCpuStream(session);
+		}, Math.max(0, Number(delay) || 0));
+	},
 
-			const finish = function (ok, err) {
-				const current = self._isCurrentCpuSession(session);
+	_handleCpuStreamFailure: function (session, attempt) {
+		const now = Date.now();
+		let delay;
 
-				if (settled)
-					return;
-				settled = true;
-				if (session.decodeTimer != null)
-					window.clearTimeout(session.decodeTimer);
-				session.decodeTimer = null;
-				decoder.onload = null;
-				decoder.onerror = null;
-				if (session.decoder === decoder)
-					session.decoder = null;
-				if (session.cancelDecode === cancelDecode)
-					session.cancelDecode = null;
+		if (!this._isCurrentCpuSession(session) || session.finishing ||
+		    !attempt ||
+		    (session.streamPending !== attempt &&
+		     session.streamVisibleAttempt !== attempt))
+			return;
+		if (session.streamPending === attempt) {
+			session.streamPending = null;
+			this._disposeCpuStreamNode(attempt.node, true);
+		}
+		if (session.streamVisibleAttempt === attempt) {
+			attempt.ended = true;
+			attempt.node.onload = null;
+			attempt.node.onerror = null;
+			if (session.streamRefreshTimer != null)
+				window.clearTimeout(session.streamRefreshTimer);
+			session.streamRefreshTimer = null;
+			session.streamNextHandoffAt = null;
+		}
+		if (!Number.isFinite(session.streamOutageStartedAt))
+			session.streamOutageStartedAt = now;
+		session.streamErrors++;
+		if (session.streamErrors >= 3 &&
+		    now - session.streamOutageStartedAt >=
+		    CPU_STREAM_OUTAGE_TIMEOUT_MS) {
+			this._finishCpuPlayback(
+				session,
+				_('The continuous router MJPEG stream for %s remained unavailable. Use browser rendering or try another browser.')
+					.format(session.label),
+				true
+			);
+			return;
+		}
+		delay = Math.min(
+			CPU_STREAM_MAX_RECONNECT_MS,
+			250 * Math.pow(2, Math.min(
+				Math.max(0, session.streamErrors - 1), 4
+			))
+		);
+		if (session.streamErrors >= 4 && !session.streamWarned) {
+			session.streamWarned = true;
+			notify(null, E('p', {},
+				_('The continuous router video stream was interrupted; reconnecting.')),
+			6000, 'warning');
+		}
+		this._scheduleCpuStreamStatus(session, 0);
+		this._scheduleCpuStreamReconnect(session, delay);
+	},
 
-				if (!ok || !current) {
-					if (session.nextObjectUrl === objectUrl)
-						session.nextObjectUrl = null;
-					self._revokeObjectUrl(objectUrl);
-					if (ok || !current)
-						resolve();
-					else
-						reject(err || new Error(_('The router returned an invalid video frame.')));
-					return;
-				}
+	_openCpuStream: function (session) {
+		const self = this;
+		const visible = session && (
+			session.visibleFrame ||
+			document.getElementById('videoplayer-cpu-frame')
+		);
+		const parent = visible && visible.parentNode;
+		let attempt, frame, requestUrl;
 
-				session.nextObjectUrl = null;
-				self._queueCpuFrame(session, objectUrl);
-				resolve();
-			};
-			const cancelDecode = function () {
-				finish(true);
-			};
+		if (!self._isCurrentCpuSession(session) || session.finishing ||
+		    session.streamPending)
+			return;
+		if (!visible || !parent ||
+		    typeof document.createElement !== 'function' ||
+		    typeof parent.insertBefore !== 'function') {
+			self._finishCpuPlayback(
+				session,
+				_('This browser cannot create the router video stream surface.'),
+				true
+			);
+			return;
+		}
+		frame = document.createElement('img');
+		frame.className = 'videoplayer-cpu-frame';
+		frame.hidden = true;
+		frame.setAttribute('aria-hidden', 'true');
+		frame.setAttribute('alt', _('Continuous router-rendered video stream'));
+		parent.insertBefore(frame, visible.nextSibling || null);
+		session.visibleFrame = visible;
+		session.streamAttempt = (Number(session.streamAttempt) || 0) + 1;
+		attempt = {
+			id: session.streamAttempt,
+			node: frame,
+			openedAt: Date.now(),
+			ready: false,
+			ended: false,
+			closeObserved: false
+		};
+		session.streamPending = attempt;
+		requestUrl = session.streamUrl + '&stream=' +
+			String(session.generation) + '-' + String(attempt.id);
+		frame.onload = function () {
+			if (!self._isCurrentCpuSession(session) || session.finishing)
+				return;
+			if (session.streamPending === attempt && !attempt.ready) {
+				self._markCpuStreamStarted(session, attempt);
+				return;
+			}
+			/* Some browsers emit load only when a finite MJPEG response
+			 * closes. Others emit it for individual parts, so only a late,
+			 * once-per-attempt event may accelerate the bounded handoff. */
+			if (session.streamVisibleAttempt === attempt &&
+			    attempt.ready && !attempt.closeObserved &&
+			    Date.now() - attempt.openedAt >=
+			    session.streamSegmentMs - 1500) {
+				attempt.closeObserved = true;
+				if (session.streamRefreshTimer != null)
+					window.clearTimeout(session.streamRefreshTimer);
+				session.streamRefreshTimer = null;
+				session.streamNextHandoffAt =
+					Date.now() + CPU_STREAM_HANDOFF_GRACE_MS;
+				self._scheduleCpuStreamReconnect(
+					session, CPU_STREAM_HANDOFF_GRACE_MS);
+			}
+		};
+		frame.onerror = function () {
+			self._handleCpuStreamFailure(session, attempt);
+		};
+		frame.src = requestUrl;
+		self._scheduleCpuStreamProbe(session, attempt);
+	},
 
-			session.cancelDecode = cancelDecode;
-			decoder.onload = function () { finish(true); };
-			decoder.onerror = function () {
-				finish(false, new Error(_('The router returned a JPEG frame the browser could not decode.')));
-			};
-			session.decodeTimer = window.setTimeout(function () {
-				finish(false, new Error(_('Timed out while decoding a router-rendered frame.')));
-			}, 1500);
-			decoder.src = objectUrl;
+	_scheduleCpuStreamStatus: function (session, delay) {
+		const self = this;
+
+		if (!self._isCurrentCpuSession(session) || session.finishing)
+			return;
+		if (session.streamStatusTimer != null)
+			window.clearTimeout(session.streamStatusTimer);
+		session.streamStatusTimer = window.setTimeout(function () {
+			session.streamStatusTimer = null;
+			self._pollCpuStreamStatus(session);
+		}, Math.max(0, Number(delay) || 0));
+	},
+
+	_pollCpuStreamStatus: function (session) {
+		const self = this;
+
+		if (!self._isCurrentCpuSession(session) || session.finishing)
+			return Promise.resolve();
+		if (session.streamStatusInFlight) {
+			session.streamStatusAgain = true;
+			return Promise.resolve();
+		}
+		session.streamStatusInFlight = true;
+		session.streamStatusAgain = false;
+		return callRendererStatus(session.token).then(function (res) {
+			const state = String(res && res.state || 'error');
+
+			if (!self._isCurrentCpuSession(session) || session.finishing)
+				return;
+			session.streamStatusErrors = 0;
+			session.streamStatusWarned = false;
+			if (state === 'ended' || state === 'stopped' ||
+			    state === 'expired' || state === 'inactive') {
+				return self._finishCpuPlayback(
+					session,
+					_('Router CPU playback ended: %s').format(session.label),
+					false
+				);
+			}
+			if (state === 'error') {
+				const reason = String(res && res.reason || '').trim();
+				return self._finishCpuPlayback(
+					session,
+					reason
+						? _('Router CPU renderer failed for %s: %s')
+							.format(session.label, reason)
+						: _('Router CPU renderer failed for %s. The installed FFmpeg build may not support this video codec.')
+							.format(session.label),
+					true
+				);
+			}
+			if (state !== 'running' && state !== 'starting') {
+				return self._finishCpuPlayback(
+					session,
+					_('Router CPU renderer returned an invalid state for %s.')
+						.format(session.label),
+					true
+				);
+			}
+		}).catch(function (err) {
+			if (!self._isCurrentCpuSession(session) || session.finishing)
+				return;
+			session.streamStatusErrors++;
+			if (session.streamStatusErrors >= 3 &&
+			    !session.streamStatusWarned) {
+				session.streamStatusWarned = true;
+				notify(null, E('p', {},
+					_('Unable to verify the router video stream: %s')
+						.format(errorText(err))),
+				6000, 'warning');
+			}
+		}).finally(function () {
+			const runAgain = session.streamStatusAgain;
+
+			session.streamStatusInFlight = false;
+			session.streamStatusAgain = false;
+			if (self._isCurrentCpuSession(session) && !session.finishing)
+				self._scheduleCpuStreamStatus(
+					session,
+					runAgain ? 0 : CPU_STREAM_STATUS_INTERVAL_MS
+				);
 		});
 	},
 
@@ -2477,8 +2762,7 @@ return view.extend({
 			return Promise.resolve();
 
 		if (!isError && !force &&
-		    (((session.pendingFrames || []).length > 0) ||
-		     (session.audio &&
+		    ((session.audio &&
 		      (session.audio.active || (session.audio.sources || []).length)) ||
 		     (session.browserAudio && session.browserAudio.active &&
 		      !session.browserAudio.ended &&
@@ -2492,9 +2776,7 @@ return view.extend({
 					message: message,
 					isError: false
 				};
-				if (session.timer != null)
-					window.clearTimeout(session.timer);
-				session.timer = null;
+				this._stopCpuStreamTransport(session, false);
 				session.finishTimer = window.setTimeout(function () {
 					if (self._isCurrentCpuSession(session) && session.finishing)
 						self._finishCpuPlayback(session, message, false, true);
@@ -2514,122 +2796,6 @@ return view.extend({
 		if (isError)
 			notify(null, E('p', {}, message), 8000, 'error');
 		return Promise.resolve();
-	},
-
-	_handleCpuPollFailure: function (session, err) {
-		const self = this;
-
-		if (!self._isCurrentCpuSession(session))
-			return Promise.resolve();
-		session.errors++;
-
-		if (session.errors < 3) {
-			self._scheduleCpuFramePoll(session, 500);
-			return Promise.resolve();
-		}
-
-		return callRendererStatus(session.token).then(function (res) {
-			if (!self._isCurrentCpuSession(session))
-				return;
-			const state = res && res.state || 'error';
-			if (state === 'ended' || state === 'stopped' || state === 'expired' || state === 'inactive') {
-				return self._finishCpuPlayback(
-					session,
-					_('Router CPU playback ended: %s').format(session.label),
-					false
-				);
-			}
-			if (state === 'error') {
-				const reason = String(res && res.reason || '').trim();
-				return self._finishCpuPlayback(
-					session,
-					reason
-						? _('Router CPU renderer failed for %s: %s').format(session.label, reason)
-						: _('Router CPU renderer failed for %s. The installed FFmpeg build may not support this video codec.').format(session.label),
-					true
-				);
-			}
-
-			if (session.errors >= 5 && !session.warned) {
-				session.warned = true;
-				notify(null, E('p', {},
-					_('Router-rendered frames are temporarily unavailable: %s').format(errorText(err))),
-				7000, 'warning');
-			}
-			self._scheduleCpuFramePoll(
-				session,
-				Math.min(2000, 250 * Math.pow(2, Math.min(session.errors, 3)))
-			);
-		}).catch(function () {
-			if (self._isCurrentCpuSession(session))
-				self._scheduleCpuFramePoll(session, 2000);
-		});
-	},
-
-	_pollCpuFrame: function (session) {
-		const self = this;
-		const started = Date.now();
-
-		if (!self._isCurrentCpuSession(session))
-			return Promise.resolve();
-		session.sequence++;
-
-		return request.get(session.frameUrl, {
-			responseType: 'blob',
-			timeout: CPU_FRAME_REQUEST_TIMEOUT_MS,
-			/* The unique frame query plus no-store response headers prevent
-			 * caching. LuCI's cache:false adds a second bare query field,
-			 * which the intentionally strict CGI parser rejects. */
-			cache: true,
-			query: {
-				frame: String(session.generation) + '-' + String(session.sequence)
-			}
-		}).then(function (res) {
-			if (!self._isCurrentCpuSession(session))
-				return;
-
-			if (res.status === 202) {
-				if (Date.now() - session.startedAt > CPU_START_TIMEOUT_MS) {
-					return self._finishCpuPlayback(
-						session,
-						_('Router renderer did not produce a frame in time.'),
-						true
-					);
-				}
-				return;
-			}
-			if (res.status === 410 || res.status === 404) {
-				return self._finishCpuPlayback(
-					session,
-					_('Router CPU playback ended: %s').format(session.label),
-					false
-				);
-			}
-			if (!res.ok || res.status !== 200)
-				throw new Error(_('Frame request failed with HTTP %d').format(res.status));
-
-			const type = String(res.headers.get('Content-Type') || '')
-				.split(';', 1)[0].trim().toLowerCase();
-			const blob = res.blob();
-			if (type !== 'image/jpeg' || !blob || !blob.size ||
-			    blob.size > CPU_MAX_FRAME_BYTES)
-				throw new Error(_('The router renderer returned an invalid frame.'));
-			return self._installCpuFrame(session, blob);
-		}).then(function () {
-			if (!self._isCurrentCpuSession(session))
-				return;
-			session.errors = 0;
-			session.warned = false;
-			const interval = document.hidden
-				? CPU_HIDDEN_INTERVAL_MS
-				: session.frameIntervalMs;
-			self._scheduleCpuFramePoll(
-				session,
-				Math.max(0, interval - (Date.now() - started))
-			);
-		}).catch(function (err) {
-			return self._handleCpuPollFailure(session, err);
-		});
 	},
 
 	_scheduleCpuAudioPoll: function (session, delay) {
@@ -2873,10 +3039,11 @@ return view.extend({
 		});
 	},
 
-	_playCpuFrames: function (res, label, generation, pendingAudio) {
+	_playCpuStream: function (res, label, generation, pendingAudio) {
 		const self = this;
 		const token = String(res.session_token || '');
-		const frameUrl = String(res.stream_url || '');
+		const streamUrl = String(res.stream_url || '');
+		const segmentSeconds = Number(res.stream_segment_seconds);
 		const hasAudio = flagOn(res.has_audio);
 		const audioUrl = String(res.audio_url || '');
 		const audioMetadataValid = hasAudio &&
@@ -2888,8 +3055,14 @@ return view.extend({
 			Number(res.audio_frames_per_chunk) === CPU_AUDIO_FRAMES_PER_CHUNK;
 
 		if (!/^[0-9a-f]{32}$/.test(token) ||
-		    !/^\/cgi-bin\/videoplayer-frame\?token=[0-9a-f]{32}$/.test(frameUrl) ||
-		    frameUrl.slice(-32) !== token) {
+		    !/^\/cgi-bin\/videoplayer-frame\?token=[0-9a-f]{32}$/.test(streamUrl) ||
+		    streamUrl.slice(-32) !== token ||
+		    normalizeRenderMode(res.render_mode) !== 'router' ||
+		    res.stream_type !== 'mjpeg-stream' ||
+		    res.mime !== 'multipart/x-mixed-replace' ||
+		    !Number.isInteger(segmentSeconds) ||
+		    segmentSeconds < 10 ||
+		    segmentSeconds > 55) {
 			self._disposeCpuAudio(pendingAudio);
 			if (/^[0-9a-f]{32}$/.test(token))
 				callStopRenderer(token).catch(function () {});
@@ -2919,30 +3092,38 @@ return view.extend({
 
 		const session = {
 			token: token,
-			frameUrl: frameUrl,
+			streamUrl: streamUrl,
+			streamSegmentMs: segmentSeconds * 1000,
 			generation: generation,
 			label: label,
 			fps: normalizeRouterFps(res.router_fps),
-			frameIntervalMs: normalizeFrameInterval(res.frame_interval_ms),
-			videoDelayMs: pendingAudio ? CPU_VIDEO_AUDIO_DELAY_MS : 0,
 			active: true,
-			timer: null,
-			sequence: 0,
-			errors: 0,
-			warned: false,
-			startedAt: Date.now(),
 			firstFrameSeen: false,
 			firstFrameAt: null,
-			objectUrl: null,
-			nextObjectUrl: null,
-			pendingFrames: [],
-			decoder: null,
-			cancelDecode: null,
-			decodeTimer: null,
-			audio: pendingAudio,
+			visibleFrame: document.getElementById('videoplayer-cpu-frame'),
+			streamAttempt: 0,
+			streamPending: null,
+			streamVisibleAttempt: null,
+			streamLastFrameAt: null,
+			streamOutageStartedAt: null,
+			streamNextHandoffAt: null,
+			streamHiddenAt: null,
+			streamErrors: 0,
+			streamWarned: false,
+			streamProbeTimer: null,
+			streamRefreshTimer: null,
+			streamReconnectTimer: null,
+			streamStatusTimer: null,
+			streamStatusInFlight: false,
+			streamStatusAgain: false,
+			streamStatusErrors: 0,
+			streamStatusWarned: false,
+			audio: null,
+			pendingAudio: pendingAudio,
 			audioWarned: false,
 			audioFailureReason: '',
 			browserAudio: null,
+			browserAudioFailed: false,
 			browserAudioWarned: false,
 			browserAudioPrompted: false,
 			finishing: null,
@@ -2952,16 +3133,15 @@ return view.extend({
 		self._currentKind = 'local';
 		self._currentRenderMode = 'router';
 		self._currentLabel = label;
-		self._currentSrc = frameUrl;
+		self._currentSrc = streamUrl;
 		self._setPlayerSurface('cpu');
 		self._setNowPlaying(_('Starting router CPU renderer: %s').format(label));
-		self._scheduleCpuFramePoll(session, 0);
-		if (session.audio) {
-			self._scheduleCpuAudioPoll(session, 0);
-			return Promise.resolve();
-		}
+		self._openCpuStream(session);
+		self._scheduleCpuStreamStatus(session, 0);
 		let fallbackReason;
-		if (!hasAudio)
+		if (session.pendingAudio)
+			fallbackReason = _('Browser audio is preferred for synchronization; router-decoded PCM remains available as a fallback.');
+		else if (!hasAudio)
 			fallbackReason = _('Router FFmpeg could not provide a usable PCM audio track.');
 		else if (!audioMetadataValid)
 			fallbackReason = _('The router returned invalid PCM audio metadata.');
@@ -3107,14 +3287,15 @@ return view.extend({
 				9000, 'warning');
 			}
 
-			/* stream_url is an opaque, ACL-protected token URL; never rebuild it client-side. */
+			/* stream_url is an opaque, ACL-protected token URL. Router mode
+			 * only appends a strictly numeric multipart reconnect nonce. */
 			if (normalizeRenderMode(res.render_mode) === 'router' ||
-			    res.stream_type === 'jpeg-frames') {
+			    res.stream_type === 'mjpeg-stream') {
 				const audio = pendingAudio;
 				if (self._pendingCpuAudio === audio)
 					self._pendingCpuAudio = null;
 				pendingAudio = null;
-				return self._playCpuFrames(res, label, generation, audio);
+				return self._playCpuStream(res, label, generation, audio);
 			}
 			discardPendingAudio();
 			return self._playInVideo(

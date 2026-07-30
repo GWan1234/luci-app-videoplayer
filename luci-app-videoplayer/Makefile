@@ -15,7 +15,7 @@ PKG_VERSION:=1.1.0
 PKG_RELEASE:=
 
 LUCI_TITLE:=LuCI Video Player (local + remote)
-LUCI_DESCRIPTION:=LuCI video player with browser playback and configurable router-CPU JPEG/PCM rendering for local media.
+LUCI_DESCRIPTION:=LuCI video player with browser playback and configurable router-CPU MJPEG/PCM streaming for local media.
 LUCI_DEPENDS:=+luci-base +uhttpd +jshn +coreutils-stat +coreutils-timeout
 LUCI_PKGARCH:=all
 LUCI_URL:=https://github.com/communism420/luci-app-videoplayer
