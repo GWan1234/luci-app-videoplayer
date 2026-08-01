@@ -430,7 +430,7 @@ int main(int argc, char **argv)
 	if (snprintf(
 		    expected_video_filter,
 		    sizeof(expected_video_filter),
-		    "fps=%s,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p",
+		    "fps=fps=%s:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p",
 		    expected_fps) >= (int)sizeof(expected_video_filter))
 		return 78;
 	if (expected_private_lib != NULL) {

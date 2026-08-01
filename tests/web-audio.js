@@ -231,13 +231,20 @@ function fakeContext(options = {}) {
 		createBufferSource() {
 			const sourceNode = {
 				buffer: null,
+				playbackRate: {
+					value: 1,
+					setValueAtTime(value) {
+						this.value = value;
+					}
+				},
 				startAt: null,
 				stopped: false,
 				disconnected: false,
 				onended: null,
 				connect() {},
-				start(at) {
+				start(at, offset) {
 					this.startAt = at;
+					this.startOffset = Number(offset) || 0;
 				},
 				stop() {
 					this.stopped = true;
@@ -290,6 +297,9 @@ function fakeMediaElement(playOutcomes) {
 		paused: true,
 		duration: 600,
 		currentTime: 0,
+		defaultPlaybackRate: 1,
+		playbackRate: 1,
+		preservesPitch: false,
 		playCalls: 0,
 		playMuted: [],
 		pauseCalls: 0,
@@ -870,9 +880,8 @@ async function main() {
 	check(browserSession.firstFrameSeen && browserSession.firstFrameAt,
 		'first streamed image did not establish the audio clock');
 	check(
-		browserElement.currentTime >= 1.5 &&
-		browserElement.currentTime <= 2.5,
-		'browser audio ignored the router playback offset'
+		browserElement.currentTime >= 0 && browserElement.currentTime < 0.25,
+		'browser audio started ahead of the first displayed frame'
 	);
 	check(browserElement.playCalls === 2, 'autoplay fallback did not retry muted');
 	check(
@@ -1557,6 +1566,515 @@ async function main() {
 	check(pendingBrowserAudio.muted && pendingElement.muted,
 		'late play success undid the user mute action');
 	app._stopPlayback();
+
+	/* The streaming fetch path parses one multipart response, drops decoded
+	 * backlog, and slaves browser audio to the last frame actually presented.
+	 * Simulate a router that produces only 0.1 seconds of video in 0.8 seconds
+	 * of wall time: audio must pause and hard-resync instead of drifting ahead. */
+	const syncClock = installFakeClock(500000);
+	const syncElement = fakeMediaElement([ null, null ]);
+	const syncFrame = fakeImageElement();
+	syncFrame.id = 'videoplayer-cpu-frame';
+	syncFrame.className = 'videoplayer-cpu-frame';
+	syncFrame.naturalWidth = 640;
+	const syncParent = fakeImageParent(syncFrame);
+	const syncToken = 'e'.repeat(32);
+	const syncAudio = {
+		active: true,
+		resolving: false,
+		waitingForVideo: false,
+		playing: true,
+		playPending: false,
+		playAttempt: 0,
+		playPromise: null,
+		ended: false,
+		muted: false,
+		needsGesture: false,
+		syncPaused: false,
+		syncPausePending: false,
+		syncPauseClearTimer: null,
+		mediaOffsetMs: 9000,
+		offsetReceivedAt: Date.now(),
+		element: syncElement,
+		promise: Promise.resolve(true)
+	};
+	const syncSession = {
+		active: true,
+		generation: 91,
+		token: syncToken,
+		label: 'slow-router.mp4',
+		fps: 10,
+		streamUrl: '/cgi-bin/videoplayer-frame?token=' + syncToken,
+		streamSegmentMs: 45000,
+		streamTransportMode: 'fetch',
+		streamFrameSequence: 0,
+		visibleFrame: syncFrame,
+		streamAttempt: 1,
+		streamPending: null,
+		streamVisibleAttempt: null,
+		streamLastFrameAt: null,
+		streamOutageStartedAt: null,
+		streamNextHandoffAt: null,
+		streamHiddenAt: null,
+		streamErrors: 0,
+		streamWarned: false,
+		streamProbeTimer: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamStatusTimer: null,
+		streamStatusInFlight: false,
+		streamStatusAgain: false,
+		streamStatusErrors: 0,
+		streamStatusWarned: false,
+		videoMediaTime: null,
+		videoFrameAt: null,
+		videoPlaybackRate: 1,
+		avSyncTimer: null,
+		firstFrameSeen: false,
+		firstFrameAt: null,
+		audio: null,
+		pendingAudio: null,
+		browserAudio: syncAudio,
+		browserAudioFailed: false,
+		finishing: null,
+		finishTimer: null
+	};
+	const syncAttempt = {
+		id: 1,
+		mode: 'fetch',
+		openedAt: Date.now(),
+		ready: false,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		boundaryMarker: new Uint8Array(Buffer.from(
+			'--videoplayer-' + syncToken + '\r\n', 'ascii'
+		)),
+		headerEnd: new Uint8Array(Buffer.from('\r\n\r\n', 'ascii')),
+		multipartBuffer: new Uint8Array(0),
+		multipartState: 'boundary',
+		multipartLength: 0,
+		decodeInFlight: null,
+		queuedFrame: null,
+		reader: null,
+		controller: null
+	};
+	const makeMjpegPart = bytes => new Uint8Array(Buffer.concat([
+		Buffer.from(
+			'--videoplayer-' + syncToken + '\r\n' +
+			'Content-type: image/jpeg\r\n' +
+			'Content-length: ' + bytes.length + '\r\n\r\n',
+			'ascii'
+		),
+		Buffer.from(bytes),
+		Buffer.from('\r\n', 'ascii')
+	]));
+	const jpeg = new Uint8Array([ 0xff, 0xd8, 0x00, 0x01, 0xff, 0xd9 ]);
+	const originalBlob = window.Blob;
+	window.Blob = global.Blob;
+	elements['videoplayer-cpu-audio'] = syncElement;
+	elements['videoplayer-cpu-frame'] = syncFrame;
+	app._cpuBrowserAudioOwner = syncAudio;
+	app._cpuSession = syncSession;
+	app._playGeneration = 91;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	syncSession.streamPending = syncAttempt;
+	const firstPart = makeMjpegPart(jpeg);
+	app._consumeCpuMjpegChunk(
+		syncSession,
+		syncAttempt,
+		firstPart.slice(0, firstPart.length - 2)
+	);
+	check(!syncAttempt.decodeInFlight,
+		'partial MJPEG frame was decoded before its trailer arrived');
+	app._consumeCpuMjpegChunk(
+		syncSession,
+		syncAttempt,
+		firstPart.slice(firstPart.length - 2)
+	);
+	check(syncAttempt.decodeInFlight,
+		'complete MJPEG frame was not submitted for decoding');
+	syncAttempt.decodeInFlight.node.naturalWidth = 640;
+	syncAttempt.decodeInFlight.node.onload();
+	check(syncSession.firstFrameSeen && syncSession.videoMediaTime === 0,
+		'first parsed frame did not establish a zero video clock');
+	check(syncElement.currentTime === 0,
+		'server wall-clock offset moved audio ahead of parsed video');
+
+	syncElement.currentTime = 0.8;
+	syncClock.advance(800);
+	check(syncAudio.syncPaused && syncElement.paused,
+		'audio kept running while the video clock was stalled');
+	app._consumeCpuMjpegChunk(syncSession, syncAttempt, makeMjpegPart(jpeg));
+	check(syncAttempt.decodeInFlight,
+		'slow second frame was not submitted for decoding');
+	syncAttempt.decodeInFlight.node.naturalWidth = 640;
+	syncAttempt.decodeInFlight.node.onload();
+	await syncAudio.playPromise;
+	check(Math.abs(syncElement.currentTime - 0.1) < 0.001,
+		'audio did not hard-resync to the slow displayed video frame');
+	check(syncElement.playbackRate < 1 && syncElement.playbackRate >= 0.25,
+		'audio playback rate did not follow the bounded slow video clock');
+
+	/* While one JPEG is decoding, retain only the newest complete part. */
+	app._consumeCpuMjpegChunk(syncSession, syncAttempt, makeMjpegPart(jpeg));
+	app._consumeCpuMjpegChunk(syncSession, syncAttempt, makeMjpegPart(jpeg));
+	app._consumeCpuMjpegChunk(syncSession, syncAttempt, makeMjpegPart(jpeg));
+	check(syncAttempt.decodeInFlight && syncAttempt.queuedFrame &&
+		syncAttempt.queuedFrame.sequence === 4,
+		'MJPEG decoder queue retained stale frames instead of the newest one');
+	syncAttempt.decodeInFlight.node.naturalWidth = 640;
+	syncAttempt.decodeInFlight.node.onload();
+	check(syncAttempt.decodeInFlight &&
+		syncAttempt.decodeInFlight.sequence === 4,
+		'newest queued MJPEG frame was not decoded after backlog drop');
+	syncAttempt.decodeInFlight.node.naturalWidth = 640;
+	syncAttempt.decodeInFlight.node.onload();
+	check(Math.abs(syncSession.videoMediaTime - 0.4) < 0.001,
+		'video clock did not include dropped multipart frame sequences');
+
+	/* A bounded CGI reconnect must not add its wall-clock handoff delay to
+	 * media time. Only FFmpeg frame sequence (including one truncated part)
+	 * advances the video clock. */
+	const reconnectAttempt = {
+		id: 2,
+		mode: 'fetch',
+		openedAt: Date.now(),
+		ready: false,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		decodeInFlight: null,
+		queuedFrame: null
+	};
+	syncClock.jump(300);
+	syncSession.streamPending = reconnectAttempt;
+	const handoffFrame = fakeImageElement();
+	handoffFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(syncSession, reconnectAttempt, handoffFrame, 5);
+	check(Math.abs(syncSession.videoMediaTime - 0.5) < 0.001,
+		'CGI reconnect delay was incorrectly added to video media time');
+	const sequenceBeforeTruncation = syncSession.streamFrameSequence;
+	const truncatedAttempt = {
+		multipartState: 'body',
+		multipartBuffer: new Uint8Array([ 0xff, 0xd8 ]),
+		truncationAccounted: false
+	};
+	app._accountCpuMjpegTruncation(syncSession, truncatedAttempt);
+	app._accountCpuMjpegTruncation(syncSession, truncatedAttempt);
+	check(syncSession.streamFrameSequence === sequenceBeforeTruncation + 1,
+		'one truncated multipart frame was not counted exactly once');
+	app._stopPlayback();
+	window.Blob = originalBlob;
+	syncClock.restore();
+
+	/* PCM fallback starts at the exact sub-chunk video position and uses the
+	 * measured video rate. It must stop completely on a frame stall and rebase
+	 * from the next displayed frame instead of replaying stale queued audio. */
+	const pcmSyncClock = installFakeClock(700000);
+	const pcmSyncContext = fakeContext();
+	const pcmSyncAudio = {
+		active: true,
+		context: pcmSyncContext,
+		gain: pcmSyncContext.createGain(),
+		url: '/cgi-bin/videoplayer-audio?token=' + 'c'.repeat(32),
+		muted: false,
+		timer: null,
+		inFlight: false,
+		inFlightGeneration: null,
+		pollGeneration: 0,
+		sequence: null,
+		startedAt: Date.now(),
+		hasDecoded: false,
+		ended: false,
+		nextPlayTime: 0,
+		errors: 0,
+		missingSynchronizedChunks: 0,
+		videoHeld: false,
+		warned: false,
+		rebased: false,
+		sources: []
+	};
+	const pcmSyncFrame = fakeImageElement();
+	pcmSyncFrame.id = 'videoplayer-cpu-frame';
+	pcmSyncFrame.naturalWidth = 640;
+	fakeImageParent(pcmSyncFrame);
+	const pcmSyncSession = {
+		active: true,
+		generation: 92,
+		token: 'c'.repeat(32),
+		label: 'pcm-sync.mkv',
+		fps: 8,
+		streamTransportMode: 'fetch',
+		streamFrameSequence: 12,
+		visibleFrame: pcmSyncFrame,
+		streamPending: null,
+		streamVisibleAttempt: null,
+		streamSegmentMs: 45000,
+		streamRefreshTimer: null,
+		streamProbeTimer: null,
+		videoMediaTime: 1.375,
+		videoFrameAt: Date.now(),
+		videoPlaybackRate: 0.5,
+		videoRateAnchorMedia: 1.375,
+		videoRateAnchorAt: Date.now(),
+		avSyncTimer: null,
+		firstFrameSeen: true,
+		firstFrameAt: Date.now(),
+		audio: null,
+		pendingAudio: pcmSyncAudio,
+		browserAudio: null,
+		finishing: null
+	};
+	app._cpuSession = pcmSyncSession;
+	app._playGeneration = 92;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	const originalPcmSyncScheduler = app._scheduleCpuAudioPoll;
+	let pcmPollDelay = null;
+	app._scheduleCpuAudioPoll = (activeSession, delay) => {
+		check(activeSession === pcmSyncSession,
+			'wrong PCM sync session was scheduled');
+		pcmPollDelay = delay;
+	};
+	check(app._activatePendingCpuAudio(pcmSyncSession),
+		'ready PCM fallback was not activated');
+	check(pcmSyncAudio.sequence === 5 &&
+		Math.abs(pcmSyncAudio.startOffsetSeconds - 0.125) < 0.001,
+		'PCM fallback did not preserve the video sub-chunk offset');
+	app._decodeCpuAudioChunk(
+		pcmSyncSession, new ArrayBuffer(48000), 5
+	);
+	const offsetSource = pcmSyncContext.createdSources.at(-1);
+	check(Math.abs(offsetSource.startOffset - 0.125) < 0.001,
+		'PCM AudioBufferSource did not start at the sub-chunk offset');
+	check(Math.abs(offsetSource.videoplayerPlaybackRate - 0.5) < 0.001,
+		'PCM playback rate did not follow the displayed video rate');
+	check(Math.abs(offsetSource.videoplayerMediaStart - 1.375) < 0.001 &&
+		Math.abs(offsetSource.videoplayerEndAt - offsetSource.videoplayerStartAt - 0.25) < 0.001,
+		'PCM source timeline metadata does not match its offset and rate');
+	pcmSyncSession.videoFrameAt = Date.now() - 1000;
+	app._pollCpuAvSync(pcmSyncSession);
+	check(pcmSyncAudio.videoHeld && offsetSource.stopped &&
+		pcmSyncAudio.sources.length === 0,
+		'PCM continued playing while the displayed video was stalled');
+	const heldGeneration = pcmSyncAudio.pollGeneration;
+	const resumeAttempt = {
+		id: 3,
+		mode: 'fetch',
+		openedAt: Date.now(),
+		ready: true,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		decodeInFlight: null,
+		queuedFrame: null
+	};
+	pcmSyncSession.streamVisibleAttempt = resumeAttempt;
+	const resumeFrame = fakeImageElement();
+	resumeFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(pcmSyncSession, resumeAttempt, resumeFrame, 12);
+	check(!pcmSyncAudio.videoHeld &&
+		pcmSyncAudio.pollGeneration === heldGeneration + 1 &&
+		pcmPollDelay === 0,
+		'PCM did not rebase and resume from the next displayed frame');
+
+	/* A 410 response can race a newly displayed frame. The retry must update
+	 * both the sequence and its intra-chunk offset. */
+	pcmSyncAudio.rebased = false;
+	pcmSyncAudio.sequence = 5;
+	pcmSyncAudio.startOffsetSequence = 5;
+	pcmSyncAudio.startOffsetSeconds = 0;
+	pcmSyncAudio.inFlight = false;
+	pcmSyncAudio.videoHeld = false;
+	pcmSyncSession.videoMediaTime = 1.625;
+	pcmSyncSession.videoFrameAt = Date.now();
+	pcmSyncSession.videoPlaybackRate = 0.5;
+	request.get = () => Promise.resolve({
+		status: 410,
+		ok: false,
+		headers: { get: () => null }
+	});
+	pcmPollDelay = null;
+	await app._pollCpuAudio(pcmSyncSession);
+	check(pcmSyncAudio.sequence === 6 &&
+		pcmSyncAudio.startOffsetSequence === 6 &&
+		Math.abs(pcmSyncAudio.startOffsetSeconds - 0.125) < 0.001,
+		'PCM 410 retry lost the synchronized sub-chunk offset');
+	check(pcmPollDelay === 0,
+		'PCM 410 retry was not scheduled immediately');
+	app._scheduleCpuAudioPoll = originalPcmSyncScheduler;
+	app._stopPlayback();
+	pcmSyncClock.restore();
+
+	/* A failed final JPEG decode after transport EOF must complete the fetch
+	 * attempt, rather than leaving the session permanently pending. */
+	const eofFrame = fakeImageElement();
+	eofFrame.id = 'videoplayer-cpu-frame';
+	eofFrame.naturalWidth = 640;
+	fakeImageParent(eofFrame);
+	const eofSession = {
+		active: true,
+		generation: 93,
+		visibleFrame: eofFrame,
+		streamPending: null,
+		streamVisibleAttempt: null
+	};
+	const eofAttempt = {
+		mode: 'fetch',
+		ready: true,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: true,
+		decodeInFlight: null,
+		queuedFrame: { bytes: jpeg, sequence: 0 }
+	};
+	app._cpuSession = eofSession;
+	app._playGeneration = 93;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	eofSession.streamVisibleAttempt = eofAttempt;
+	const originalCompleteFetch = app._completeCpuFetchStream;
+	let completedFetches = 0;
+	app._completeCpuFetchStream = (activeSession, activeAttempt) => {
+		check(activeSession === eofSession && activeAttempt === eofAttempt,
+			'wrong EOF fetch attempt completed');
+		completedFetches++;
+	};
+	window.Blob = global.Blob;
+	app._decodeCpuMjpegFrame(eofSession, eofAttempt);
+	check(eofAttempt.decodeInFlight,
+		'final EOF JPEG was not submitted for decoding');
+	eofAttempt.decodeInFlight.node.onerror();
+	check(completedFetches === 1,
+		'failed final EOF JPEG left the fetch attempt unfinished');
+	app._completeCpuFetchStream = originalCompleteFetch;
+	window.Blob = originalBlob;
+	app._stopPlayback();
+
+	/* Streaming fetch must have a bounded startup timeout. An explicitly
+	 * unsupported response body disables fetch immediately and the next open
+	 * uses the native MJPEG transport instead of retrying fetch forever. */
+	const fetchClock = installFakeClock(900000);
+	const fetchFrame = fakeImageElement();
+	fetchFrame.id = 'videoplayer-cpu-frame';
+	fetchFrame.naturalWidth = 640;
+	fakeImageParent(fetchFrame);
+	const fetchSession = {
+		active: true,
+		generation: 94,
+		token: 'd'.repeat(32),
+		streamUrl: '/cgi-bin/videoplayer-frame?token=' + 'd'.repeat(32),
+		streamSegmentMs: 45000,
+		visibleFrame: fetchFrame,
+		streamAttempt: 0,
+		streamPending: null,
+		streamVisibleAttempt: null,
+		streamErrors: 0,
+		streamWarned: false,
+		streamFetchErrors: 0,
+		fetchDisabled: false,
+		fetchFallbackWarned: false,
+		streamProbeTimer: null,
+		streamProbeAttempt: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamStatusTimer: null,
+		streamOutageStartedAt: null,
+		finishing: null
+	};
+	app._cpuSession = fetchSession;
+	app._playGeneration = 94;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	const originalStreamStatusScheduler = app._scheduleCpuStreamStatus;
+	const originalStreamReconnectScheduler = app._scheduleCpuStreamReconnect;
+	app._scheduleCpuStreamStatus = () => {};
+	app._scheduleCpuStreamReconnect = () => {};
+	let abortedFetches = 0;
+	window.AbortController = function () {
+		this.signal = {};
+		this.abort = () => { abortedFetches++; };
+	};
+	window.fetch = () => Promise.resolve({
+		status: 200,
+		ok: true,
+		headers: {
+			get: name => String(name).toLowerCase() === 'content-type'
+				? 'multipart/x-mixed-replace; boundary=videoplayer-' + fetchSession.token
+				: null
+		},
+		body: null
+	});
+	window.Blob = global.Blob;
+	const unsupportedAttempt = {
+		id: 1,
+		mode: 'fetch',
+		openedAt: Date.now(),
+		lastProgressAt: Date.now(),
+		ready: false,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		decodeInFlight: null,
+		queuedFrame: null,
+		reader: null,
+		controller: null
+	};
+	fetchSession.streamPending = unsupportedAttempt;
+	app._startCpuFetchStream(
+		fetchSession,
+		unsupportedAttempt,
+		fetchSession.streamUrl + '&stream=1-1'
+	);
+	await unsupportedAttempt.fetchPromise;
+	check(fetchSession.fetchDisabled && fetchSession.streamPending === null &&
+		abortedFetches === 1,
+		'unsupported streaming fetch did not switch to native fallback');
+	app._openCpuStream(fetchSession);
+	check(fetchSession.streamPending &&
+		fetchSession.streamPending.mode === 'native-mjpeg',
+		'native MJPEG fallback was not selected after fetch rejection');
+	app._clearCpuStreamRequest(fetchSession, false);
+
+	/* A fetch()/reader that makes no progress is aborted after the bounded
+	 * attempt timeout so it cannot block all reconnects forever. */
+	fetchSession.fetchDisabled = false;
+	fetchSession.streamFetchErrors = 0;
+	const hungAttempt = {
+		id: 2,
+		mode: 'fetch',
+		openedAt: Date.now(),
+		lastProgressAt: Date.now(),
+		ready: false,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		decodeInFlight: null,
+		queuedFrame: null,
+		reader: null,
+		controller: { abort: () => { abortedFetches++; } }
+	};
+	fetchSession.streamPending = hungAttempt;
+	app._scheduleCpuStreamProbe(fetchSession, hungAttempt);
+	fetchClock.advance(5000);
+	check(fetchSession.streamPending === null && hungAttempt.cancelled &&
+		fetchSession.streamFetchErrors === 1 && abortedFetches === 2,
+		'hung streaming fetch was not aborted at the startup deadline');
+	app._scheduleCpuStreamStatus = originalStreamStatusScheduler;
+	app._scheduleCpuStreamReconnect = originalStreamReconnectScheduler;
+	app._stopPlayback();
+	delete window.fetch;
+	delete window.AbortController;
+	window.Blob = originalBlob;
+	fetchClock.restore();
 
 	process.stdout.write('web-audio-test: ok\n');
 }

@@ -21,6 +21,7 @@ const callStopRenderer   = rpc.declare({
 const PAGE_SIZE = 100;
 const CPU_ROUTER_FPS_OPTIONS = [ 5, 8, 12, 15, 20, 24, 30, 48, 50, 60 ];
 const CPU_STREAM_ATTEMPT_TIMEOUT_MS = 5000;
+const CPU_STREAM_IDLE_TIMEOUT_MS = 15000;
 const CPU_STREAM_STATUS_INTERVAL_MS = 3000;
 const CPU_STREAM_PROBE_INTERVAL_MS = 100;
 const CPU_STREAM_HANDOFF_GRACE_MS = 250;
@@ -37,6 +38,70 @@ const CPU_AUDIO_DRAIN_TIMEOUT_MS = 5000;
 const CPU_AUDIO_INITIAL_LEAD_SECONDS = 0.12;
 const CPU_AUDIO_MAX_LEAD_SECONDS = 0.75;
 const CPU_MAX_MEDIA_OFFSET_MS = 21605000;
+const CPU_MJPEG_MAX_HEADER_BYTES = 4096;
+const CPU_MJPEG_MAX_FRAME_BYTES = 4 * 1024 * 1024;
+const CPU_AV_SYNC_INTERVAL_MS = 100;
+const CPU_AV_STALL_MIN_MS = 350;
+const CPU_AV_RATE_WINDOW_MS = 500;
+const CPU_AV_HARD_DRIFT_SECONDS = 0.10;
+const CPU_AV_SOFT_DRIFT_SECONDS = 0.03;
+const CPU_AV_MIN_ESTIMATED_RATE = 0.001;
+const CPU_AV_MIN_PLAYBACK_RATE = 0.25;
+const CPU_AV_MAX_PLAYBACK_RATE = 1.05;
+const CPU_PCM_MIN_PLAYBACK_RATE = 0.001;
+
+function cpuMonotonicNow() {
+	if (window.performance && typeof window.performance.now === 'function')
+		return window.performance.now();
+	return Date.now();
+}
+
+function concatBytes(left, right) {
+	if (!left || !left.length)
+		return right.slice();
+	if (!right || !right.length)
+		return left;
+	const joined = new Uint8Array(left.length + right.length);
+	joined.set(left, 0);
+	joined.set(right, left.length);
+	return joined;
+}
+
+function asciiBytes(value) {
+	value = String(value || '');
+	const bytes = new Uint8Array(value.length);
+	for (let i = 0; i < value.length; i++)
+		bytes[i] = value.charCodeAt(i) & 0x7f;
+	return bytes;
+}
+
+function findBytes(haystack, needle, start) {
+	start = Math.max(0, Number(start) || 0);
+	if (!needle.length)
+		return start <= haystack.length ? start : -1;
+	for (let i = start; i + needle.length <= haystack.length; i++) {
+		let matched = true;
+		for (let j = 0; j < needle.length; j++) {
+			if (haystack[i + j] !== needle[j]) {
+				matched = false;
+				break;
+			}
+		}
+		if (matched)
+			return i;
+	}
+	return -1;
+}
+
+function bytesToAscii(bytes) {
+	let text = '';
+	for (let i = 0; i < bytes.length; i++) {
+		if (bytes[i] > 0x7f)
+			throw new Error(_('The router returned non-ASCII MJPEG headers.'));
+		text += String.fromCharCode(bytes[i]);
+	}
+	return text;
+}
 
 function formatSize(bytes) {
 	const n = Number(bytes) || 0;
@@ -1002,7 +1067,8 @@ return view.extend({
 			if (browserAudio && browserAudio.active &&
 			    browserAudio.element) {
 				if (!browserAudio.muted && !browserAudio.needsGesture &&
-				    (browserAudio.playing || browserAudio.playPending)) {
+				    (browserAudio.playing || browserAudio.playPending ||
+				     browserAudio.syncPaused)) {
 					browserAudio.playAttempt =
 						(Number(browserAudio.playAttempt) || 0) + 1;
 					browserAudio.playPending = false;
@@ -1019,6 +1085,11 @@ return view.extend({
 				browserAudio.muted = false;
 				browserAudio.needsGesture = false;
 				browserAudio.element.muted = false;
+				if (browserAudio.syncPaused) {
+					self._updateCpuAudioPresentation(session);
+					notify(null, _('Unmuted; audio will resume with video.'), 2000);
+					return Promise.resolve();
+				}
 				browserAudio.playPromise = self._playCpuBrowserAudio(
 					session, browserAudio, true
 				);
@@ -1572,6 +1643,8 @@ return view.extend({
 				ended: false,
 				nextPlayTime: 0,
 				errors: 0,
+				missingSynchronizedChunks: 0,
+				videoHeld: false,
 				warned: false,
 				sources: []
 			};
@@ -1675,6 +1748,8 @@ return view.extend({
 		try { element.pause(); }
 		catch (err) {}
 		element.muted = false;
+		try { element.playbackRate = 1; }
+		catch (err) {}
 		try { element.removeAttribute('src'); }
 		catch (err) { element.src = ''; }
 		try { element.load(); }
@@ -1691,6 +1766,10 @@ return view.extend({
 		browserAudio.resolving = false;
 		browserAudio.playing = false;
 		browserAudio.ended = true;
+		if (browserAudio.syncPauseClearTimer != null)
+			window.clearTimeout(browserAudio.syncPauseClearTimer);
+		browserAudio.syncPauseClearTimer = null;
+		browserAudio.syncPausePending = false;
 		browserAudio.playAttempt = (Number(browserAudio.playAttempt) || 0) + 1;
 		if (this._cpuBrowserAudioOwner === browserAudio) {
 			this._clearCpuBrowserAudioElement(browserAudio.element);
@@ -1760,18 +1839,115 @@ return view.extend({
 		}
 	},
 
-	_positionCpuBrowserAudio: function (session, browserAudio) {
+	_cpuAudioPositionForVideo: function (session) {
+		const mediaTime = this._cpuVideoTarget(session);
+		let sequence;
+
+		if (!session || session.streamTransportMode !== 'fetch' ||
+		    !Number.isFinite(mediaTime))
+			return null;
+		sequence = Math.max(0, Math.floor(
+			mediaTime * 1000 / CPU_AUDIO_CHUNK_MS
+		));
+		return {
+			sequence: sequence,
+			offset: Math.min(
+				CPU_AUDIO_CHUNK_MS / 1000 - 0.001,
+				Math.max(
+					0,
+					mediaTime - sequence * CPU_AUDIO_CHUNK_MS / 1000
+				)
+			)
+		};
+	},
+
+	_cpuAudioSequenceForVideo: function (session) {
+		const position = this._cpuAudioPositionForVideo(session);
+
+		return position ? position.sequence : null;
+	},
+
+	_cpuAudioOffsetForVideo: function (session, sequence) {
+		const position = this._cpuAudioPositionForVideo(session);
+
+		if (!position || position.sequence !== sequence ||
+		    !Number.isInteger(sequence) || sequence < 0)
+			return 0;
+		return position.offset;
+	},
+
+	_cpuPcmMediaTime: function (audio) {
+		const context = audio && audio.context;
+		const now = context && Number(context.currentTime);
+		const sources = audio && audio.sources || [];
+
+		if (!Number.isFinite(now))
+			return null;
+		for (let i = 0; i < sources.length; i++) {
+			const source = sources[i];
+			const startAt = Number(source.videoplayerStartAt);
+			const endAt = Number(source.videoplayerEndAt);
+			const mediaStart = Number(source.videoplayerMediaStart);
+			const rate = Number(source.videoplayerPlaybackRate);
+
+			if (!Number.isFinite(startAt) || !Number.isFinite(endAt) ||
+			    !Number.isFinite(mediaStart) || !Number.isFinite(rate) || rate <= 0)
+				continue;
+			if (now < startAt)
+				return mediaStart;
+			if (now <= endAt)
+				return mediaStart + (now - startAt) * rate;
+		}
+		return null;
+	},
+
+	_cpuVideoTarget: function (session, now) {
+		const mediaTime = session && session.videoMediaTime;
+		const frameAt = session && session.videoFrameAt;
+		const rate = session && Number.isFinite(session.videoPlaybackRate)
+			? session.videoPlaybackRate
+			: (session && session.streamTransportMode === 'fetch' ? 0 : 1);
+		const stallMs = session
+			? Math.max(
+				CPU_AV_STALL_MIN_MS,
+				2500 / Math.max(1, Number(session.fps) || 1)
+			)
+			: CPU_AV_STALL_MIN_MS;
+
+		if (!Number.isFinite(mediaTime) || !Number.isFinite(frameAt))
+			return null;
+		now = Number.isFinite(now) ? now : cpuMonotonicNow();
+		return Math.max(0, mediaTime + Math.min(
+			Math.max(0, now - frameAt),
+			stallMs
+		) * Math.max(0, rate) / 1000);
+	},
+
+	_positionCpuBrowserAudio: function (session, browserAudio, force) {
 		const element = browserAudio && browserAudio.element;
 		const startedAt = session && session.firstFrameAt;
 		const offsetReceivedAt = browserAudio &&
 			browserAudio.offsetReceivedAt;
 		const mediaOffsetMs = browserAudio &&
 			browserAudio.mediaOffsetMs;
-		let target;
+		const videoTarget = this._cpuVideoTarget(session);
+		let target, drift, rate;
 
 		if (!element)
 			return;
-		if (Number.isFinite(offsetReceivedAt) &&
+		if (Number.isFinite(videoTarget)) {
+			target = videoTarget;
+		}
+		else if (session && session.streamTransportMode === 'fetch') {
+			/* The fetch transport starts audio from the first JPEG that was
+			 * actually decoded. A server wall-clock offset would reintroduce the
+			 * very FIFO/browser backlog that this clock is designed to remove. */
+			return;
+		}
+		else if (Number.isFinite(startedAt)) {
+			target = Math.max(0, (Date.now() - startedAt) / 1000);
+		}
+		else if (Number.isFinite(offsetReceivedAt) &&
 		    Number.isFinite(mediaOffsetMs)) {
 			target = Math.max(
 				0,
@@ -1780,37 +1956,148 @@ return view.extend({
 					1000
 			);
 		}
-		else if (Number.isFinite(startedAt)) {
-			target = Math.max(0, (Date.now() - startedAt) / 1000);
-		}
 		else {
 			return;
 		}
 		if (Number.isFinite(element.duration) && element.duration > 0)
 			target = Math.min(target, Math.max(0, element.duration - 0.05));
-		if (target < 0.25)
-			return;
+		drift = Number(element.currentTime) - target;
 		try {
-			if (!Number.isFinite(element.currentTime) ||
-			    Math.abs(element.currentTime - target) > 0.75)
+			if (force || !Number.isFinite(element.currentTime) ||
+			    Math.abs(drift) > CPU_AV_HARD_DRIFT_SECONDS) {
 				element.currentTime = target;
+				drift = 0;
+			}
+			if (Number.isFinite(videoTarget)) {
+				rate = Number.isFinite(session.videoPlaybackRate)
+					? session.videoPlaybackRate
+					: 0;
+				if (Math.abs(drift) > CPU_AV_SOFT_DRIFT_SECONDS)
+					rate -= drift * 0.35;
+				rate = Math.min(
+					CPU_AV_MAX_PLAYBACK_RATE,
+					Math.max(CPU_AV_MIN_PLAYBACK_RATE, rate)
+				);
+				if (!Number.isFinite(element.playbackRate) ||
+				    Math.abs(element.playbackRate - rate) > 0.01)
+					element.playbackRate = rate;
+			}
 		}
 		catch (err) {
 			/* loadedmetadata retries this for browsers that reject early seeks. */
 		}
 	},
 
+	_pauseCpuBrowserAudioForSync: function (session, browserAudio) {
+		if (!this._isCurrentCpuSession(session) || !browserAudio ||
+		    session.browserAudio !== browserAudio || !browserAudio.active ||
+		    !browserAudio.element)
+			return;
+		if (browserAudio.syncPauseClearTimer != null)
+			window.clearTimeout(browserAudio.syncPauseClearTimer);
+		browserAudio.syncPauseClearTimer = null;
+		browserAudio.syncPausePending = true;
+		browserAudio.syncPaused = true;
+		browserAudio.playAttempt =
+			(Number(browserAudio.playAttempt) || 0) + 1;
+		browserAudio.playPending = false;
+		try { browserAudio.element.pause(); }
+		catch (err) {}
+		browserAudio.playing = false;
+	},
+
+	_scheduleCpuAvSync: function (session, delay) {
+		const self = this;
+
+		if (!self._isCurrentCpuSession(session) || session.finishing)
+			return;
+		if (session.avSyncTimer != null)
+			window.clearTimeout(session.avSyncTimer);
+		session.avSyncTimer = window.setTimeout(function () {
+			session.avSyncTimer = null;
+			self._pollCpuAvSync(session);
+		}, Math.max(0, Number(delay) || 0));
+	},
+
+	_pollCpuAvSync: function (session) {
+		const browserAudio = session && session.browserAudio;
+		const now = cpuMonotonicNow();
+		const stallMs = Math.max(
+			CPU_AV_STALL_MIN_MS,
+			2500 / Math.max(1, Number(session && session.fps) || 1)
+		);
+
+		if (!this._isCurrentCpuSession(session) || session.finishing)
+			return;
+		const videoStalled = Number.isFinite(session.videoFrameAt) &&
+			now - session.videoFrameAt >= stallMs;
+
+		if (browserAudio && browserAudio.active && browserAudio.element &&
+		    Number.isFinite(session.videoFrameAt)) {
+			if (videoStalled) {
+				if (!browserAudio.syncPaused &&
+				    (browserAudio.playing || browserAudio.playPending)) {
+					this._pauseCpuBrowserAudioForSync(session, browserAudio);
+				}
+			}
+			else {
+				this._positionCpuBrowserAudio(session, browserAudio, false);
+			}
+		}
+		else if (session.audio && session.audio.active &&
+		         Number.isFinite(session.videoMediaTime)) {
+			if (videoStalled) {
+				const audio = session.audio;
+
+				if (!audio.videoHeld) {
+					audio.videoHeld = true;
+					audio.pollGeneration =
+						(Number(audio.pollGeneration) || 0) + 1;
+					if (audio.timer != null)
+						window.clearTimeout(audio.timer);
+					audio.timer = null;
+					audio.inFlight = false;
+					audio.inFlightGeneration = null;
+					this._resetCpuAudioQueue(audio);
+				}
+				this._scheduleCpuAvSync(session, CPU_AV_SYNC_INTERVAL_MS);
+				return;
+			}
+			const pcmTime = this._cpuPcmMediaTime(session.audio);
+			const videoTime = this._cpuVideoTarget(session, now);
+
+			if (Number.isFinite(pcmTime) && Number.isFinite(videoTime) &&
+			    Math.abs(pcmTime - videoTime) > CPU_AUDIO_CHUNK_MS / 1000 &&
+			    (!Number.isFinite(session.audio.lastVideoRebaseAt) ||
+			     now - session.audio.lastVideoRebaseAt >=
+				CPU_AUDIO_CHUNK_MS * 2)) {
+				session.audio.lastVideoRebaseAt = now;
+				this._rebaseCpuAudio(session, session.audio);
+			}
+		}
+		this._scheduleCpuAvSync(session, CPU_AV_SYNC_INTERVAL_MS);
+	},
+
 	_activatePendingCpuAudio: function (session) {
 		const audio = session && session.pendingAudio;
+		let position;
 
 		if (!this._isCurrentCpuSession(session) || session.finishing ||
 		    !audio || !audio.active || session.audio)
 			return false;
+		if (session.streamTransportMode === 'fetch' &&
+		    (!Number.isFinite(session.videoMediaTime) ||
+		     !Number.isFinite(session.videoPlaybackRate)))
+			return false;
 		session.pendingAudio = null;
 		session.audio = audio;
 		audio.startedAt = Date.now();
-		audio.sequence = null;
+		position = this._cpuAudioPositionForVideo(session);
+		audio.sequence = position ? position.sequence : null;
+		audio.startOffsetSequence = audio.sequence;
+		audio.startOffsetSeconds = position ? position.offset : 0;
 		audio.errors = 0;
+		audio.missingSynchronizedChunks = 0;
 		audio.ended = false;
 		audio.inFlight = false;
 		audio.inFlightGeneration = null;
@@ -1974,6 +2261,9 @@ return view.extend({
 			ended: false,
 			muted: false,
 			needsGesture: false,
+			syncPaused: false,
+			syncPausePending: false,
+			syncPauseClearTimer: null,
 			mediaOffsetMs: null,
 			offsetReceivedAt: null,
 			element: null,
@@ -2018,6 +2308,13 @@ return view.extend({
 			browserAudio.offsetReceivedAt = Date.now();
 			element.preload = 'auto';
 			element.muted = false;
+			try {
+				element.defaultPlaybackRate = 1;
+				element.playbackRate = 1;
+				if ('preservesPitch' in element)
+					element.preservesPitch = true;
+			}
+			catch (err) {}
 			element.onloadedmetadata = function () {
 				if (self._isCurrentCpuSession(session) &&
 				    session.browserAudio === browserAudio)
@@ -2027,6 +2324,19 @@ return view.extend({
 				if (!self._isCurrentCpuSession(session) ||
 				    session.browserAudio !== browserAudio)
 					return;
+				if (browserAudio.syncPaused || document.hidden) {
+					self._pauseCpuBrowserAudioForSync(session, browserAudio);
+					self._updateCpuAudioPresentation(session);
+					return;
+				}
+				if (browserAudio.syncPausePending) {
+					if (browserAudio.syncPauseClearTimer != null)
+						window.clearTimeout(browserAudio.syncPauseClearTimer);
+					browserAudio.syncPauseClearTimer = window.setTimeout(function () {
+						browserAudio.syncPauseClearTimer = null;
+						browserAudio.syncPausePending = false;
+					}, CPU_AV_SYNC_INTERVAL_MS);
+				}
 				browserAudio.playing = true;
 				self._updateCpuAudioPresentation(session);
 			};
@@ -2035,6 +2345,15 @@ return view.extend({
 				    session.browserAudio !== browserAudio ||
 				    browserAudio.ended)
 					return;
+				if (browserAudio.syncPausePending || browserAudio.syncPaused) {
+					browserAudio.syncPausePending = false;
+					if (browserAudio.syncPauseClearTimer != null)
+						window.clearTimeout(browserAudio.syncPauseClearTimer);
+					browserAudio.syncPauseClearTimer = null;
+					browserAudio.playing = false;
+					self._updateCpuAudioPresentation(session);
+					return;
+				}
 				browserAudio.playAttempt =
 					(Number(browserAudio.playAttempt) || 0) + 1;
 				browserAudio.playPending = false;
@@ -2074,7 +2393,9 @@ return view.extend({
 			try { element.load(); }
 			catch (err) {}
 			self._positionCpuBrowserAudio(session, browserAudio);
-			browserAudio.waitingForVideo = !session.firstFrameSeen;
+			browserAudio.waitingForVideo = !session.firstFrameSeen ||
+				(session.streamTransportMode === 'fetch' &&
+				 !Number.isFinite(session.videoPlaybackRate));
 			self._updateCpuAudioPresentation(session);
 			if (!browserAudio.waitingForVideo)
 				browserAudio.playPromise = self._playCpuBrowserAudio(
@@ -2217,6 +2538,13 @@ return view.extend({
 			return;
 		if (document.hidden) {
 			session.streamHiddenAt = now;
+			if (session.browserAudio && session.browserAudio.active &&
+			    (session.browserAudio.playing ||
+			     session.browserAudio.playPending)) {
+				this._pauseCpuBrowserAudioForSync(
+					session, session.browserAudio
+				);
+			}
 			return;
 		}
 		if (Number.isFinite(session.streamHiddenAt))
@@ -2226,6 +2554,19 @@ return view.extend({
 		if (session.audio && session.audio.active &&
 		    hiddenFor > CPU_AUDIO_CHUNK_MS * 2)
 			this._rebaseCpuAudio(session, session.audio);
+		if (session.browserAudio && session.browserAudio.active &&
+		    session.browserAudio.syncPaused &&
+		    Number.isFinite(session.videoFrameAt) &&
+		    cpuMonotonicNow() - session.videoFrameAt < CPU_AV_STALL_MIN_MS) {
+			this._positionCpuBrowserAudio(
+				session, session.browserAudio, true
+			);
+			session.browserAudio.syncPaused = false;
+			session.browserAudio.playPromise = this._playCpuBrowserAudio(
+				session, session.browserAudio, false
+			);
+		}
+		this._scheduleCpuAvSync(session, 0);
 		if (!session.streamPending &&
 		    (!session.streamVisibleAttempt ||
 		     session.streamVisibleAttempt.ended ||
@@ -2262,6 +2603,438 @@ return view.extend({
 		}
 	},
 
+	_canUseCpuFetchStream: function () {
+		return typeof window.fetch === 'function' &&
+			typeof window.AbortController === 'function' &&
+			typeof window.Blob === 'function' &&
+			window.URL &&
+			typeof window.URL.createObjectURL === 'function' &&
+			typeof window.URL.revokeObjectURL === 'function';
+	},
+
+	_disposeCpuFetchAttempt: function (attempt) {
+		if (!attempt || attempt.mode !== 'fetch')
+			return;
+		attempt.cancelled = true;
+		if (attempt.reader && typeof attempt.reader.cancel === 'function') {
+			try {
+				const cancelled = attempt.reader.cancel();
+				if (cancelled && typeof cancelled.catch === 'function')
+					cancelled.catch(function () {});
+			}
+			catch (err) {}
+		}
+		attempt.reader = null;
+		if (attempt.controller) {
+			try { attempt.controller.abort(); }
+			catch (err) {}
+		}
+		attempt.controller = null;
+		if (attempt.decodeInFlight) {
+			const decoding = attempt.decodeInFlight;
+			decoding.node.onload = null;
+			decoding.node.onerror = null;
+			try { decoding.node.removeAttribute('src'); }
+			catch (err) {}
+			try { window.URL.revokeObjectURL(decoding.url); }
+			catch (err) {}
+		}
+		attempt.decodeInFlight = null;
+		attempt.queuedFrame = null;
+		attempt.multipartBuffer = null;
+	},
+
+	_consumeCpuMjpegChunk: function (session, attempt, chunk) {
+		const headerEnd = attempt.headerEnd || asciiBytes('\r\n\r\n');
+		const boundary = attempt.boundaryMarker;
+
+		if (!this._isCurrentCpuSession(session) || attempt.cancelled ||
+		    !(chunk instanceof Uint8Array) || !boundary || !boundary.length)
+			return;
+		attempt.multipartBuffer = concatBytes(
+			attempt.multipartBuffer || new Uint8Array(0),
+			chunk
+		);
+
+		while (attempt.multipartBuffer.length) {
+			let buffer = attempt.multipartBuffer;
+
+			if (attempt.multipartState === 'boundary') {
+				const boundaryAt = findBytes(buffer, boundary, 0);
+				if (boundaryAt < 0) {
+					if (buffer.length > CPU_MJPEG_MAX_HEADER_BYTES)
+						throw new Error(_('The router returned an invalid MJPEG boundary.'));
+					return;
+				}
+				if (boundaryAt > CPU_MJPEG_MAX_HEADER_BYTES)
+					throw new Error(_('The router returned excessive MJPEG preamble data.'));
+				buffer = buffer.slice(boundaryAt + boundary.length);
+				attempt.multipartBuffer = buffer;
+				attempt.multipartState = 'headers';
+				continue;
+			}
+
+			if (attempt.multipartState === 'headers') {
+				const headerAt = findBytes(buffer, headerEnd, 0);
+				let headers, lengthMatch, typeMatch, length;
+
+				if (headerAt < 0) {
+					if (buffer.length > CPU_MJPEG_MAX_HEADER_BYTES)
+						throw new Error(_('The router returned oversized MJPEG headers.'));
+					return;
+				}
+				if (headerAt > CPU_MJPEG_MAX_HEADER_BYTES)
+					throw new Error(_('The router returned oversized MJPEG headers.'));
+				headers = bytesToAscii(buffer.slice(0, headerAt));
+				lengthMatch = headers.match(/^content-length:\s*([0-9]+)\s*$/im);
+				typeMatch = headers.match(/^content-type:\s*image\/jpeg\s*$/im);
+				length = lengthMatch ? Number(lengthMatch[1]) : NaN;
+				if (!typeMatch || !Number.isSafeInteger(length) || length < 4 ||
+				    length > CPU_MJPEG_MAX_FRAME_BYTES)
+					throw new Error(_('The router returned invalid MJPEG frame metadata.'));
+				attempt.multipartLength = length;
+				attempt.multipartBuffer = buffer.slice(
+					headerAt + headerEnd.length
+				);
+				attempt.multipartState = 'body';
+				continue;
+			}
+
+			if (attempt.multipartState === 'body') {
+				const length = attempt.multipartLength;
+				if (buffer.length < length + 2)
+					return;
+				if (buffer[length] !== 13 || buffer[length + 1] !== 10 ||
+				    buffer[0] !== 0xff || buffer[1] !== 0xd8 ||
+				    buffer[length - 2] !== 0xff || buffer[length - 1] !== 0xd9)
+					throw new Error(_('The router returned a damaged MJPEG frame.'));
+
+				const sequence = session.streamFrameSequence++;
+				this._queueCpuMjpegFrame(
+					session,
+					attempt,
+					buffer.slice(0, length),
+					sequence
+				);
+				attempt.multipartBuffer = buffer.slice(length + 2);
+				attempt.multipartLength = 0;
+				attempt.multipartState = 'boundary';
+				continue;
+			}
+
+			throw new Error(_('The MJPEG parser entered an invalid state.'));
+		}
+	},
+
+	_queueCpuMjpegFrame: function (session, attempt, bytes, sequence) {
+		if (!this._isCurrentCpuSession(session) || attempt.cancelled ||
+		    (session.streamPending !== attempt &&
+		     session.streamVisibleAttempt !== attempt))
+			return;
+		attempt.queuedFrame = { bytes: bytes, sequence: sequence };
+		if (!attempt.decodeInFlight)
+			this._decodeCpuMjpegFrame(session, attempt);
+	},
+
+	_accountCpuMjpegTruncation: function (session, attempt) {
+		const buffer = attempt && attempt.multipartBuffer;
+		const closing = attempt && attempt.boundaryCloseMarker;
+		const cleanClose = attempt && attempt.multipartState === 'boundary' &&
+			buffer instanceof Uint8Array && closing instanceof Uint8Array &&
+			buffer.length === closing.length &&
+			findBytes(buffer, closing, 0) === 0;
+		const partialFrame = attempt && (
+			attempt.multipartState === 'headers' ||
+			attempt.multipartState === 'body' ||
+			(attempt.multipartState === 'boundary' &&
+			 buffer instanceof Uint8Array && buffer.length > 0 && !cleanClose)
+		);
+
+		if (!this._isCurrentCpuSession(session) || !partialFrame ||
+		    attempt.truncationAccounted)
+			return;
+		/* The next CGI segment scans to the following multipart boundary, so
+		 * exactly one partially consumed frame is discarded on the server too. */
+		attempt.truncationAccounted = true;
+		session.streamFrameSequence++;
+	},
+
+	_decodeCpuMjpegFrame: function (session, attempt) {
+		const self = this;
+		const queued = attempt && attempt.queuedFrame;
+		let node, url;
+
+		if (!self._isCurrentCpuSession(session) || !queued ||
+		    attempt.cancelled || attempt.decodeInFlight)
+			return;
+		attempt.queuedFrame = null;
+		node = document.createElement('img');
+		node.className = 'videoplayer-cpu-frame';
+		node.hidden = true;
+		node.setAttribute('aria-hidden', 'true');
+		node.setAttribute('alt', _('Router-rendered video frame'));
+		url = window.URL.createObjectURL(new window.Blob(
+			[ queued.bytes ],
+			{ type: 'image/jpeg' }
+		));
+		attempt.decodeInFlight = {
+			node: node,
+			url: url,
+			sequence: queued.sequence
+		};
+		node.onload = function () {
+			const decoding = attempt.decodeInFlight;
+			node.onload = null;
+			node.onerror = null;
+			attempt.decodeInFlight = null;
+			try { window.URL.revokeObjectURL(url); }
+			catch (err) {}
+			if (decoding && decoding.node === node &&
+			    self._isCurrentCpuSession(session) && !attempt.cancelled &&
+			    Number(node.naturalWidth) > 0) {
+				self._presentCpuMjpegFrame(
+					session, attempt, node, decoding.sequence
+				);
+			}
+			self._decodeCpuMjpegFrame(session, attempt);
+			if (attempt.transportEnded && !attempt.decodeInFlight &&
+			    !attempt.queuedFrame)
+				self._completeCpuFetchStream(session, attempt);
+		};
+		node.onerror = function () {
+			node.onload = null;
+			node.onerror = null;
+			attempt.decodeInFlight = null;
+			try { window.URL.revokeObjectURL(url); }
+			catch (err) {}
+			self._decodeCpuMjpegFrame(session, attempt);
+			if (attempt.transportEnded && !attempt.decodeInFlight &&
+			    !attempt.queuedFrame)
+				self._completeCpuFetchStream(session, attempt);
+		};
+		node.src = url;
+	},
+
+	_presentCpuMjpegFrame: function (session, attempt, frame, sequence) {
+		const previous = session && session.visibleFrame;
+		const parent = previous && previous.parentNode;
+		const firstFrame = !session.firstFrameSeen;
+		const startingAttempt = !attempt.ready;
+		const now = cpuMonotonicNow();
+		const frameDuration = 1 / Math.max(1, session.fps);
+		let mediaTime;
+
+		if (!this._isCurrentCpuSession(session) || attempt.cancelled ||
+		    !parent || !frame ||
+		    (session.streamPending !== attempt &&
+		     session.streamVisibleAttempt !== attempt))
+			return;
+		/* sequence is global across bounded HTTP segments. It represents the
+		 * FFmpeg output timeline, so reconnect wall time must never be added to
+		 * it: doing so would accumulate a permanent A/V offset every 45 seconds. */
+		mediaTime = Math.max(0, sequence * frameDuration);
+		if (!attempt.ready) {
+			if (session.streamPending !== attempt)
+				return;
+			attempt.ready = true;
+			session.streamPending = null;
+			session.streamVisibleAttempt = attempt;
+			session.streamOutageStartedAt = null;
+			session.streamErrors = 0;
+			session.streamWarned = false;
+			if (attempt.mode === 'fetch')
+				session.streamFetchErrors = 0;
+			session.streamNextHandoffAt =
+				attempt.openedAt + session.streamSegmentMs +
+				CPU_STREAM_HANDOFF_GRACE_MS;
+			if (session.streamRefreshTimer != null)
+				window.clearTimeout(session.streamRefreshTimer);
+			{
+				const self = this;
+				session.streamRefreshTimer = window.setTimeout(function () {
+					session.streamRefreshTimer = null;
+					if (self._isCurrentCpuSession(session) &&
+					    !session.finishing &&
+					    session.streamVisibleAttempt === attempt &&
+					    !session.streamPending)
+						self._scheduleCpuStreamReconnect(session, 0);
+				}, Math.max(0, session.streamNextHandoffAt - Date.now()));
+			}
+		}
+
+		if (startingAttempt && Number.isFinite(session.videoMediaTime)) {
+			session.videoRateAnchorMedia = mediaTime;
+			session.videoRateAnchorAt = now;
+		}
+		else if (!Number.isFinite(session.videoRateAnchorMedia) ||
+		    !Number.isFinite(session.videoRateAnchorAt)) {
+			session.videoRateAnchorMedia = mediaTime;
+			session.videoRateAnchorAt = now;
+		}
+		else if (mediaTime > session.videoRateAnchorMedia &&
+		         now - session.videoRateAnchorAt >= CPU_AV_RATE_WINDOW_MS) {
+			const observedRate = (mediaTime - session.videoRateAnchorMedia) /
+				((now - session.videoRateAnchorAt) / 1000);
+			if (Number.isFinite(observedRate) && observedRate > 0) {
+				const boundedRate = Math.min(
+					1,
+					Math.max(CPU_AV_MIN_ESTIMATED_RATE, observedRate)
+				);
+				session.videoPlaybackRate = Number.isFinite(session.videoPlaybackRate)
+					? session.videoPlaybackRate * 0.5 + boundedRate * 0.5
+					: boundedRate;
+			}
+			session.videoRateAnchorMedia = mediaTime;
+			session.videoRateAnchorAt = now;
+		}
+		if (previous !== frame) {
+			if (previous.id === 'videoplayer-cpu-frame')
+				previous.removeAttribute('id');
+			parent.insertBefore(frame, previous.nextSibling || null);
+			frame.id = 'videoplayer-cpu-frame';
+			frame.hidden = false;
+			frame.setAttribute('aria-hidden', 'false');
+			session.visibleFrame = frame;
+			this._disposeCpuStreamNode(previous, true);
+		}
+		session.videoMediaTime = mediaTime;
+		session.videoFrameAt = now;
+		session.streamLastFrameAt = Date.now();
+		if (firstFrame) {
+			session.firstFrameSeen = true;
+			session.firstFrameAt = session.streamLastFrameAt;
+		}
+
+		if (session.browserAudio && session.browserAudio.active) {
+			const browserAudio = session.browserAudio;
+			this._positionCpuBrowserAudio(
+				session, browserAudio, firstFrame || browserAudio.syncPaused
+			);
+			if (!document.hidden &&
+			    Number.isFinite(session.videoPlaybackRate) &&
+			    (browserAudio.waitingForVideo || browserAudio.syncPaused)) {
+				browserAudio.waitingForVideo = false;
+				browserAudio.syncPaused = false;
+				browserAudio.playPromise = this._playCpuBrowserAudio(
+					session, browserAudio, false
+				);
+			}
+		}
+		else if (session.pendingAudio &&
+		         Number.isFinite(session.videoPlaybackRate)) {
+			this._activatePendingCpuAudio(session);
+		}
+		else if (session.audio && session.audio.active &&
+		         session.audio.videoHeld &&
+		         Number.isFinite(session.videoPlaybackRate)) {
+			session.audio.videoHeld = false;
+			this._rebaseCpuAudio(session, session.audio);
+		}
+		this._setPlayerSurface('cpu');
+		this._updateCpuAudioPresentation(session);
+		this._scheduleCpuAvSync(session, CPU_AV_SYNC_INTERVAL_MS);
+		if (attempt.transportEnded && !attempt.decodeInFlight &&
+		    !attempt.queuedFrame)
+			this._completeCpuFetchStream(session, attempt);
+	},
+
+	_completeCpuFetchStream: function (session, attempt) {
+		if (!this._isCurrentCpuSession(session) || attempt.cancelled ||
+		    attempt.completed)
+			return;
+		attempt.completed = true;
+		if (!attempt.ready) {
+			this._handleCpuStreamFailure(session, attempt);
+			return;
+		}
+		if (session.streamProbeAttempt === attempt) {
+			if (session.streamProbeTimer != null)
+				window.clearTimeout(session.streamProbeTimer);
+			session.streamProbeTimer = null;
+			session.streamProbeAttempt = null;
+		}
+		attempt.ended = true;
+		if (session.streamRefreshTimer != null)
+			window.clearTimeout(session.streamRefreshTimer);
+		session.streamRefreshTimer = null;
+		session.streamNextHandoffAt = Date.now() + CPU_STREAM_HANDOFF_GRACE_MS;
+		this._scheduleCpuStreamStatus(session, 0);
+		this._scheduleCpuStreamReconnect(session, CPU_STREAM_HANDOFF_GRACE_MS);
+	},
+
+	_startCpuFetchStream: function (session, attempt, requestUrl) {
+		const self = this;
+		const expectedBoundary = 'videoplayer-' + session.token;
+
+		attempt.controller = new window.AbortController();
+		attempt.fetchPromise = window.fetch(requestUrl, {
+			method: 'GET',
+			credentials: 'same-origin',
+			cache: 'no-store',
+			signal: attempt.controller.signal
+		}).then(function (response) {
+			const contentType = String(
+				response && response.headers &&
+				response.headers.get('Content-Type') || ''
+			);
+			const boundaryMatch = contentType.match(
+				/^multipart\/x-mixed-replace\s*;[^\r\n]*\bboundary=(?:"([^"]+)"|([^;\s]+))/i
+			);
+
+			if (!response || response.status !== 200 || !response.ok)
+				throw new Error(_('The router video stream returned HTTP %d.').format(
+					Number(response && response.status) || 0
+				));
+			if (!boundaryMatch ||
+			    String(boundaryMatch[1] || boundaryMatch[2] || '') !== expectedBoundary)
+				throw new Error(_('The router returned an invalid MJPEG content type.'));
+			if (!response.body || typeof response.body.getReader !== 'function') {
+				attempt.fetchUnsupported = true;
+				throw new Error(_('This browser cannot read a continuous MJPEG stream.'));
+			}
+
+			attempt.boundaryMarker = asciiBytes('--' + expectedBoundary + '\r\n');
+			attempt.boundaryCloseMarker = asciiBytes(
+				'--' + expectedBoundary + '--\r\n'
+			);
+			attempt.headerEnd = asciiBytes('\r\n\r\n');
+			attempt.multipartBuffer = new Uint8Array(0);
+			attempt.multipartState = 'boundary';
+			attempt.reader = response.body.getReader();
+			attempt.lastProgressAt = Date.now();
+
+			const pump = function () {
+				if (!self._isCurrentCpuSession(session) || attempt.cancelled)
+					return Promise.resolve();
+				return attempt.reader.read().then(function (part) {
+					if (!self._isCurrentCpuSession(session) || attempt.cancelled)
+						return;
+					if (part.done) {
+						attempt.reader = null;
+						self._accountCpuMjpegTruncation(session, attempt);
+						attempt.transportEnded = true;
+						if (!attempt.decodeInFlight && !attempt.queuedFrame)
+							self._completeCpuFetchStream(session, attempt);
+						return;
+					}
+					if (!(part.value instanceof Uint8Array))
+						throw new Error(_('The browser returned invalid MJPEG stream data.'));
+					attempt.lastProgressAt = Date.now();
+					self._consumeCpuMjpegChunk(session, attempt, part.value);
+					return pump();
+				});
+			};
+			return pump();
+		}).catch(function (err) {
+			if (!self._isCurrentCpuSession(session) || attempt.cancelled ||
+			    (err && err.name === 'AbortError'))
+				return;
+			self._accountCpuMjpegTruncation(session, attempt);
+			attempt.failureReason = errorText(err);
+			self._handleCpuStreamFailure(session, attempt);
+		});
+	},
+
 	_disposeCpuStreamNode: function (node, removeNode) {
 		if (!node)
 			return;
@@ -2286,6 +3059,7 @@ return view.extend({
 		if (session.streamProbeTimer != null)
 			window.clearTimeout(session.streamProbeTimer);
 		session.streamProbeTimer = null;
+		session.streamProbeAttempt = null;
 		if (session.streamRefreshTimer != null)
 			window.clearTimeout(session.streamRefreshTimer);
 		session.streamRefreshTimer = null;
@@ -2293,12 +3067,20 @@ return view.extend({
 			window.clearTimeout(session.streamReconnectTimer);
 		session.streamReconnectTimer = null;
 		if (session.streamPending) {
-			this._disposeCpuStreamNode(session.streamPending.node, true);
+			if (session.streamPending.mode === 'fetch')
+				this._disposeCpuFetchAttempt(session.streamPending);
+			else
+				this._disposeCpuStreamNode(session.streamPending.node, true);
 			session.streamPending = null;
 		}
 		if (session.streamVisibleAttempt) {
-			session.streamVisibleAttempt.node.onload = null;
-			session.streamVisibleAttempt.node.onerror = null;
+			if (session.streamVisibleAttempt.mode === 'fetch') {
+				this._disposeCpuFetchAttempt(session.streamVisibleAttempt);
+			}
+			else if (session.streamVisibleAttempt.node) {
+				session.streamVisibleAttempt.node.onload = null;
+				session.streamVisibleAttempt.node.onerror = null;
+			}
 			session.streamVisibleAttempt = null;
 		}
 		session.streamNextHandoffAt = null;
@@ -2323,6 +3105,9 @@ return view.extend({
 		if (session.finishTimer != null)
 			window.clearTimeout(session.finishTimer);
 		session.finishTimer = null;
+		if (session.avSyncTimer != null)
+			window.clearTimeout(session.avSyncTimer);
+		session.avSyncTimer = null;
 		session.finishing = null;
 		if (session.audio) {
 			this._disposeCpuAudio(session.audio);
@@ -2509,25 +3294,41 @@ return view.extend({
 
 	_scheduleCpuStreamProbe: function (session, attempt) {
 		const self = this;
+		const isFetch = attempt && attempt.mode === 'fetch';
 
 		if (!self._isCurrentCpuSession(session) || session.finishing ||
-		    !attempt || attempt.ready || session.streamPending !== attempt)
+		    !attempt || attempt.ended || attempt.completed ||
+		    (isFetch
+			? (session.streamPending !== attempt &&
+			   session.streamVisibleAttempt !== attempt)
+			: (attempt.ready || session.streamPending !== attempt)))
 			return;
 		if (session.streamProbeTimer != null)
 			window.clearTimeout(session.streamProbeTimer);
+		session.streamProbeAttempt = attempt;
 		session.streamProbeTimer = window.setTimeout(function () {
 			const frame = attempt.node;
 
 			session.streamProbeTimer = null;
+			if (session.streamProbeAttempt === attempt)
+				session.streamProbeAttempt = null;
 			if (!self._isCurrentCpuSession(session) || session.finishing ||
-			    session.streamPending !== attempt)
+			    attempt.ended || attempt.completed ||
+			    (isFetch
+				? (session.streamPending !== attempt &&
+				   session.streamVisibleAttempt !== attempt)
+				: session.streamPending !== attempt))
 				return;
-			if (frame && Number(frame.naturalWidth) > 0) {
+			if (!isFetch && frame && Number(frame.naturalWidth) > 0) {
 				self._markCpuStreamStarted(session, attempt);
 				return;
 			}
-			if (Date.now() - attempt.openedAt >=
-			    CPU_STREAM_ATTEMPT_TIMEOUT_MS) {
+			if (Date.now() - (isFetch && attempt.ready
+					? Number(attempt.lastProgressAt) || attempt.openedAt
+					: attempt.openedAt) >=
+			    (isFetch && attempt.ready
+					? CPU_STREAM_IDLE_TIMEOUT_MS
+					: CPU_STREAM_ATTEMPT_TIMEOUT_MS)) {
 				self._handleCpuStreamFailure(session, attempt);
 				return;
 			}
@@ -2551,6 +3352,8 @@ return view.extend({
 
 	_handleCpuStreamFailure: function (session, attempt) {
 		const now = Date.now();
+		const fetchStartupFailure = attempt && attempt.mode === 'fetch' &&
+			!attempt.ready;
 		let delay;
 
 		if (!this._isCurrentCpuSession(session) || session.finishing ||
@@ -2558,14 +3361,40 @@ return view.extend({
 		    (session.streamPending !== attempt &&
 		     session.streamVisibleAttempt !== attempt))
 			return;
+		if (session.streamProbeAttempt === attempt) {
+			if (session.streamProbeTimer != null)
+				window.clearTimeout(session.streamProbeTimer);
+			session.streamProbeTimer = null;
+			session.streamProbeAttempt = null;
+		}
+		if (fetchStartupFailure) {
+			session.streamFetchErrors =
+				(Number(session.streamFetchErrors) || 0) + 1;
+			if (attempt.fetchUnsupported || session.streamFetchErrors >= 2) {
+				session.fetchDisabled = true;
+				if (!session.fetchFallbackWarned) {
+					session.fetchFallbackWarned = true;
+					notify(null, E('p', {},
+						_('This browser cannot parse the router MJPEG stream directly. Falling back to native MJPEG playback; precise frame-clock audio synchronization may be unavailable.')),
+					6000, 'warning');
+				}
+			}
+		}
 		if (session.streamPending === attempt) {
 			session.streamPending = null;
-			this._disposeCpuStreamNode(attempt.node, true);
+			if (attempt.mode === 'fetch')
+				this._disposeCpuFetchAttempt(attempt);
+			else
+				this._disposeCpuStreamNode(attempt.node, true);
 		}
 		if (session.streamVisibleAttempt === attempt) {
 			attempt.ended = true;
-			attempt.node.onload = null;
-			attempt.node.onerror = null;
+			if (attempt.mode === 'fetch')
+				this._disposeCpuFetchAttempt(attempt);
+			else if (attempt.node) {
+				attempt.node.onload = null;
+				attempt.node.onerror = null;
+			}
 			if (session.streamRefreshTimer != null)
 				window.clearTimeout(session.streamRefreshTimer);
 			session.streamRefreshTimer = null;
@@ -2623,16 +3452,43 @@ return view.extend({
 			);
 			return;
 		}
+		session.visibleFrame = visible;
+		session.streamAttempt = (Number(session.streamAttempt) || 0) + 1;
+		requestUrl = session.streamUrl + '&stream=' +
+			String(session.generation) + '-' + String(session.streamAttempt);
+		if (!session.fetchDisabled && self._canUseCpuFetchStream()) {
+			session.streamTransportMode = 'fetch';
+			attempt = {
+				id: session.streamAttempt,
+				mode: 'fetch',
+				openedAt: Date.now(),
+				lastProgressAt: Date.now(),
+				ready: false,
+				ended: false,
+				cancelled: false,
+				completed: false,
+				transportEnded: false,
+				decodeInFlight: null,
+				queuedFrame: null,
+				reader: null,
+				controller: null
+			};
+			session.streamPending = attempt;
+			self._startCpuFetchStream(session, attempt, requestUrl);
+			self._scheduleCpuStreamProbe(session, attempt);
+			return;
+		}
+
+		session.streamTransportMode = 'native-mjpeg';
 		frame = document.createElement('img');
 		frame.className = 'videoplayer-cpu-frame';
 		frame.hidden = true;
 		frame.setAttribute('aria-hidden', 'true');
 		frame.setAttribute('alt', _('Continuous router-rendered video stream'));
 		parent.insertBefore(frame, visible.nextSibling || null);
-		session.visibleFrame = visible;
-		session.streamAttempt = (Number(session.streamAttempt) || 0) + 1;
 		attempt = {
 			id: session.streamAttempt,
+			mode: 'native-mjpeg',
 			node: frame,
 			openedAt: Date.now(),
 			ready: false,
@@ -2640,8 +3496,6 @@ return view.extend({
 			closeObserved: false
 		};
 		session.streamPending = attempt;
-		requestUrl = session.streamUrl + '&stream=' +
-			String(session.generation) + '-' + String(attempt.id);
 		frame.onload = function () {
 			if (!self._isCurrentCpuSession(session) || session.finishing)
 				return;
@@ -2803,7 +3657,7 @@ return view.extend({
 		const audio = session && session.audio;
 
 		if (!self._isCurrentCpuSession(session) || !audio || !audio.active ||
-		    audio.ended)
+		    audio.ended || audio.videoHeld)
 			return;
 		if (audio.timer != null)
 			window.clearTimeout(audio.timer);
@@ -2825,12 +3679,18 @@ return view.extend({
 	},
 
 	_rebaseCpuAudio: function (session, audio) {
+		let position;
+
 		if (!session || !audio || !audio.active || session.audio !== audio)
 			return;
 		audio.pollGeneration =
 			(Number(audio.pollGeneration) || 0) + 1;
-		audio.sequence = null;
+		position = this._cpuAudioPositionForVideo(session);
+		audio.sequence = position ? position.sequence : null;
+		audio.startOffsetSequence = audio.sequence;
+		audio.startOffsetSeconds = position ? position.offset : 0;
 		audio.rebased = true;
+		audio.missingSynchronizedChunks = 0;
 		audio.inFlight = false;
 		audio.inFlightGeneration = null;
 		this._resetCpuAudioQueue(audio);
@@ -2869,7 +3729,37 @@ return view.extend({
 
 		const source = context.createBufferSource();
 		const startAt = audio.nextPlayTime;
+		const startOffset = audio.startOffsetSequence === sequence
+			? Math.min(
+				CPU_AUDIO_CHUNK_MS / 1000 - 0.001,
+				Math.max(0, Number(audio.startOffsetSeconds) || 0)
+			)
+			: 0;
+		const playbackRate = session.streamTransportMode === 'fetch'
+			? Math.min(
+				1,
+				Math.max(
+					CPU_PCM_MIN_PLAYBACK_RATE,
+					Number(session.videoPlaybackRate) || 1
+				)
+			)
+			: 1;
 		source.buffer = buffer;
+		if (source.playbackRate) {
+			try {
+				if (typeof source.playbackRate.setValueAtTime === 'function')
+					source.playbackRate.setValueAtTime(playbackRate, startAt);
+				else
+					source.playbackRate.value = playbackRate;
+			}
+			catch (err) {}
+		}
+		source.videoplayerStartAt = startAt;
+		source.videoplayerPlaybackRate = playbackRate;
+		source.videoplayerMediaStart =
+			sequence * CPU_AUDIO_CHUNK_MS / 1000 + startOffset;
+		source.videoplayerEndAt = startAt +
+			(CPU_AUDIO_CHUNK_MS / 1000 - startOffset) / playbackRate;
 		source.connect(audio.gain);
 		audio.sources.push(source);
 		source.onended = function () {
@@ -2880,8 +3770,12 @@ return view.extend({
 			catch (err) {}
 			self._finishCpuAudioDrain(session, audio);
 		};
-		source.start(startAt);
-		audio.nextPlayTime = startAt + CPU_AUDIO_CHUNK_MS / 1000;
+		source.start(startAt, startOffset);
+		if (audio.startOffsetSequence === sequence) {
+			audio.startOffsetSequence = null;
+			audio.startOffsetSeconds = 0;
+		}
+		audio.nextPlayTime = source.videoplayerEndAt;
 		audio.sequence = sequence + 1;
 		audio.hasDecoded = true;
 		audio.errors = 0;
@@ -2899,7 +3793,7 @@ return view.extend({
 
 		if (!self._isCurrentCpuSession(session) || !audio || !audio.active ||
 		    audio.ended ||
-		    audio.inFlight)
+		    audio.inFlight || audio.videoHeld)
 			return Promise.resolve();
 		if (audio.context.state === 'closed') {
 			self._disableCpuAudio(
@@ -2943,10 +3837,22 @@ return view.extend({
 				return { done: true };
 			}
 			if (res.status === 410 && audio.sequence != null && !audio.rebased) {
+				const synchronizedPosition =
+					self._cpuAudioPositionForVideo(session);
+				const synchronizedSequence = synchronizedPosition &&
+					synchronizedPosition.sequence;
 				audio.rebased = true;
-				audio.sequence = null;
-				self._resetCpuAudioQueue(audio);
-				return { retry: true, delay: 0 };
+				audio.missingSynchronizedChunks =
+					(Number(audio.missingSynchronizedChunks) || 0) + 1;
+				if (synchronizedSequence != null &&
+				    synchronizedSequence !== audio.sequence &&
+				    audio.missingSynchronizedChunks < 3) {
+					audio.sequence = synchronizedSequence;
+					audio.startOffsetSequence = synchronizedSequence;
+					audio.startOffsetSeconds = synchronizedPosition.offset;
+					self._resetCpuAudioQueue(audio);
+					return { retry: true, delay: 0 };
+				}
 			}
 			if (res.status === 409 || res.status === 404 || res.status === 410) {
 				self._disableCpuAudio(
@@ -2998,6 +3904,7 @@ return view.extend({
 					return { done: true };
 				self._decodeCpuAudioChunk(session, arrayBuffer, sequence);
 				audio.rebased = false;
+				audio.missingSynchronizedChunks = 0;
 				const lead = audio.nextPlayTime - audio.context.currentTime;
 				return {
 					retry: true,
@@ -3104,13 +4011,19 @@ return view.extend({
 			streamAttempt: 0,
 			streamPending: null,
 			streamVisibleAttempt: null,
+			streamTransportMode: null,
+			streamFrameSequence: 0,
 			streamLastFrameAt: null,
 			streamOutageStartedAt: null,
 			streamNextHandoffAt: null,
 			streamHiddenAt: null,
 			streamErrors: 0,
 			streamWarned: false,
+			streamFetchErrors: 0,
+			fetchDisabled: false,
+			fetchFallbackWarned: false,
 			streamProbeTimer: null,
+			streamProbeAttempt: null,
 			streamRefreshTimer: null,
 			streamReconnectTimer: null,
 			streamStatusTimer: null,
@@ -3118,6 +4031,12 @@ return view.extend({
 			streamStatusAgain: false,
 			streamStatusErrors: 0,
 			streamStatusWarned: false,
+			videoMediaTime: null,
+			videoFrameAt: null,
+			videoPlaybackRate: null,
+			videoRateAnchorMedia: null,
+			videoRateAnchorAt: null,
+			avSyncTimer: null,
 			audio: null,
 			pendingAudio: pendingAudio,
 			audioWarned: false,

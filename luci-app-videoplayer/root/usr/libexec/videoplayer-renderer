@@ -2249,7 +2249,7 @@ cmd_worker() {
 		-dn \
 		-map_metadata -1 \
 		-filter_threads 1 \
-		-vf "fps=$router_fps,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
+		-vf "fps=fps=$router_fps:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 		-threads 1 \
 		-c:v mjpeg \
 		-q:v 8 \

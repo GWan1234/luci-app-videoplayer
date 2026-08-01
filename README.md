@@ -83,17 +83,25 @@ session may run at a time, and selecting another local video replaces the
 previous session. Each session uses its own random token directory under
 `/tmp`; FFmpeg writes its native multipart MJPEG output into a root-only,
 bounded FIFO and one long-lived CGI copier forwards it directly to the browser.
+LuCI incrementally parses that single response, keeps at most one waiting JPEG,
+and discards superseded frames before browser decoding can build a backlog.
 There is no temporary JPEG, filesystem scan, or process launch per frame.
 Stock uhttpd applies an absolute CGI deadline, so each response is bounded to
 45 seconds and LuCI transparently reconnects the next segment; this is one
-request per segment rather than one request per frame. Only one MJPEG viewer
+request per segment rather than one request per frame. The frame sequence is
+global across those segments, so the reconnect delay is never added to media
+time; if a segment ends inside one multipart frame, that single discarded frame
+is counted before the next aligned segment begins. Only one MJPEG viewer
 may hold the session stream at a time, which prevents duplicate tabs from
 exhausting uhttpd's small CGI worker pool. LuCI normally requests a
 session-bound browser-audio capability and uses the renderer's already-open
-original-file descriptor only as browser audio. The renderer also reports its
-current media offset so the hidden audio element starts near the video already
-visible in LuCI. If browser audio resolution or decoding fails, LuCI switches
-once to bounded raw PCM chunks decoded by the router. The stream renews a
+original-file descriptor only as browser audio. The sequence of the JPEG that
+was actually decoded and displayed is the master playback clock: LuCI applies
+bounded playback-rate correction, seeks audio after a large deviation, and
+pauses audio while video frames are stalled. If browser audio resolution or
+decoding fails, LuCI switches once to raw PCM chunks decoded by the router and
+selects them from the same video timeline while they remain in the bounded
+ring. The stream renews a
 short heartbeat while it is active. Closing the page or losing the client stops
 CPU work after the heartbeat timeout, and every session also has an absolute
 expiry.
@@ -536,18 +544,29 @@ on the package manager and whether the file has been modified.
   frames per second. Selecting a rate above the source video's frame rate
   duplicates frames; it does not perform motion interpolation.
 - Router CPU audio first uses a hidden HTML media element to decode the
-  original protected audio track in the browser and align it to the current
-  renderer offset. If browser resolution or decoding fails, the player switches
-  once to signed 16-bit stereo PCM chunks decoded by the router at 48 kHz and
-  played through Web Audio. Browser autoplay policies may require pressing
-  **Unmute** once. If neither path can decode the audio, playback remains
-  silent. For uncommon or extensionless containers, browser audio support can
-  still depend on the browser's media sniffing behavior.
-- Router CPU mode has no pause, seeking, duration, or timeline. Its continuous
-  MJPEG video and independently delivered audio provide approximate
-  synchronization, so slow routers or networks may introduce stutter, gaps, or
-  audio/video drift. LuCI transparently reconnects the video stream between
-  bounded CGI segments and keeps the last displayed image during the handoff.
+  original protected audio track in the browser. Audio follows the last JPEG
+  actually displayed, not elapsed wall time: small deviations adjust playback
+  rate, deviations above 100 milliseconds seek, and a stalled video stream
+  pauses sound. If browser resolution or decoding fails, the player switches
+  once to signed
+  16-bit stereo PCM chunks decoded by the router at 48 kHz and requests the
+  exact chunk and intra-chunk offset matching the displayed video time. PCM is
+  also stopped and rebased when video stalls. Browser autoplay policies may
+  require pressing **Unmute** once. If neither path can decode the audio,
+  playback remains silent. For uncommon or extensionless containers, browser
+  audio support can still depend on the browser's media sniffing behavior.
+- Router-decoded PCM is a bounded fallback, not an unbounded cache. It retains
+  eight seconds of recent audio to protect a router's RAM. If video rendering
+  remains far below real time long enough for the matching PCM chunk to expire,
+  the player disables that fallback instead of playing a different point in
+  the soundtrack. The preferred protected browser-audio path is seekable and
+  does not have this ring-window limit.
+- Router CPU mode has no user-controlled pause, seeking, duration, or timeline.
+  A router that cannot render in real time can still produce slow or uneven
+  playback, but the video clock now slows or pauses audio with it instead of
+  accumulating A/V drift. LuCI transparently reconnects the video stream
+  between bounded CGI segments and keeps the last displayed image during the
+  handoff.
 - If router-side FFmpeg cannot start for a local file, the UI reports the
   classified failure and automatically retries that file with browser
   decoding. Automatic browser fallback starts muted; audio can be enabled with
@@ -590,7 +609,8 @@ exercises successful renderer and PCM-audio lifecycle, validates the
 session-bound browser-audio nonce, stable source-descriptor Range streaming,
 continuous multipart MJPEG framing, single-viewer locking, heartbeat renewal,
 path-replacement resistance, browser PCM conversion, queueing, resume
-recovery, browser-audio fallback, autoplay recovery, synchronization, and
+recovery, browser-audio fallback, autoplay recovery, slow-renderer A/V
+synchronization, bounded MJPEG frame dropping, and
 cleanup, checks modern and legacy missing-decoder diagnostics,
 unusable V4L2 hardware decoders, bounded noisy logs, and unknown FFmpeg failures
 with isolated fake processes, and builds and verifies both packages. After
