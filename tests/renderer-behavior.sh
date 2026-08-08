@@ -69,13 +69,14 @@ cleanup() {
 	[[ -x "$helper" ]] && "$helper" cleanup >/dev/null 2>&1
 
 	for pid in \
-		"${worker1:-}" "${ffmpeg1:-}" "${audio1:-}" "${chunker1:-}" \
-		"${worker2:-}" "${ffmpeg2:-}" "${audio2:-}" "${chunker2:-}" \
+		"${ring_fill_pid:-}" \
+		"${worker1:-}" "${ffmpeg1:-}" "${chunker1:-}" \
+		"${worker2:-}" "${ffmpeg2:-}" "${chunker2:-}" \
 		"${finite_worker:-}" "${finite_ffmpeg:-}" \
-		"${finite_media_worker:-}" "${finite_media_ffmpeg:-}" \
+		"${finite_media_worker:-}" \
 		"${instant_worker:-}" "${delayed_worker:-}" \
 		"${chunker_failure_worker:-}" "${chunker_failure_ffmpeg:-}" \
-		"${chunker_failure_audio:-}" "${chunker_failure_chunker:-}"
+		"${chunker_failure_chunker:-}"
 	do
 		terminate_owned_pid "$pid"
 	done
@@ -377,6 +378,28 @@ static int publish_audio(int fd, unsigned int sequence)
 	return 0;
 }
 
+static int publish_partial_audio(int fd, unsigned int sequence)
+{
+	unsigned char pcm[24000];
+
+	memset(pcm, (int)(sequence & 0xffU), sizeof(pcm));
+	return write_all(fd, pcm, sizeof(pcm));
+}
+
+static const char *find_output(
+	int argc,
+	char **argv,
+	const char *suffix)
+{
+	int i;
+
+	for (i = 1; i < argc; ++i)
+		if (ends_with(argv[i], suffix))
+			return argv[i];
+
+	return NULL;
+}
+
 static int marker_is(
 	const char *marker,
 	ssize_t marker_size,
@@ -395,12 +418,11 @@ int main(int argc, char **argv)
 	char expected_video_filter[256];
 	char *fps_end = NULL;
 	const char *boundary;
-	const char *output;
-	int input_fd;
-	int is_audio;
-	int audio_fail;
+	const char *audio_output;
+	const char *video_output;
 	int audio_finite;
-	int audio_output_fd;
+	int audio_runtime_failure;
+	int audio_output_fd = -1;
 	int video_output_fd;
 	int delayed_video;
 	int fail_after_first_frame;
@@ -471,10 +493,31 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	output = argv[argc - 1];
+	if (has_arg(argc, argv, "-frames:a")) {
+		errno = 0;
+		if (count_pair(argc, argv, "-i", "/proc/self/fd/3") != 1 ||
+		    count_pair(argc, argv, "-map", "0:a:0") != 1 ||
+		    count_pair(argc, argv, "-frames:a", "1") != 1 ||
+		    count_pair(argc, argv, "-f", "s16le") != 1 ||
+		    strcmp(argv[argc - 1], "-") != 0 ||
+		    fstat(3, &input) != 0 || !S_ISREG(input.st_mode) ||
+		    fcntl(8, F_GETFD) != -1 || errno != EBADF)
+			return 84;
+		marker_size = pread(3, marker, sizeof(marker) - 1, 0);
+		if (marker_size < 0)
+			return 85;
+		if (marker_is(marker, marker_size, "no-audio") ||
+		    marker_is(marker, marker_size, "delayed-start") ||
+		    marker_is(marker, marker_size, "instant-media")) {
+			fputs("Stream map '0:a:0' matches no streams\n", stderr);
+			return 81;
+		}
+		return publish_audio(STDOUT_FILENO, 0) == 0 ? 0 : 86;
+	}
+
+	video_output = find_output(argc, argv, "/video.pipe");
+	audio_output = find_output(argc, argv, "/audio.pipe");
 	boundary = pair_value(argc, argv, "-boundary_tag");
-	is_audio = ends_with(output, "/audio.pipe");
-	input_fd = is_audio ? 4 : 3;
 	errno = 0;
 	if (argc < 2 || !has_arg(argc, argv, "-nostdin") ||
 	    !has_arg(argc, argv, "-re") ||
@@ -482,17 +525,16 @@ int main(int argc, char **argv)
 	    count_pair(argc, argv, "-protocol_whitelist", "file,pipe") != 1 ||
 	    count_pair(argc, argv, "-fflags", "+genpts") != 1 ||
 	    count_pair(argc, argv, "-err_detect", "ignore_err") != 1 ||
-	    fstat(input_fd, &input) != 0 ||
+	    fstat(3, &input) != 0 ||
 	    !S_ISREG(input.st_mode) ||
 	    input.st_size <= 0 ||
 	    fcntl(8, F_GETFD) != -1 ||
 	    errno != EBADF)
 		return 64;
 
-	if (is_audio) {
-		errno = 0;
-		if (count_pair(argc, argv, "-threads", "1") < 2 ||
-		    count_pair(argc, argv, "-i", "/proc/self/fd/4") != 1 ||
+	errno = 0;
+	if (audio_output != NULL &&
+	    (count_pair(argc, argv, "-threads", "1") < 2 ||
 		    count_pair(argc, argv, "-map", "0:a:0") != 1 ||
 		    count_pair(
 			    argc,
@@ -501,13 +543,13 @@ int main(int argc, char **argv)
 			    "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,asetnsamples=n=12000:p=1") != 1 ||
 		    count_pair(argc, argv, "-c:a", "pcm_s16le") != 1 ||
 		    count_pair(argc, argv, "-f", "s16le") != 1 ||
-		    fcntl(3, F_GETFD) != -1 ||
-		    errno != EBADF ||
-		    !output_is_safe(output, "/audio.pipe"))
-			return 80;
-	} else if (
+		    !output_is_safe(audio_output, "/audio.pipe")))
+		return 80;
+	if (fcntl(4, F_GETFD) != -1 || errno != EBADF)
+		return 80;
+	if (
 	    count_pair(argc, argv, "-threads", "2") != 1 ||
-	    count_pair(argc, argv, "-threads", "1") != 1 ||
+	    count_pair(argc, argv, "-threads", "1") < 1 ||
 	    count_pair(argc, argv, "-filter_threads", "1") != 1 ||
 	    count_pair(argc, argv, "-i", "/proc/self/fd/3") != 1 ||
 	    count_pair(argc, argv, "-map", "0:V:0") != 1 ||
@@ -522,54 +564,20 @@ int main(int argc, char **argv)
 	    count_pair(argc, argv, "-boundary_tag", boundary) != 1 ||
 	    has_arg(argc, argv, "-update") ||
 	    has_arg(argc, argv, "-atomic_writing") ||
-	    !output_is_safe(output, "/video.pipe") ||
-	    !boundary_matches_output(boundary, output))
+	    video_output == NULL ||
+	    !output_is_safe(video_output, "/video.pipe") ||
+	    !boundary_matches_output(boundary, video_output))
 		return 64;
 
-	marker_size = pread(input_fd, marker, sizeof(marker) - 1, 0);
+	marker_size = pread(3, marker, sizeof(marker) - 1, 0);
 	if (marker_size < 0)
 		return 67;
 	delayed_video = marker_is(marker, marker_size, "delayed-start");
 	finite_video = marker_is(marker, marker_size, "finite-media");
 	instant_video = marker_is(marker, marker_size, "instant-media");
-	if (is_audio) {
-		if (marker_is(marker, marker_size, "no-audio") ||
-		    delayed_video || instant_video) {
-			fputs("Stream map '0:a:0' matches no streams\n", stderr);
-			return 81;
-		}
-		audio_fail = marker_is(
-			marker,
-			marker_size,
-			"audio-runtime-failure");
-		audio_finite = marker_is(
-			marker,
-			marker_size,
-			"audio-finite") || finite_video;
-		signal(SIGTERM, stop);
-		signal(SIGINT, stop);
-		signal(SIGHUP, stop);
-		audio_output_fd = open(output, O_WRONLY);
-		if (audio_output_fd < 0)
-			return 82;
-		while (running) {
-			if (publish_audio(audio_output_fd, audio_sequence++) != 0) {
-				close(audio_output_fd);
-				return 82;
-			}
-			if (audio_fail && audio_sequence >= 4) {
-				close(audio_output_fd);
-				return 83;
-			}
-			if (audio_finite && audio_sequence >= 4) {
-				close(audio_output_fd);
-				return 0;
-			}
-			usleep(100000);
-		}
-		close(audio_output_fd);
-		return 0;
-	}
+	audio_finite = marker_is(marker, marker_size, "audio-finite") || finite_video;
+	audio_runtime_failure =
+		marker_is(marker, marker_size, "audio-runtime-failure");
 	if (marker_is(marker, marker_size, "decoder-missing")) {
 		fputs(
 			"Decoder (codec h264) not found for input stream #0:0\n",
@@ -661,34 +669,69 @@ int main(int argc, char **argv)
 
 	if (delayed_video)
 		sleep(4);
-	video_output_fd = open(output, O_WRONLY);
+	if (audio_output != NULL) {
+		audio_output_fd = open(audio_output, O_WRONLY);
+		if (audio_output_fd < 0)
+			return 82;
+	}
+	video_output_fd = open(video_output, O_WRONLY);
 	if (video_output_fd < 0)
 		return 66;
 	while (running) {
+		if (audio_output_fd >= 0) {
+			if (publish_audio(audio_output_fd, audio_sequence++) != 0) {
+				close(audio_output_fd);
+				close(video_output_fd);
+				return 82;
+			} else if (audio_runtime_failure && audio_sequence >= 4) {
+				if (publish_partial_audio(audio_output_fd, audio_sequence) != 0) {
+					close(audio_output_fd);
+					close(video_output_fd);
+					return 82;
+				}
+				close(audio_output_fd);
+				audio_output_fd = -1;
+			} else if (audio_finite && audio_sequence >= 4) {
+				close(audio_output_fd);
+				audio_output_fd = -1;
+			}
+		}
 		if (publish_mjpeg(video_output_fd, boundary, video_sequence) != 0) {
+			if (audio_output_fd >= 0)
+				close(audio_output_fd);
 			close(video_output_fd);
 			return 66;
 		}
 		video_sequence++;
 		if (instant_video) {
 			if (publish_mjpeg_trailer(video_output_fd, boundary) != 0) {
+				if (audio_output_fd >= 0)
+					close(audio_output_fd);
 				close(video_output_fd);
 				return 66;
 			}
+			if (audio_output_fd >= 0)
+				close(audio_output_fd);
 			close(video_output_fd);
 			return 0;
 		}
 		if (finite_video && video_sequence >= 4) {
 			if (publish_mjpeg_trailer(video_output_fd, boundary) != 0) {
+				if (audio_output_fd >= 0)
+					close(audio_output_fd);
 				close(video_output_fd);
 				return 66;
 			}
+			if (audio_output_fd >= 0)
+				close(audio_output_fd);
 			close(video_output_fd);
 			return 0;
 		}
 		if (fail_after_first_frame) {
 			sleep(4);
 			fputs("Cannot allocate memory while decoding frame\n", stderr);
+			if (audio_output_fd >= 0)
+				close(audio_output_fd);
 			close(video_output_fd);
 			return 69;
 		}
@@ -696,6 +739,8 @@ int main(int argc, char **argv)
 		usleep(frame_delay_us);
 	}
 
+	if (audio_output_fd >= 0)
+		close(audio_output_fd);
 	close(video_output_fd);
 	return 0;
 }
@@ -1506,7 +1551,9 @@ assert_eq \
 	started \
 	"finite-media start"
 finite_media_worker="$(session_pid "$finite_media" worker)"
-finite_media_ffmpeg="$(session_pid "$finite_media" ffmpeg)"
+# A very short child may finish before /proc exposes a trustworthy start time.
+# The saved, validated prefetch still makes the finite session observable; do
+# not require a live-process identity for a producer that has already exited.
 run_mjpeg_cgi "$finite_media" 1-1 "$work/finite-media-mjpeg"
 check_mjpeg_response \
 	"$work/finite-media-mjpeg" "$finite_media" 4 finite >/dev/null
@@ -1516,7 +1563,6 @@ for _ in {1..200}; do
 done
 assert_eq "$("$helper" status "$finite_media")" ended "finite-media status"
 wait_dead "$finite_media_worker"
-wait_dead "$finite_media_ffmpeg"
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$finite_media/audio-state")" \
 	ended \
@@ -1531,8 +1577,10 @@ run_audio_cgi \
 check_status_line "$work/audio-response" "204 No Content"
 assert_eq "$("$helper" stop "$finite_media")" stopped "finite-media stop"
 
-# A child that fails after publishing audio must not poison the independent
-# video renderer or force browser fallback.
+# The PCM sink can receive complete blocks and then a truncated block after
+# the one-frame source probe succeeded. The shared producer's verified standby
+# drain must discard subsequent audio, mark PCM unavailable, and keep the
+# MJPEG output independently playable.
 assert_eq \
 	"$("$helper" start "$audio_failure" "$work/media/audio-runtime.mp4")" \
 	started \
@@ -1561,7 +1609,6 @@ assert_eq \
 	"chunker-failure start"
 chunker_failure_worker="$(session_pid "$chunker_failure" worker)"
 chunker_failure_ffmpeg="$(session_pid "$chunker_failure" ffmpeg)"
-chunker_failure_audio="$(session_pid "$chunker_failure" audio)"
 chunker_failure_chunker="$(session_pid "$chunker_failure" chunker)"
 kill -KILL "$chunker_failure_chunker"
 wait_dead "$chunker_failure_chunker"
@@ -1573,7 +1620,6 @@ assert_eq \
 	"$("$helper" has-audio "$chunker_failure")" \
 	0 \
 	"chunker-failure audio state"
-wait_dead "$chunker_failure_audio"
 inspect_audio_ring "$chunker_failure"
 assert_audio_storage_bound
 chunker_failure_bytes="$AUDIO_TOTAL_BYTES"
@@ -1615,11 +1661,9 @@ assert_eq \
 
 worker1="$(session_pid "$token1" worker)"
 ffmpeg1="$(session_pid "$token1" ffmpeg)"
-audio1="$(session_pid "$token1" audio)"
 chunker1="$(session_pid "$token1" chunker)"
 kill -0 "$worker1"
 kill -0 "$ffmpeg1"
-kill -0 "$audio1"
 kill -0 "$chunker1"
 assert_eq \
 	"$(tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" | sed -n '1p')" \
@@ -1629,19 +1673,23 @@ assert_eq \
 	"$(tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" | tail -n 1)" \
 	"$runtime/s-$token1/video.pipe" \
 	"video FFmpeg process identity"
-assert_eq \
-	"$(tr '\000' '\n' < "/proc/$audio1/cmdline" | tail -n 1)" \
-	"$runtime/s-$token1/audio.pipe" \
-	"audio FFmpeg process identity"
+tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" |
+	grep -Fqx -- "$runtime/s-$token1/audio.pipe" ||
+	fail "shared FFmpeg process does not own the audio output"
+[[ ! -e "$runtime/s-$token1/audio" ]] ||
+	fail "legacy separate audio FFmpeg identity unexpectedly exists"
 assert_eq \
 	"$(tr '\000' '\n' < "/proc/$chunker1/cmdline" | sed -n '3p')" \
 	audio-chunker \
 	"audio chunker process identity"
 assert_eq "$("$helper" has-audio "$token1")" 1 "audio capability"
 
-# The producer runs faster than the worker's one-second supervision loop.
-# Repeatedly sample through saturation to prove the chunker, not the worker,
-# enforces the 32-segment hard bound and only publishes complete chunks.
+# Drain video while forcing audio-ring saturation: the shared producer
+# intentionally stops advancing both tracks when the MJPEG FIFO is full.
+# Repeatedly sample to prove the chunker enforces the 32-segment hard bound and
+# only publishes complete chunks.
+run_mjpeg_cgi "$token1" 1-0 "$work/mjpeg-ring-fill" &
+ring_fill_pid=$!
 ring_saturated=0
 for _ in {1..100}; do
 	inspect_audio_ring "$token1"
@@ -1651,6 +1699,8 @@ for _ in {1..100}; do
 done
 [[ "$ring_saturated" -eq 1 ]] ||
 	fail "audio ring did not reach the hard-bound test condition"
+wait "$ring_fill_pid"
+ring_fill_pid=""
 kill -STOP "$chunker1"
 sleep 0.05
 inspect_audio_ring "$token1"
@@ -1833,7 +1883,6 @@ assert_eq "$("$helper" status "$token1")" inactive "status after stop"
 
 wait_dead "$worker1"
 wait_dead "$ffmpeg1"
-wait_dead "$audio1"
 wait_dead "$chunker1"
 
 # Exercise recovery after the wrapper dies without running its signal trap.
@@ -1841,7 +1890,6 @@ assert_eq "$("$helper" start "$token2" "$media")" started "second start"
 
 worker2="$(session_pid "$token2" worker)"
 ffmpeg2="$(session_pid "$token2" ffmpeg)"
-audio2="$(session_pid "$token2" audio)"
 chunker2="$(session_pid "$token2" chunker)"
 
 assert_eq \
@@ -1853,10 +1901,9 @@ kill -KILL "$worker2"
 wait_dead "$worker2"
 
 # The chunker's worker-liveness watchdog closes the FIFO after an untrappable
-# worker crash. That must terminate both audio processes without waiting for a
+# worker crash. That must terminate the audio chunker without waiting for a
 # later cleanup request, and the bounded ring must stop changing.
 wait_dead "$chunker2"
-wait_dead "$audio2"
 inspect_audio_ring "$token2"
 assert_audio_storage_bound
 crash_audio_count="$AUDIO_FILE_COUNT"

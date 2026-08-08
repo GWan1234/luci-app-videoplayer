@@ -416,7 +416,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-render-mode-desc',
 								class: 'cbi-value-description'
-							}, _('Local files only. Router mode uses FFmpeg to decode, scale, and encode video on the router, then sends one continuous MJPEG stream to this page instead of requesting every frame separately. For tighter synchronization, the browser normally plays the original audio track; router-decoded PCM is used when the browser cannot decode that audio. This mode has no pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build and browser. If video decoding cannot start, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
+							}, _('Local files only. After a bounded audio probe, router mode uses one long-lived FFmpeg process to produce synchronized MJPEG video and PCM audio from the same input clock. Fetch-capable browsers play that PCM with the measured video clock, including speeds below the HTML media minimum; native MJPEG fallback uses the protected original audio track. This mode has no pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build and browser. If video decoding cannot start, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
 							E('div', {
 								id: 'vp-render-mode-status',
 								class: rendererAvailable === false
@@ -600,7 +600,7 @@ return view.extend({
 						id: 'vp-cpu-player-note',
 						class: 'cbi-value-description',
 						hidden: 'hidden'
-					}, _('Router CPU mode has no pause, seeking, or timeline. FFmpeg renders video on the router and sends it as one continuous MJPEG stream. Browser audio is preferred for synchronization, with router-decoded PCM as a fallback.'))
+					}, _('Router CPU mode has no pause, seeking, or timeline. One long-lived FFmpeg process renders video and decodes PCM audio on the router from the same input clock. Browser-decoded original audio is used for native MJPEG or PCM failure fallback.'))
 				])
 			]),
 
@@ -1302,7 +1302,7 @@ return view.extend({
 			);
 		}
 		else if (this._rendererAvailable === true && this._renderMode === 'router') {
-			statusEl.textContent = _('The FFmpeg output pipeline is available. Router playback uses %d FPS. Browser-decoded audio is preferred for synchronization, with router-decoded PCM as a fallback. Expect high CPU usage; video startup failures fall back to full browser decoding.').format(this._routerFps);
+			statusEl.textContent = _('The FFmpeg output pipeline is available. Router playback uses %d FPS. Synchronized router-decoded PCM is the primary audio path; browser-decoded original audio is the fallback. Expect high CPU usage; video startup failures fall back to full browser decoding.').format(this._routerFps);
 		}
 		else {
 			statusEl.textContent = '';
@@ -1901,6 +1901,23 @@ return view.extend({
 		return null;
 	},
 
+	_cpuVideoStallMs: function (session) {
+		const targetFps = Math.max(1, Number(session && session.fps) || 1);
+		const rate = session && Number.isFinite(session.videoPlaybackRate)
+			? Math.max(CPU_AV_MIN_ESTIMATED_RATE, session.videoPlaybackRate)
+			: 1;
+		const effectiveFps = targetFps * rate;
+
+		/* A selected 60 FPS is only the media-time scale. If the router can
+		 * actually present one frame per second, a 350 ms timeout would chop PCM
+		 * between every pair of valid frames. Allow roughly 2.5 observed frame
+		 * intervals, without exceeding the transport's own inactivity window. */
+		return Math.min(
+			CPU_STREAM_IDLE_TIMEOUT_MS - 1000,
+			Math.max(CPU_AV_STALL_MIN_MS, 2500 / effectiveFps)
+		);
+	},
+
 	_cpuVideoTarget: function (session, now) {
 		const mediaTime = session && session.videoMediaTime;
 		const frameAt = session && session.videoFrameAt;
@@ -1908,10 +1925,7 @@ return view.extend({
 			? session.videoPlaybackRate
 			: (session && session.streamTransportMode === 'fetch' ? 0 : 1);
 		const stallMs = session
-			? Math.max(
-				CPU_AV_STALL_MIN_MS,
-				2500 / Math.max(1, Number(session.fps) || 1)
-			)
+			? this._cpuVideoStallMs(session)
 			: CPU_AV_STALL_MIN_MS;
 
 		if (!Number.isFinite(mediaTime) || !Number.isFinite(frameAt))
@@ -1945,7 +1959,13 @@ return view.extend({
 			return;
 		}
 		else if (Number.isFinite(startedAt)) {
-			target = Math.max(0, (Date.now() - startedAt) / 1000);
+			target = Math.max(
+				0,
+				(Number.isFinite(session.nativeMediaBase)
+					? session.nativeMediaBase
+					: 0) +
+				(Date.now() - startedAt) / 1000
+			);
 		}
 		else if (Number.isFinite(offsetReceivedAt) &&
 		    Number.isFinite(mediaOffsetMs)) {
@@ -2022,10 +2042,7 @@ return view.extend({
 	_pollCpuAvSync: function (session) {
 		const browserAudio = session && session.browserAudio;
 		const now = cpuMonotonicNow();
-		const stallMs = Math.max(
-			CPU_AV_STALL_MIN_MS,
-			2500 / Math.max(1, Number(session && session.fps) || 1)
-		);
+		const stallMs = this._cpuVideoStallMs(session);
 
 		if (!this._isCurrentCpuSession(session) || session.finishing)
 			return;
@@ -2059,6 +2076,8 @@ return view.extend({
 					audio.inFlight = false;
 					audio.inFlightGeneration = null;
 					this._resetCpuAudioQueue(audio);
+					if (audio.ended)
+						this._finishCpuAudioDrain(session, audio);
 				}
 				this._scheduleCpuAvSync(session, CPU_AV_SYNC_INTERVAL_MS);
 				return;
@@ -2083,7 +2102,7 @@ return view.extend({
 		let position;
 
 		if (!this._isCurrentCpuSession(session) || session.finishing ||
-		    !audio || !audio.active || session.audio)
+		    document.hidden || !audio || !audio.active || session.audio)
 			return false;
 		if (session.streamTransportMode === 'fetch' &&
 		    (!Number.isFinite(session.videoMediaTime) ||
@@ -2393,7 +2412,8 @@ return view.extend({
 			try { element.load(); }
 			catch (err) {}
 			self._positionCpuBrowserAudio(session, browserAudio);
-			browserAudio.waitingForVideo = !session.firstFrameSeen ||
+			browserAudio.waitingForVideo = document.hidden ||
+				!session.firstFrameSeen ||
 				(session.streamTransportMode === 'fetch' &&
 				 !Number.isFinite(session.videoPlaybackRate));
 			self._updateCpuAudioPresentation(session);
@@ -2538,6 +2558,20 @@ return view.extend({
 			return;
 		if (document.hidden) {
 			session.streamHiddenAt = now;
+			if (session.audio && session.audio.active &&
+			    !session.audio.videoHeld) {
+				session.audio.videoHeld = true;
+				session.audio.pollGeneration =
+					(Number(session.audio.pollGeneration) || 0) + 1;
+				if (session.audio.timer != null)
+					window.clearTimeout(session.audio.timer);
+				session.audio.timer = null;
+				session.audio.inFlight = false;
+				session.audio.inFlightGeneration = null;
+				this._resetCpuAudioQueue(session.audio);
+				if (session.audio.ended)
+					this._finishCpuAudioDrain(session, session.audio);
+			}
 			if (session.browserAudio && session.browserAudio.active &&
 			    (session.browserAudio.playing ||
 			     session.browserAudio.playPending)) {
@@ -2551,22 +2585,45 @@ return view.extend({
 			hiddenFor = Math.max(0, now - session.streamHiddenAt);
 		session.streamHiddenAt = null;
 		this._scheduleCpuStreamStatus(session, 0);
-		if (session.audio && session.audio.active &&
-		    hiddenFor > CPU_AUDIO_CHUNK_MS * 2)
-			this._rebaseCpuAudio(session, session.audio);
-		if (session.browserAudio && session.browserAudio.active &&
-		    session.browserAudio.syncPaused &&
+		if (session.pendingAudio &&
+		    Number.isFinite(session.videoPlaybackRate) &&
 		    Number.isFinite(session.videoFrameAt) &&
-		    cpuMonotonicNow() - session.videoFrameAt < CPU_AV_STALL_MIN_MS) {
+		    cpuMonotonicNow() - session.videoFrameAt <
+			this._cpuVideoStallMs(session)) {
+			this._activatePendingCpuAudio(session);
+		}
+		if (session.audio && session.audio.active) {
+			if (session.audio.videoHeld &&
+			    Number.isFinite(session.videoFrameAt) &&
+			    cpuMonotonicNow() - session.videoFrameAt <
+				this._cpuVideoStallMs(session)) {
+				session.audio.videoHeld = false;
+				this._rebaseCpuAudio(session, session.audio);
+			}
+			else if (!session.audio.videoHeld &&
+			         hiddenFor > CPU_AUDIO_CHUNK_MS * 2) {
+				this._rebaseCpuAudio(session, session.audio);
+			}
+		}
+		if (session.browserAudio && session.browserAudio.active &&
+		    (session.browserAudio.syncPaused ||
+		     session.browserAudio.waitingForVideo) &&
+		    ((session.streamTransportMode === 'native-mjpeg' &&
+		      session.firstFrameSeen) ||
+		     (Number.isFinite(session.videoFrameAt) &&
+		      cpuMonotonicNow() - session.videoFrameAt <
+			this._cpuVideoStallMs(session)))) {
 			this._positionCpuBrowserAudio(
 				session, session.browserAudio, true
 			);
+			session.browserAudio.waitingForVideo = false;
 			session.browserAudio.syncPaused = false;
 			session.browserAudio.playPromise = this._playCpuBrowserAudio(
 				session, session.browserAudio, false
 			);
 		}
-		this._scheduleCpuAvSync(session, 0);
+		if (session.streamTransportMode === 'fetch')
+			this._scheduleCpuAvSync(session, 0);
 		if (!session.streamPending &&
 		    (!session.streamVisibleAttempt ||
 		     session.streamVisibleAttempt.ended ||
@@ -2822,7 +2879,7 @@ return view.extend({
 		const startingAttempt = !attempt.ready;
 		const now = cpuMonotonicNow();
 		const frameDuration = 1 / Math.max(1, session.fps);
-		let mediaTime;
+		let mediaTime, rateWindowMs;
 
 		if (!this._isCurrentCpuSession(session) || attempt.cancelled ||
 		    !parent || !frame ||
@@ -2871,8 +2928,11 @@ return view.extend({
 			session.videoRateAnchorMedia = mediaTime;
 			session.videoRateAnchorAt = now;
 		}
-		else if (mediaTime > session.videoRateAnchorMedia &&
-		         now - session.videoRateAnchorAt >= CPU_AV_RATE_WINDOW_MS) {
+		rateWindowMs = Number.isFinite(session.videoPlaybackRate)
+			? CPU_AV_RATE_WINDOW_MS
+			: Math.max(8, Math.min(100, 500 / Math.max(1, session.fps)));
+		if (mediaTime > session.videoRateAnchorMedia &&
+		    now - session.videoRateAnchorAt >= rateWindowMs) {
 			const observedRate = (mediaTime - session.videoRateAnchorMedia) /
 				((now - session.videoRateAnchorAt) / 1000);
 			if (Number.isFinite(observedRate) && observedRate > 0) {
@@ -2880,8 +2940,13 @@ return view.extend({
 					1,
 					Math.max(CPU_AV_MIN_ESTIMATED_RATE, observedRate)
 				);
+				/* React immediately when the router slows down so audio is held
+				 * before it can race ahead. Smooth only recovery/increases, which
+				 * avoids audible rate jumps after one unusually fast frame. */
 				session.videoPlaybackRate = Number.isFinite(session.videoPlaybackRate)
-					? session.videoPlaybackRate * 0.5 + boundedRate * 0.5
+					? (boundedRate < session.videoPlaybackRate
+						? boundedRate
+						: session.videoPlaybackRate * 0.5 + boundedRate * 0.5)
 					: boundedRate;
 			}
 			session.videoRateAnchorMedia = mediaTime;
@@ -2924,7 +2989,8 @@ return view.extend({
 		         Number.isFinite(session.videoPlaybackRate)) {
 			this._activatePendingCpuAudio(session);
 		}
-		else if (session.audio && session.audio.active &&
+		else if (!document.hidden &&
+		         session.audio && session.audio.active &&
 		         session.audio.videoHeld &&
 		         Number.isFinite(session.videoPlaybackRate)) {
 			session.audio.videoHeld = false;
@@ -3281,11 +3347,17 @@ return view.extend({
 			if (session.browserAudio &&
 			    session.browserAudio.active &&
 			    session.browserAudio.waitingForVideo) {
-				session.browserAudio.waitingForVideo = false;
-				session.browserAudio.playPromise =
-					this._playCpuBrowserAudio(
-						session, session.browserAudio, false
-					);
+				if (document.hidden) {
+					session.browserAudio.syncPaused = true;
+				}
+				else {
+					session.browserAudio.waitingForVideo = false;
+					session.browserAudio.syncPaused = false;
+					session.browserAudio.playPromise =
+						this._playCpuBrowserAudio(
+							session, session.browserAudio, false
+						);
+				}
 			}
 		}
 		this._setPlayerSurface('cpu');
@@ -3437,7 +3509,7 @@ return view.extend({
 			document.getElementById('videoplayer-cpu-frame')
 		);
 		const parent = visible && visible.parentNode;
-		let attempt, frame, requestUrl;
+		let attempt, frame, requestUrl, previousTransport, nativeBase;
 
 		if (!self._isCurrentCpuSession(session) || session.finishing ||
 		    session.streamPending)
@@ -3479,7 +3551,75 @@ return view.extend({
 			return;
 		}
 
+		previousTransport = session.streamTransportMode;
+		nativeBase = self._cpuVideoTarget(session, cpuMonotonicNow());
 		session.streamTransportMode = 'native-mjpeg';
+		if (previousTransport !== 'native-mjpeg') {
+			/* Fetch supplies exact frame sequence timestamps; native multipart
+			 * <img> does not. Retain only the last displayed media position as the
+			 * native epoch, and discard the stale fetch clock before browser audio
+			 * is allowed to start. */
+			session.nativeMediaBase = Number.isFinite(nativeBase)
+				? nativeBase
+				: (Number.isFinite(session.videoMediaTime)
+					? session.videoMediaTime
+					: 0);
+			session.videoMediaTime = null;
+			session.videoFrameAt = null;
+			session.videoPlaybackRate = null;
+			session.videoRateAnchorMedia = null;
+			session.videoRateAnchorAt = null;
+			session.firstFrameSeen = false;
+			session.firstFrameAt = null;
+			session.streamLastFrameAt = null;
+			if (session.streamVisibleAttempt &&
+			    session.streamVisibleAttempt.mode === 'fetch') {
+				const oldFetchAttempt = session.streamVisibleAttempt;
+
+				self._disposeCpuFetchAttempt(oldFetchAttempt);
+				session.streamVisibleAttempt = null;
+				if (session.streamProbeAttempt === oldFetchAttempt) {
+					if (session.streamProbeTimer != null)
+						window.clearTimeout(session.streamProbeTimer);
+					session.streamProbeTimer = null;
+					session.streamProbeAttempt = null;
+				}
+			}
+			if (session.streamRefreshTimer != null)
+				window.clearTimeout(session.streamRefreshTimer);
+			session.streamRefreshTimer = null;
+			session.streamNextHandoffAt = null;
+			if (session.avSyncTimer != null)
+				window.clearTimeout(session.avSyncTimer);
+			session.avSyncTimer = null;
+			if (session.browserAudio && session.browserAudio.active) {
+				session.browserAudio.waitingForVideo = true;
+				if (session.browserAudio.element)
+					self._pauseCpuBrowserAudioForSync(
+						session, session.browserAudio
+					);
+			}
+		}
+		/* Native multipart <img> playback exposes no per-frame sequence or PTS.
+		 * Running PCM at chunk=live/1x here would recreate the original audio-ahead
+		 * bug on a slow router. Use the protected browser track for this emergency
+		 * transport; exact PCM synchronization remains a fetch-stream feature. */
+		if (session.audio && session.audio.active) {
+			self._disableCpuAudio(
+				session,
+				_('Precise PCM synchronization is unavailable in native MJPEG fallback mode.')
+			);
+		}
+		else if (session.pendingAudio) {
+			const pending = session.pendingAudio;
+
+			session.pendingAudio = null;
+			self._disposeCpuAudio(pending);
+			self._startCpuBrowserAudioFallback(
+				session,
+				_('Precise PCM synchronization is unavailable in native MJPEG fallback mode.')
+			);
+		}
 		frame = document.createElement('img');
 		frame.className = 'videoplayer-cpu-frame';
 		frame.hidden = true;
@@ -3614,6 +3754,29 @@ return view.extend({
 	_finishCpuPlayback: function (session, message, isError, force) {
 		if (!this._isCurrentCpuSession(session))
 			return Promise.resolve();
+		if (!isError && !force && session.firstFrameSeen &&
+		    Number.isFinite(session.videoMediaTime) &&
+		    !Number.isFinite(session.videoPlaybackRate)) {
+			/* A one-frame or sub-window clip has no second presentation timestamp
+			 * from which to estimate speed. The producer is -re paced, so normal
+			 * speed is the least surprising terminal clock for either audio path. */
+			session.videoPlaybackRate = 1;
+		}
+		if (!isError && !force && session.pendingAudio &&
+		    session.firstFrameSeen && Number.isFinite(session.videoMediaTime)) {
+			this._activatePendingCpuAudio(session);
+		}
+		if (!isError && !force && session.browserAudio &&
+		    session.browserAudio.active &&
+		    session.browserAudio.waitingForVideo &&
+		    session.browserAudio.element &&
+		    Number.isFinite(session.videoPlaybackRate)) {
+			session.browserAudio.waitingForVideo = false;
+			session.browserAudio.syncPaused = false;
+			session.browserAudio.playPromise = this._playCpuBrowserAudio(
+				session, session.browserAudio, false
+			);
+		}
 
 		if (!isError && !force &&
 		    ((session.audio &&
@@ -4036,6 +4199,7 @@ return view.extend({
 			videoPlaybackRate: null,
 			videoRateAnchorMedia: null,
 			videoRateAnchorAt: null,
+			nativeMediaBase: 0,
 			avSyncTimer: null,
 			audio: null,
 			pendingAudio: pendingAudio,
@@ -4057,10 +4221,17 @@ return view.extend({
 		self._setNowPlaying(_('Starting router CPU renderer: %s').format(label));
 		self._openCpuStream(session);
 		self._scheduleCpuStreamStatus(session, 0);
+		if (session.pendingAudio) {
+			/* CPU mode deliberately uses router-decoded PCM as its primary sound.
+			 * Unlike HTMLMediaElement audio, Web Audio can follow a renderer that
+			 * is running below 0.25x without audibly racing ahead. The original
+			 * browser-decoded track is opened only if PCM later becomes unusable. */
+			self._updateCpuAudioPresentation(session);
+			return Promise.resolve(true);
+		}
+
 		let fallbackReason;
-		if (session.pendingAudio)
-			fallbackReason = _('Browser audio is preferred for synchronization; router-decoded PCM remains available as a fallback.');
-		else if (!hasAudio)
+		if (!hasAudio)
 			fallbackReason = _('Router FFmpeg could not provide a usable PCM audio track.');
 		else if (!audioMetadataValid)
 			fallbackReason = _('The router returned invalid PCM audio metadata.');

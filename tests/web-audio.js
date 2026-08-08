@@ -786,6 +786,129 @@ async function main() {
 		);
 	}
 
+	/* A one-frame fetch clip has no second timestamp from which to estimate a
+	 * render rate. Clean EOF must still promote pending PCM at a bounded normal
+	 * terminal rate instead of disposing the soundtrack immediately. */
+	const shortPcmContext = fakeContext();
+	const shortPcm = {
+		active: true,
+		context: shortPcmContext,
+		gain: shortPcmContext.createGain(),
+		muted: false,
+		timer: null,
+		inFlight: false,
+		inFlightGeneration: null,
+		pollGeneration: 0,
+		sequence: null,
+		startedAt: Date.now(),
+		hasDecoded: false,
+		ended: false,
+		nextPlayTime: 0,
+		errors: 0,
+		videoHeld: false,
+		sources: []
+	};
+	const shortPcmSession = {
+		active: true,
+		generation: 54,
+		token: '8'.repeat(32),
+		label: 'one-frame.mp4',
+		fps: 60,
+		streamTransportMode: 'fetch',
+		videoMediaTime: 0,
+		videoFrameAt: Date.now(),
+		videoPlaybackRate: null,
+		firstFrameSeen: true,
+		firstFrameAt: Date.now(),
+		audio: null,
+		pendingAudio: shortPcm,
+		browserAudio: null,
+		finishing: null,
+		finishTimer: null
+	};
+	app._cpuSession = shortPcmSession;
+	app._playGeneration = 54;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	const originalShortPcmScheduler = app._scheduleCpuAudioPoll;
+	let shortPcmPolls = 0;
+	app._scheduleCpuAudioPoll = () => { shortPcmPolls++; };
+	await app._finishCpuPlayback(shortPcmSession, 'one-frame-ended', false);
+	check(
+		app._cpuSession === shortPcmSession &&
+		shortPcmSession.audio === shortPcm &&
+		shortPcmSession.pendingAudio === null &&
+		shortPcmSession.videoPlaybackRate === 1 &&
+		shortPcmSession.finishing !== null &&
+		shortPcmPolls === 1,
+		'clean one-frame EOF discarded pending PCM instead of draining it'
+	);
+	await app._finishCpuPlayback(shortPcmSession, 'one-frame-ended', false, true);
+	check(shortPcmContext.closed,
+		'forced one-frame PCM drain did not close its AudioContext');
+	app._scheduleCpuAudioPoll = originalShortPcmScheduler;
+
+	/* The same terminal clock must release an already-resolved browser-audio
+	 * fallback. Previously it remained waiting for a second JPEG until the
+	 * five-second drain timeout and a one-frame clip was completely silent. */
+	const shortBrowserElement = fakeMediaElement([ null ]);
+	const shortBrowserAudio = {
+		active: true,
+		resolving: false,
+		waitingForVideo: true,
+		playing: false,
+		playPending: false,
+		playAttempt: 0,
+		playPromise: null,
+		ended: false,
+		muted: false,
+		needsGesture: false,
+		syncPaused: false,
+		syncPausePending: false,
+		syncPauseClearTimer: null,
+		mediaOffsetMs: 0,
+		offsetReceivedAt: Date.now(),
+		element: shortBrowserElement,
+		promise: Promise.resolve(true)
+	};
+	const shortBrowserSession = {
+		active: true,
+		generation: 55,
+		token: 'd'.repeat(32),
+		label: 'one-frame-browser-audio.mp4',
+		fps: 60,
+		streamTransportMode: 'fetch',
+		videoMediaTime: 0,
+		videoFrameAt: Date.now(),
+		videoPlaybackRate: null,
+		firstFrameSeen: true,
+		firstFrameAt: Date.now(),
+		audio: null,
+		pendingAudio: null,
+		browserAudio: shortBrowserAudio,
+		finishing: null,
+		finishTimer: null
+	};
+	app._cpuSession = shortBrowserSession;
+	app._playGeneration = 55;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	await app._finishCpuPlayback(
+		shortBrowserSession, 'one-frame-browser-ended', false
+	);
+	await shortBrowserAudio.playPromise;
+	check(
+		shortBrowserSession.videoPlaybackRate === 1 &&
+		!shortBrowserAudio.waitingForVideo &&
+		shortBrowserElement.playCalls === 1 &&
+		shortBrowserAudio.playing &&
+		shortBrowserSession.finishing !== null,
+		'clean one-frame EOF did not start browser-audio fallback'
+	);
+	await app._finishCpuPlayback(
+		shortBrowserSession, 'one-frame-browser-ended', false, true
+	);
+
 	/* When router PCM is unavailable, keep the continuous CPU-rendered MJPEG
 	 * stream but resolve the original protected stream into a hidden browser
 	 * audio element. A delayed audible play may be blocked, so muted playback
@@ -958,9 +1081,10 @@ async function main() {
 		'Stop did not stop the router renderer'
 	);
 
-	/* Browser audio is the synchronized primary output even when router PCM is
-	 * available. Autoplay fallback to muted playback is not a decode failure;
-	 * only a real media error promotes the dormant PCM context. */
+	/* Router PCM is the synchronized primary output whenever the renderer can
+	 * provide it. The original protected track is resolved only after PCM
+	 * becomes unusable, so HTMLMediaElement's 0.25x floor cannot make sound run
+	 * ahead of a very slow router-rendered picture. */
 	const primaryElement = fakeMediaElement([
 		new Error('NotAllowedError'),
 		null
@@ -1011,6 +1135,12 @@ async function main() {
 	app._scheduleCpuAudioPoll = () => {
 		primaryPcmPolls++;
 	};
+	const originalCanUseCpuFetchStream = app._canUseCpuFetchStream;
+	const originalStartCpuFetchStream = app._startCpuFetchStream;
+	app._canUseCpuFetchStream = () => true;
+	app._startCpuFetchStream = () => {};
+	rpcCalls.length = 0;
+	const primaryClock = installFakeClock(600000);
 	app._playGeneration = 60;
 	await app._playCpuStream({
 		session_token: primaryToken,
@@ -1030,39 +1160,269 @@ async function main() {
 		router_fps: 60
 	}, 'primary-audio.mp4', 60, dormantPcm);
 	const primarySession = app._cpuSession;
-	const primaryBrowserAudio = primarySession.browserAudio;
 	check(
 		primarySession.audio === null &&
 		primarySession.pendingAudio === dormantPcm &&
-		primaryPcmPolls === 0,
-		'router PCM started before synchronized browser audio failed'
+		primarySession.browserAudio === null &&
+		primaryPcmPolls === 0 &&
+		rpcCalls.filter(call => call.method === 'resolve_audio').length === 0,
+		'router PCM was not retained as the primary pending audio path'
 	);
-	primarySession.streamPending.node.naturalWidth = 640;
-	primarySession.streamPending.node.onload();
+	const primaryFrame = fakeImageElement();
+	primaryFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(
+		primarySession,
+		primarySession.streamPending,
+		primaryFrame,
+		0
+	);
+	check(primarySession.pendingAudio === dormantPcm &&
+		primarySession.audio === null,
+		'first fetch frame activated PCM before a playback clock existed');
+	primaryClock.jump(100);
+	const primarySecondFrame = fakeImageElement();
+	primarySecondFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(
+		primarySession,
+		primarySession.streamVisibleAttempt,
+		primarySecondFrame,
+		6
+	);
+	check(
+		primarySession.audio === dormantPcm &&
+		primarySession.pendingAudio === null &&
+		primarySession.browserAudio === null &&
+		primaryPcmPolls === 1 &&
+		Math.abs(primarySession.videoPlaybackRate - 1) < 0.001,
+		'natural second-frame clock did not activate router PCM exactly once'
+	);
+	await app._disableCpuAudio(primarySession, 'forced PCM failure');
+	const primaryBrowserAudio = primarySession.browserAudio;
 	await primaryBrowserAudio.playPromise;
 	check(
+		primarySession.audio === null &&
+		primaryBrowserAudio && primaryBrowserAudio.active &&
 		primaryBrowserAudio.playing &&
 		primaryBrowserAudio.muted &&
 		primaryBrowserAudio.needsGesture &&
-		primarySession.audio === null &&
-		primaryPcmPolls === 0,
-		'autoplay mute fallback incorrectly activated router PCM'
+		rpcCalls.filter(call => call.method === 'resolve_audio').length === 1,
+		'PCM failure did not start browser audio exactly once'
 	);
-	primaryElement.onerror();
-	check(
-		primarySession.browserAudio === null &&
-		primarySession.browserAudioFailed &&
-		primarySession.audio === dormantPcm &&
-		primarySession.pendingAudio === null &&
-		primaryPcmPolls === 1,
-		'real browser-audio failure did not promote router PCM exactly once'
-	);
-	check(primaryElement.src === '' && !primaryBrowserAudio.active,
-		'PCM failover left browser audio active');
+	check(primaryElement.src.includes('&audio=' + primaryAudioToken),
+		'PCM fallback did not use the protected browser-audio URL');
 	app._stopPlayback();
+	primaryClock.restore();
 	check(dormantPcm.context.closed,
-		'stopping PCM fallback did not close its AudioContext');
+		'PCM failure did not close its AudioContext');
+	app._canUseCpuFetchStream = originalCanUseCpuFetchStream;
+	app._startCpuFetchStream = originalStartCpuFetchStream;
 	app._scheduleCpuAudioPoll = originalAudioScheduler;
+
+	/* Native multipart <img> transport has no per-frame clock. Even if PCM is
+	 * available, it must be closed and replaced by browser audio rather than
+	 * running chunk=live at 1x ahead of a slow image stream. */
+	const nativeToken = 'a'.repeat(32);
+	const nativeAudioToken = 'f'.repeat(32);
+	const nativePcmContext = fakeContext();
+	const nativePcm = {
+		active: true,
+		context: nativePcmContext,
+		gain: null,
+		timer: null,
+		sources: []
+	};
+	rpcHandlers.resolve_audio = rendererToken => {
+		check(rendererToken === nativeToken,
+			'native fallback resolved the wrong renderer session');
+		return {
+			render_mode: 'browser',
+			stream_type: 'html5-video',
+			stream_url:
+				'/cgi-bin/videoplayer-stream?renderer=' + nativeToken +
+				'&audio=' + nativeAudioToken,
+			media_offset_ms: 0
+		};
+	};
+	rpcCalls.length = 0;
+	app._playGeneration = 61;
+	await app._playCpuStream({
+		session_token: nativeToken,
+		stream_url: '/cgi-bin/videoplayer-frame?token=' + nativeToken,
+		render_mode: 'router',
+		stream_type: 'mjpeg-stream',
+		mime: 'multipart/x-mixed-replace',
+		stream_segment_seconds: 45,
+		has_audio: 1,
+		audio_url: '/cgi-bin/videoplayer-audio?token=' + nativeToken,
+		audio_type: 'pcm-s16le-chunks',
+		audio_sample_rate: 48000,
+		audio_channels: 2,
+		audio_frames_per_chunk: 12000,
+		router_fps: 60
+	}, 'native-fallback.mp4', 61, nativePcm);
+	const nativeSession = app._cpuSession;
+	check(
+		nativeSession.streamTransportMode === 'native-mjpeg' &&
+		nativeSession.audio === null && nativeSession.pendingAudio === null &&
+		nativeSession.browserAudio && nativeSession.browserAudio.active &&
+		!nativePcm.active && nativePcmContext.closed,
+		'native MJPEG fallback retained unsynchronized router PCM'
+	);
+	check(rpcCalls.filter(call => call.method === 'resolve_audio').length === 1,
+		'native MJPEG fallback did not resolve browser audio exactly once');
+	app._stopPlayback();
+
+	/* A fetch session may fall back to native transport after repeated reader
+	 * failures. Its old sequence/rate clock must not start or immediately pause
+	 * browser audio before the first native image becomes visible. */
+	const transitionToken = 'e'.repeat(32);
+	const transitionAudioToken = '4'.repeat(32);
+	const transitionElement = fakeMediaElement([ null ]);
+	const transitionPcmContext = fakeContext();
+	const transitionPcm = {
+		active: true,
+		context: transitionPcmContext,
+		gain: transitionPcmContext.createGain(),
+		timer: null,
+		pollGeneration: 0,
+		inFlight: false,
+		inFlightGeneration: null,
+		sources: []
+	};
+	elements['videoplayer-cpu-audio'] = transitionElement;
+	rpcHandlers.resolve_audio = rendererToken => {
+		check(rendererToken === transitionToken,
+			'fetch-to-native fallback resolved the wrong renderer');
+		return {
+			render_mode: 'browser',
+			stream_type: 'html5-video',
+			stream_url:
+				'/cgi-bin/videoplayer-stream?renderer=' + transitionToken +
+				'&audio=' + transitionAudioToken,
+			media_offset_ms: 0
+		};
+	};
+	const transitionVisible = document.getElementById('videoplayer-cpu-frame');
+	let transitionReaderCancels = 0;
+	let transitionControllerAborts = 0;
+	const transitionFetchAttempt = {
+		id: 1,
+		mode: 'fetch',
+		ready: true,
+		cancelled: false,
+		completed: false,
+		reader: {
+			cancel() {
+				transitionReaderCancels++;
+				return Promise.resolve();
+			}
+		},
+		controller: {
+			abort() { transitionControllerAborts++; }
+		},
+		decodeInFlight: null,
+		queuedFrame: null,
+		multipartBuffer: new Uint8Array(0)
+	};
+	const transitionSession = {
+		active: true,
+		generation: 611,
+		token: transitionToken,
+		label: 'fetch-to-native.mp4',
+		fps: 60,
+		streamUrl: '/cgi-bin/videoplayer-frame?token=' + transitionToken,
+		streamSegmentMs: 45000,
+		visibleFrame: transitionVisible,
+		streamAttempt: 1,
+		streamPending: null,
+		streamVisibleAttempt: transitionFetchAttempt,
+		streamTransportMode: 'fetch',
+		streamFrameSequence: 721,
+		streamLastFrameAt: Date.now() - 100,
+		streamOutageStartedAt: Date.now() - 50,
+		streamNextHandoffAt: null,
+		streamHiddenAt: null,
+		streamErrors: 2,
+		streamWarned: false,
+		streamFetchErrors: 2,
+		fetchDisabled: true,
+		streamProbeTimer: null,
+		streamProbeAttempt: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamStatusTimer: null,
+		streamStatusInFlight: false,
+		streamStatusAgain: false,
+		streamStatusErrors: 0,
+		videoMediaTime: 12,
+		videoFrameAt: Date.now() - 100,
+		videoPlaybackRate: 0.5,
+		videoRateAnchorMedia: 12,
+		videoRateAnchorAt: Date.now() - 100,
+		avSyncTimer: null,
+		nativeMediaBase: 0,
+		firstFrameSeen: true,
+		firstFrameAt: Date.now() - 12000,
+		audio: transitionPcm,
+		pendingAudio: null,
+		browserAudio: null,
+		browserAudioFailed: false,
+		audioWarned: false,
+		audioFailureReason: '',
+		finishing: null,
+		finishTimer: null
+	};
+	app._cpuSession = transitionSession;
+	app._playGeneration = 611;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._openCpuStream(transitionSession);
+	await transitionSession.browserAudio.promise;
+	const nativeTransitionAttempt = transitionSession.streamPending;
+	check(
+		transitionSession.streamTransportMode === 'native-mjpeg' &&
+		!transitionSession.firstFrameSeen &&
+		transitionSession.videoMediaTime === null &&
+		transitionSession.videoFrameAt === null &&
+		transitionSession.videoPlaybackRate === null &&
+		transitionSession.nativeMediaBase >= 12 &&
+		transitionSession.browserAudio.waitingForVideo &&
+		transitionElement.playCalls === 0 &&
+		transitionPcmContext.closed &&
+		transitionFetchAttempt.cancelled &&
+		transitionReaderCancels === 1 &&
+		transitionControllerAborts === 1,
+		'fetch-to-native fallback retained the stale fetch clock or started audio early'
+	);
+	const staleTransitionFrame = fakeImageElement();
+	staleTransitionFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(
+		transitionSession, transitionFetchAttempt, staleTransitionFrame, 800
+	);
+	check(!transitionSession.firstFrameSeen &&
+		transitionSession.videoMediaTime === null,
+		'late cancelled fetch frame repopulated the native playback clock');
+	document.hidden = true;
+	nativeTransitionAttempt.node.naturalWidth = 640;
+	nativeTransitionAttempt.node.onload();
+	check(
+		transitionSession.firstFrameSeen &&
+		transitionSession.browserAudio.waitingForVideo &&
+		transitionElement.playCalls === 0,
+		'native video started hidden browser audio in a background tab'
+	);
+	document.hidden = false;
+	app._handleCpuVisibilityChange();
+	await transitionSession.browserAudio.playPromise;
+	check(
+		transitionSession.firstFrameSeen &&
+		!transitionSession.browserAudio.waitingForVideo &&
+		transitionElement.playCalls === 1 &&
+		transitionElement.currentTime >= 12 &&
+		transitionSession.avSyncTimer === null,
+		'native first frame did not start browser audio from the retained media epoch'
+	);
+	app._stopPlayback();
 
 	/* A broken multipart connection is retried as a stream, not converted
 	 * back into per-frame fetches. Stop must invalidate even a captured stale
@@ -1757,6 +2117,59 @@ async function main() {
 	app._presentCpuMjpegFrame(syncSession, reconnectAttempt, handoffFrame, 5);
 	check(Math.abs(syncSession.videoMediaTime - 0.5) < 0.001,
 		'CGI reconnect delay was incorrectly added to video media time');
+	/* Initial rate discovery must not wait half a second: otherwise PCM-primary
+	 * skips the beginning of every short clip. Later samples still use the
+	 * wider smoothing window. */
+	syncSession.videoPlaybackRate = null;
+	syncSession.videoRateAnchorMedia = null;
+	syncSession.videoRateAnchorAt = null;
+	const initialRateAttempt = {
+		id: 22,
+		mode: 'fetch',
+		openedAt: Date.now(),
+		ready: true,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		decodeInFlight: null,
+		queuedFrame: null
+	};
+	syncSession.streamVisibleAttempt = initialRateAttempt;
+	const initialRateFrame = fakeImageElement();
+	initialRateFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(
+		syncSession, initialRateAttempt, initialRateFrame, 6
+	);
+	syncClock.jump(100);
+	const secondRateFrame = fakeImageElement();
+	secondRateFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(
+		syncSession, initialRateAttempt, secondRateFrame, 7
+	);
+	check(Number.isFinite(syncSession.videoPlaybackRate) &&
+		syncSession.videoPlaybackRate > 0,
+		'initial fetch playback rate still required a 500 ms window');
+	/* A sudden overload must lower the clock immediately. Averaging the drop
+	 * over several one-second frames used to apply the 350 ms stall threshold
+	 * repeatedly and chop PCM before every valid image. */
+	syncSession.fps = 60;
+	syncSession.videoPlaybackRate = 1;
+	syncSession.videoRateAnchorMedia = 2;
+	syncSession.videoRateAnchorAt = syncClock.now();
+	syncSession.videoMediaTime = 2;
+	syncSession.videoFrameAt = syncClock.now();
+	syncClock.jump(1000);
+	const overloadedFrame = fakeImageElement();
+	overloadedFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(
+		syncSession, initialRateAttempt, overloadedFrame, 121
+	);
+	check(
+		syncSession.videoPlaybackRate < 0.03 &&
+		app._cpuVideoStallMs(syncSession) > 2000,
+		'sudden router slowdown remained hidden by rate smoothing'
+	);
 	const sequenceBeforeTruncation = syncSession.streamFrameSequence;
 	const truncatedAttempt = {
 		multipartState: 'body',
@@ -1842,6 +2255,8 @@ async function main() {
 	};
 	check(app._activatePendingCpuAudio(pcmSyncSession),
 		'ready PCM fallback was not activated');
+	check(app._cpuVideoStallMs({ fps: 60, videoPlaybackRate: 0.01 }) > 4000,
+		'very slow rendering still used the selected FPS as its stall clock');
 	check(pcmSyncAudio.sequence === 5 &&
 		Math.abs(pcmSyncAudio.startOffsetSeconds - 0.125) < 0.001,
 		'PCM fallback did not preserve the video sub-chunk offset');
@@ -1883,6 +2298,35 @@ async function main() {
 		pcmPollDelay === 0,
 		'PCM did not rebase and resume from the next displayed frame');
 
+	/* Background timer throttling must not leave Web Audio audible while JPEG
+	 * presentation is suspended. Hold immediately, then rebase only after a
+	 * recent visible frame is available again. */
+	const visibilitySequence = pcmSyncAudio.sequence;
+	app._decodeCpuAudioChunk(
+		pcmSyncSession, new ArrayBuffer(48000), visibilitySequence
+	);
+	const visibilitySource = pcmSyncContext.createdSources.at(-1);
+	document.hidden = true;
+	app._handleCpuVisibilityChange();
+	check(
+		pcmSyncAudio.videoHeld && visibilitySource.stopped &&
+		pcmSyncAudio.sources.length === 0,
+		'hidden tab left router PCM playing without visible frames'
+	);
+	pcmPollDelay = null;
+	const hiddenFrame = fakeImageElement();
+	hiddenFrame.naturalWidth = 640;
+	app._presentCpuMjpegFrame(
+		pcmSyncSession, resumeAttempt, hiddenFrame, 13
+	);
+	check(pcmSyncAudio.videoHeld && pcmPollDelay === null,
+		'background fetch frame restarted held router PCM');
+	pcmSyncSession.videoFrameAt = Date.now();
+	document.hidden = false;
+	app._handleCpuVisibilityChange();
+	check(!pcmSyncAudio.videoHeld && pcmPollDelay === 0,
+		'visible tab did not rebase held router PCM');
+
 	/* A 410 response can race a newly displayed frame. The retry must update
 	 * both the sequence and its intra-chunk offset. */
 	pcmSyncAudio.rebased = false;
@@ -1907,6 +2351,23 @@ async function main() {
 		'PCM 410 retry lost the synchronized sub-chunk offset');
 	check(pcmPollDelay === 0,
 		'PCM 410 retry was not scheduled immediately');
+
+	/* If graceful audio EOF was already draining, a visibility/stall hold stops
+	 * the queued tail. That forced reset must also run the normal drain cleanup
+	 * instead of leaving an ended AudioContext attached forever. */
+	app._decodeCpuAudioChunk(
+		pcmSyncSession, new ArrayBuffer(48000), pcmSyncAudio.sequence
+	);
+	const endedVisibilitySource = pcmSyncContext.createdSources.at(-1);
+	pcmSyncAudio.ended = true;
+	document.hidden = true;
+	app._handleCpuVisibilityChange();
+	check(
+		pcmSyncSession.audio === null && pcmSyncContext.closed &&
+		endedVisibilitySource.stopped,
+		'forced hold leaked an ended PCM AudioContext'
+	);
+	document.hidden = false;
 	app._scheduleCpuAudioPoll = originalPcmSyncScheduler;
 	app._stopPlayback();
 	pcmSyncClock.restore();
