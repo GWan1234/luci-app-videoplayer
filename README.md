@@ -258,13 +258,14 @@ the current head of `main`. Before installing that verified application APK,
 it also installs or checks for an update to the same exact
 architecture-specific private FFmpeg runtime described below. An
 already-current runtime does not stop the application installation. The
-installer refuses to proceed while a newer push is still being checked or if
-any verification fails. This path supports only `apk`; use the
-published-release installer above on OpenWrt versions that still use `opkg`.
-OpenWrt 25.12.1 and newer can force a reinstall when two snapshots share the
-same package version. On 25.12.0, the first installation works, but an existing
-copy must be removed manually before installing any newer build, including a
-genuine version upgrade.
+installer then checks the head of `main` again immediately before replacing
+the application package. It refuses to proceed while a newer push is still
+being checked or if any verification fails. This path supports only `apk`; use
+the published-release installer above on OpenWrt versions that still use
+`opkg`.
+The current snapshot targets the exact OpenWrt 25.12.5 revision listed below
+and force-reinstalls the application when a newer snapshot still has the same
+package version, `1.1.0`.
 
 ### Architecture-specific Codec Runtime (APK or IPK)
 

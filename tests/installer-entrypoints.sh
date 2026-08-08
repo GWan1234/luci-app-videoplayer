@@ -110,7 +110,7 @@ do
 			app_install_marker="printf 'Installing %s with %s..."
 			;;
 		scripts/install-main-apk.sh)
-			app_install_marker="printf 'Installing %s with apk..."
+			app_install_marker="install_apk_package \"\$APK_INSTALL_MODE\" \"\$APK_PATH\""
 			;;
 	esac
 	app_install_line="$(
@@ -125,6 +125,206 @@ do
 		exit 1
 	fi
 done
+
+main_installer="$root/scripts/install-main-apk.sh"
+main_installer_without_main="$tmp/install-main-apk.without-main"
+sed '$d' "$main_installer" > "$main_installer_without_main"
+current_commit="1111111111111111111111111111111111111111"
+stale_commit="2222222222222222222222222222222222222222"
+sh -s -- "$main_installer_without_main" "$current_commit" <<'EOF'
+set -eu
+installer="$1"
+current_commit="$2"
+# shellcheck disable=SC1090
+. "$installer"
+require_current_snapshot "$current_commit" "$current_commit"
+EOF
+if sh -s -- \
+	"$main_installer_without_main" \
+	"$stale_commit" \
+	"$current_commit" \
+	>"$tmp/stale-main.stdout" 2>"$tmp/stale-main.stderr" <<'EOF'
+set -eu
+installer="$1"
+stale_commit="$2"
+current_commit="$3"
+# shellcheck disable=SC1090
+. "$installer"
+require_current_snapshot "$stale_commit" "$current_commit"
+EOF
+then
+	printf '%s\n' 'The current-main installer accepted a stale snapshot.' >&2
+	exit 1
+fi
+grep -F 'The verified APK does not match current main.' \
+	"$tmp/stale-main.stderr" >/dev/null || {
+	printf '%s\n' 'The current-main installer returned the wrong stale-snapshot error.' >&2
+	exit 1
+}
+
+initial_freshness_line="$(
+	grep -nFx \
+		"require_current_snapshot \"\$SOURCE_COMMIT\" \"\$MAIN_COMMIT\"" \
+		"$main_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
+final_freshness_line="$(
+	grep -nFx \
+		"require_current_snapshot \"\$SOURCE_COMMIT\" \"\$FINAL_MAIN_COMMIT\"" \
+		"$main_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
+codec_call_line="$(
+	grep -nF "if ! /bin/sh \"\$CODEC_INSTALLER_PATH\"; then" "$main_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
+app_install_line="$(
+	grep -nFx "install_apk_package \"\$APK_INSTALL_MODE\" \"\$APK_PATH\"" \
+		"$main_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
+if [[ ! "$initial_freshness_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$final_freshness_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$codec_call_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$app_install_line" =~ ^[0-9]+$ ]] ||
+	((initial_freshness_line >= codec_call_line)) ||
+	((final_freshness_line <= codec_call_line)) ||
+	((final_freshness_line >= app_install_line)); then
+	printf '%s\n' \
+		'The current-main freshness checks do not guard both installation stages.' >&2
+	exit 1
+fi
+grep -Fx "FINAL_MAIN_COMMIT=\"\$(read_commit_sha \"\$FINAL_MAIN_REF_PATH\")\" ||" \
+	"$main_installer" >/dev/null || {
+	printf '%s\n' 'The final main check does not read its independently downloaded reference.' >&2
+	exit 1
+}
+for cache_header in 'Cache-Control: no-cache' 'Pragma: no-cache'; do
+	cache_header_count="$(grep -Fc "$cache_header" "$main_installer")"
+	if [[ "$cache_header_count" != 3 ]]; then
+		printf 'The current-main installer does not send %s through every downloader.\n' \
+			"$cache_header" >&2
+		exit 1
+	fi
+done
+
+fake_apk_bin="$tmp/fake-apk-bin"
+mkdir "$fake_apk_bin"
+cat > "$fake_apk_bin/apk" <<'EOF'
+#!/bin/sh
+set -u
+: "${APK_TEST_LOG:?}"
+printf '%s\n' "$*" >> "$APK_TEST_LOG"
+
+if [ "$#" -eq 3 ] && [ "$1" = "add" ] &&
+	[ "$2" = "--force-reinstall" ] && [ "$3" = "--help" ]; then
+	[ "${APK_TEST_FORCE_SUPPORTED:-0}" = "1" ]
+	exit
+fi
+if [ "$#" -eq 3 ] && [ "$1" = "info" ] && [ "$2" = "-e" ] &&
+	[ "$3" = "luci-app-videoplayer" ]; then
+	case "${APK_TEST_INSTALLED:-0}" in
+		0) exit 1 ;;
+		1) exit 0 ;;
+		*) exit 2 ;;
+	esac
+fi
+if [ "${1:-}" = "add" ]; then
+	exit "${APK_TEST_ADD_STATUS:-0}"
+fi
+exit 99
+EOF
+chmod 0755 "$fake_apk_bin/apk"
+
+cat > "$tmp/probe-apk-install.sh" <<'EOF'
+#!/bin/sh
+set -eu
+installer="$1"
+package_path="$2"
+# shellcheck disable=SC1090
+. "$installer"
+install_mode="$(select_apk_install_mode)"
+printf 'mode=%s\n' "$install_mode"
+install_apk_package "$install_mode" "$package_path"
+printf '%s\n' "completed"
+EOF
+chmod 0755 "$tmp/probe-apk-install.sh"
+
+test_package_path="/tmp/luci-app-videoplayer-current.apk"
+force_log="$tmp/apk-force.log"
+force_output="$(
+	env PATH="$fake_apk_bin:$PATH" \
+		APK_TEST_LOG="$force_log" \
+		APK_TEST_FORCE_SUPPORTED="1" \
+		APK_TEST_ADD_STATUS="0" \
+		sh "$tmp/probe-apk-install.sh" \
+		"$main_installer_without_main" "$test_package_path"
+)"
+mapfile -t force_calls < "$force_log"
+if [[ "$force_output" != $'mode=force\ncompleted' ]] ||
+	((${#force_calls[@]} != 2)) ||
+	[[ "${force_calls[0]:-}" != "add --force-reinstall --help" ]] ||
+	[[ "${force_calls[1]:-}" != \
+		"add --allow-untrusted --force-reinstall $test_package_path" ]]; then
+	printf '%s\n' 'The current-main installer did not force a same-version replacement.' >&2
+	exit 1
+fi
+
+plain_log="$tmp/apk-plain.log"
+plain_output="$(
+	env PATH="$fake_apk_bin:$PATH" \
+		APK_TEST_LOG="$plain_log" \
+		APK_TEST_FORCE_SUPPORTED="0" \
+		APK_TEST_INSTALLED="0" \
+		APK_TEST_ADD_STATUS="0" \
+		sh "$tmp/probe-apk-install.sh" \
+		"$main_installer_without_main" "$test_package_path"
+)"
+mapfile -t plain_calls < "$plain_log"
+if [[ "$plain_output" != $'mode=plain\ncompleted' ]] ||
+	((${#plain_calls[@]} != 3)) ||
+	[[ "${plain_calls[1]:-}" != "info -e luci-app-videoplayer" ]] ||
+	[[ "${plain_calls[2]:-}" != "add --allow-untrusted $test_package_path" ]]; then
+	printf '%s\n' 'The current-main installer broke first installation on legacy apk.' >&2
+	exit 1
+fi
+
+installed_log="$tmp/apk-installed.log"
+if env PATH="$fake_apk_bin:$PATH" \
+	APK_TEST_LOG="$installed_log" \
+	APK_TEST_FORCE_SUPPORTED="0" \
+	APK_TEST_INSTALLED="1" \
+	sh "$tmp/probe-apk-install.sh" \
+	"$main_installer_without_main" "$test_package_path" \
+	>"$tmp/apk-installed.stdout" 2>"$tmp/apk-installed.stderr"; then
+	printf '%s\n' 'The installer accepted unsafe same-version replacement on legacy apk.' >&2
+	exit 1
+fi
+grep -F 'cannot safely reinstall an existing snapshot' \
+	"$tmp/apk-installed.stderr" >/dev/null || {
+	printf '%s\n' 'The legacy-apk refusal returned the wrong error.' >&2
+	exit 1
+}
+if grep -F 'add --allow-untrusted' "$installed_log" >/dev/null; then
+	printf '%s\n' 'The legacy-apk refusal attempted to install the package.' >&2
+	exit 1
+fi
+
+failed_add_log="$tmp/apk-failed-add.log"
+if env PATH="$fake_apk_bin:$PATH" \
+	APK_TEST_LOG="$failed_add_log" \
+	APK_TEST_FORCE_SUPPORTED="1" \
+	APK_TEST_ADD_STATUS="23" \
+	sh "$tmp/probe-apk-install.sh" \
+	"$main_installer_without_main" "$test_package_path" \
+	>"$tmp/apk-failed-add.stdout" 2>"$tmp/apk-failed-add.stderr"; then
+	printf '%s\n' 'The installer ignored an apk installation failure.' >&2
+	exit 1
+fi
+if grep -Fx 'completed' "$tmp/apk-failed-add.stdout" >/dev/null; then
+	printf '%s\n' 'The installer reported completion after apk failed.' >&2
+	exit 1
+fi
 
 for specification in \
 	"scripts/install-from-github.sh|Usage: sh install-from-github.sh" \

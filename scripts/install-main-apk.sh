@@ -123,6 +123,8 @@ download_commit_sha() (
 		if ! run_with_download_deadline \
 			uclient-fetch \
 			--header="Accept: application/vnd.github.sha" \
+			--header="Cache-Control: no-cache" \
+			--header="Pragma: no-cache" \
 			-T "$DOWNLOAD_TIMEOUT_SECONDS" \
 			-O "$destination" "$url"; then
 			exit 1
@@ -131,6 +133,8 @@ download_commit_sha() (
 		if ! run_with_download_deadline \
 			wget \
 			--header="Accept: application/vnd.github.sha" \
+			--header="Cache-Control: no-cache" \
+			--header="Pragma: no-cache" \
 			-T "$DOWNLOAD_TIMEOUT_SECONDS" \
 			-O "$destination" "$url"; then
 			exit 1
@@ -142,6 +146,8 @@ download_commit_sha() (
 			--max-time "$DOWNLOAD_DEADLINE_SECONDS" \
 			--proto '=https' --proto-redir '=https' \
 			-H "Accept: application/vnd.github.sha" \
+			-H "Cache-Control: no-cache" \
+			-H "Pragma: no-cache" \
 			-o "$destination" "$url"; then
 			exit 1
 		fi
@@ -175,6 +181,48 @@ verify_sha256() {
 
 	[ "$actual_sha256" = "$expected_sha256" ] ||
 		die "The downloaded $description failed SHA-256 verification."
+}
+
+require_current_snapshot() {
+	[ "$1" = "$2" ] ||
+		die "The verified APK does not match current main. Wait for the package checks and retry."
+}
+
+select_apk_install_mode() {
+	if apk add --force-reinstall --help >/dev/null 2>&1; then
+		printf '%s\n' "force"
+		return 0
+	fi
+
+	apk_info_status="0"
+	apk info -e luci-app-videoplayer >/dev/null 2>&1 ||
+		apk_info_status="$?"
+	case "$apk_info_status" in
+		0)
+			die \
+				"This apk version cannot safely reinstall an existing snapshot. Upgrade OpenWrt or remove luci-app-videoplayer before retrying."
+			;;
+		1)
+			printf '%s\n' "plain"
+			;;
+		*)
+			die "Could not determine whether luci-app-videoplayer is already installed."
+			;;
+	esac
+}
+
+install_apk_package() {
+	case "$1" in
+		force)
+			apk add --allow-untrusted --force-reinstall "$2"
+			;;
+		plain)
+			apk add --allow-untrusted "$2"
+			;;
+		*)
+			die "Internal error: unknown apk installation mode."
+			;;
+	esac
 }
 
 # Keep all side effects behind the final entry-point call so the installer is
@@ -335,8 +383,7 @@ if ! download_commit_sha "$MAIN_REF_URL" "$MAIN_REF_PATH"; then
 fi
 MAIN_COMMIT="$(read_commit_sha "$MAIN_REF_PATH")" ||
 	die "GitHub returned an invalid main commit identifier."
-[ "$SOURCE_COMMIT" = "$MAIN_COMMIT" ] ||
-	die "The verified APK has not caught up with current main yet. Wait for the package checks and retry."
+require_current_snapshot "$SOURCE_COMMIT" "$MAIN_COMMIT"
 
 ACTUAL_SHA256="$(sha256sum "$APK_PATH")"
 ACTUAL_SHA256="${ACTUAL_SHA256%% *}"
@@ -372,26 +419,19 @@ if ! apk update; then
 	warn "Could not refresh apk indexes; continuing with the current indexes."
 fi
 
-printf 'Installing %s with apk...\n' "$SNAPSHOT_APK"
-if apk add --force-reinstall --help >/dev/null 2>&1; then
-	apk add --allow-untrusted --force-reinstall "$APK_PATH"
-else
-	APK_INFO_STATUS="0"
-	apk info -e luci-app-videoplayer >/dev/null 2>&1 ||
-		APK_INFO_STATUS="$?"
-	case "$APK_INFO_STATUS" in
-		0)
-			die \
-				"This apk version cannot safely reinstall an existing snapshot. Upgrade OpenWrt or remove luci-app-videoplayer before retrying."
-			;;
-		1)
-			apk add --allow-untrusted "$APK_PATH"
-			;;
-		*)
-			die "Could not determine whether luci-app-videoplayer is already installed."
-			;;
-	esac
+APK_INSTALL_MODE="$(select_apk_install_mode)"
+
+FINAL_MAIN_REF_PATH="$WORK_DIR/main-ref-final"
+printf 'Rechecking current main immediately before application installation...\n'
+if ! download_commit_sha "$MAIN_REF_URL" "$FINAL_MAIN_REF_PATH"; then
+	die "Could not recheck the current main branch before application installation."
 fi
+FINAL_MAIN_COMMIT="$(read_commit_sha "$FINAL_MAIN_REF_PATH")" ||
+	die "GitHub returned an invalid final main commit identifier."
+require_current_snapshot "$SOURCE_COMMIT" "$FINAL_MAIN_COMMIT"
+
+printf 'Installing %s with apk...\n' "$SNAPSHOT_APK"
+install_apk_package "$APK_INSTALL_MODE" "$APK_PATH"
 
 printf '%s\n' \
 	"Installation complete." \
