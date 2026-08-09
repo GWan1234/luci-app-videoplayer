@@ -616,10 +616,12 @@ fi
 
 [ -x "$PRIVATE_FFMPEG" ] ||
 	die "The installed private FFmpeg is missing or not executable: $PRIVATE_FFMPEG"
-[ -f "$PRIVATE_RELAY" ] && [ ! -L "$PRIVATE_RELAY" ] &&
-	[ -x "$PRIVATE_RELAY" ] &&
-	[ "$(stat -c '%u:%a' "$PRIVATE_RELAY" 2>/dev/null)" = "0:755" ] ||
+if [ ! -f "$PRIVATE_RELAY" ] ||
+	[ -L "$PRIVATE_RELAY" ] ||
+	[ ! -x "$PRIVATE_RELAY" ] ||
+	[ "$(stat -c '%u:%a' "$PRIVATE_RELAY" 2>/dev/null)" != "0:755" ]; then
 	die "The installed MJPEG relay is missing or unsafe: $PRIVATE_RELAY"
+fi
 RELAY_PROBE_RC="0"
 "$PRIVATE_RELAY" </dev/null >/dev/null 2>&1 || RELAY_PROBE_RC="$?"
 [ "$RELAY_PROBE_RC" -eq 64 ] ||
