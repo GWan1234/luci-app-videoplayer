@@ -384,15 +384,15 @@ audio_size="$(wc -c < "$audio_pcm" | tr -d '[:space:]')"
 	exec 3< "$long_audio_sample"
 	run_target \
 		-y -hide_banner -loglevel error -nostats -nostdin \
-		-filter_threads 1 \
-		-protocol_whitelist file,pipe -threads 2 \
+		-filter_threads 2 \
+		-protocol_whitelist file,pipe -threads 4 \
 		-fflags +genpts -err_detect ignore_err -i /proc/self/fd/3 \
 		-protocol_whitelist file,pipe -threads 1 \
 		-fflags +genpts -err_detect ignore_err -i /proc/self/fd/3 \
 		-map 0:V:0 -map 1:a:0 -sn -dn -map_metadata -1 \
 		-vf "fps=fps=5:start_time=0,scale=160:90:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 		-af "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=12000:p=1" \
-		-threads:v 1 -threads:a 1 \
+		-threads:v 2 -threads:a 1 \
 		-c:v mjpeg -q:v 8 -c:a pcm_s16le -shortest -flush_packets 1 \
 		-f tee \
 		"[select=v:f=mpjpeg:boundary_tag=videoplayer-validation]$tee_video_stream|[select=a:f=s16le:onfail=ignore]$tee_audio_pcm"

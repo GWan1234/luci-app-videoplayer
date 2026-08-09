@@ -108,7 +108,12 @@ two independent demux contexts on the same validated, immutable source
 descriptor: one selects video and one selects audio. This prevents a much
 longer audio track in one container from hiding video EOF until global input
 EOF. The process produces MJPEG and PCM from the same normalized input
-timeline. Its unified `tee` output pads a short audio track with silence
+timeline. Video decoding uses the detected online CPU count, capped at four
+threads to bound memory on embedded targets. Filtering and MJPEG encoding use
+one thread on a single-core router and at most two elsewhere. FFmpeg remains at
+reduced scheduler priority so it yields to LuCI and network traffic under load,
+but no input pacing option limits how quickly it can use otherwise idle CPU.
+Its unified `tee` output pads a short audio track with silence
 and stops an overlong audio track when video ends, so video is the authoritative
 timeline and neither length mismatch can stall the producer. LuCI immediately
 drains sequential PCM batches and complete JPEG frames into bounded browser
@@ -597,7 +602,12 @@ on the package manager and whether the file has been modified.
   creates video and audio from the same input timeline. Each validated batch
   request acknowledges only earlier PCM chunks; a full ring backpressures the
   shared FFmpeg process instead of overwriting sound that the browser has not
-  received. If the backend explicitly reports that its PCM chunker is
+  received. Numeric requests avoid rescanning the whole ring while waiting for
+  a complete batch, and LuCI backs off repeated empty polls from 50 ms to an
+  interval of 250 ms.
+  A short authenticated lock-busy response is retried for a bounded interval
+  instead of aborting the entire CPU-rendered session. If the backend explicitly
+  reports that its PCM chunker is
   unavailable, or Web Audio fails after a safe discard drain has been
   established, the player attempts the protected original track in a hidden
   HTML media element at 1×. It keeps acknowledging discarded PCM batches when

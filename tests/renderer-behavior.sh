@@ -47,6 +47,10 @@ private_exec_dir="$work/private-libexec/videoplayer-ffmpeg"
 private_lib_dir="$work/private-lib/videoplayer-ffmpeg"
 private_ffmpeg="$private_exec_dir/ffmpeg"
 host_relay="$bin/videoplayer-mjpeg-relay"
+audio_capacity_race_ready="$work/audio-capacity-race.ready"
+audio_capacity_race_release="$work/audio-capacity-race.release"
+audio_capacity_race_once="$work/audio-capacity-race.once"
+audio_capacity_race_arm="$work/audio-capacity-race.arm"
 
 mkdir -m 0755 -- "$bin" "$work/media"
 
@@ -54,8 +58,23 @@ export VIDEOPLAYER_TEST_MEDIA_ROOT="$work/media"
 export VIDEOPLAYER_TEST_RUNTIME="$runtime"
 export VIDEOPLAYER_TEST_ROUTER_FPS=60
 export VIDEOPLAYER_EXPECT_FPS=60
+VIDEOPLAYER_EXPECT_DECODER_THREADS="$(
+	awk '/^processor[[:space:]]*:/ { count++ } END { print count + 0 }' \
+		/proc/cpuinfo 2>/dev/null
+)" || VIDEOPLAYER_EXPECT_DECODER_THREADS=""
+if [[ ! "$VIDEOPLAYER_EXPECT_DECODER_THREADS" =~ ^[0-9]+$ ]] ||
+   [[ "$VIDEOPLAYER_EXPECT_DECODER_THREADS" -lt 1 ]]; then
+	VIDEOPLAYER_EXPECT_DECODER_THREADS=2
+elif [[ "$VIDEOPLAYER_EXPECT_DECODER_THREADS" -gt 4 ]]; then
+	VIDEOPLAYER_EXPECT_DECODER_THREADS=4
+fi
+export VIDEOPLAYER_EXPECT_DECODER_THREADS
 export VIDEOPLAYER_TEST_REQUIRE_NATIVE_RELAY=1
 export VIDEOPLAYER_TEST_DELAY_CGI_IDENTITY=1
+export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_READY="$audio_capacity_race_ready"
+export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_RELEASE="$audio_capacity_race_release"
+export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ONCE="$audio_capacity_race_once"
+export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ARM="$audio_capacity_race_arm"
 
 terminate_owned_pid() {
 	local pid="${1:-}" cmdline
@@ -82,6 +101,8 @@ cleanup() {
 	trap - EXIT INT TERM
 	set +e
 
+	[[ -n "${audio_capacity_race_release:-}" ]] &&
+		: > "$audio_capacity_race_release"
 	[[ -x "$helper" ]] && "$helper" cleanup >/dev/null 2>&1
 
 	for pid in \
@@ -98,6 +119,7 @@ cleanup() {
 		"${relay_partial_writer:-}" "${relay_partial_marker_writer:-}" \
 		"${status_touch_race_pid:-}" \
 		"${instant_worker:-}" "${delayed_worker:-}" \
+		"${fast_worker:-}" \
 		"${chunker_failure_worker:-}" "${chunker_failure_ffmpeg:-}" \
 		"${chunker_failure_chunker:-}" "${chunker_failure_cgi:-}" \
 		"${chunker_failure_video_cgi:-}" \
@@ -145,6 +167,39 @@ grep -Fq 'AUDIO_RING_SEGMENTS=32' "$source_helper" ||
 	fail "unexpected PCM ring size"
 grep -Fq 'AUDIO_BATCH_MAX_SEGMENTS=8' "$source_helper" ||
 	fail "unexpected PCM batch size"
+grep -Fq 'nice -n 10' "$source_helper" ||
+	fail "renderer no longer yields CPU to LuCI under contention"
+if grep -Eq '(^|[[:space:]"])-(re|readrate[^[:space:]"]*)($|[[:space:]"])' \
+	"$source_helper"; then
+	fail "renderer contains an input wall-clock pacing option"
+fi
+
+# Keep the decoder parallelism portable across single-core and multi-core
+# targets, including the conservative fallback for an unusual /proc format.
+decoder_thread_functions="$work/decoder-thread-functions.sh"
+awk '
+	/^renderer_decoder_threads\(\) \{/ { copying = 1 }
+	copying { print }
+	copying && /^}/ { exit }
+' "$source_helper" > "$decoder_thread_functions"
+bash -s -- "$decoder_thread_functions" <<'BASH'
+set -Eeuo pipefail
+functions=$1
+valid_decimal() {
+	[[ "$1" =~ ^[0-9]+$ && ${#1} -le $2 ]]
+}
+# shellcheck source=/dev/null
+. "$functions"
+awk() { printf '%s\n' "$FAKE_CPU_COUNT"; }
+FAKE_CPU_COUNT=1
+[[ "$(renderer_decoder_threads)" == 1 ]]
+FAKE_CPU_COUNT=4
+[[ "$(renderer_decoder_threads)" == 4 ]]
+FAKE_CPU_COUNT=64
+[[ "$(renderer_decoder_threads)" == 4 ]]
+FAKE_CPU_COUNT=invalid
+[[ "$(renderer_decoder_threads)" == 2 ]]
+BASH
 
 # The production helper runs in BusyBox ash, whose `read -t` keeps the bounded
 # between-frame handoff safe. Ubuntu's /bin/sh is dash and lacks that option;
@@ -167,9 +222,27 @@ if [ "${VIDEOPLAYER_TEST_REQUIRE_NATIVE_RELAY:-0}" = "1" ]; then\
 fi' \
 	-e '/^[[:space:]]*ffmpeg_pid=\$!$/a\
 sleep 0.05' \
+	-e '/^renderer_decoder_threads() {$/a\
+if [ -n "${VIDEOPLAYER_TEST_DECODER_THREADS:-}" ]; then\
+\tprintf "%s\\n" "$VIDEOPLAYER_TEST_DECODER_THREADS"\
+\treturn 0\
+fi' \
 	-e '/^[[:space:]]*CGI_COPY_PID=\$!$/a\
 if [ "${VIDEOPLAYER_TEST_DELAY_CGI_IDENTITY:-0}" = "1" ]; then\
 \tsleep 0.05\
+fi' \
+	-e '/^[[:space:]]*load_audio_ack "\$token" || capacity_failed=1$/a\
+if [ -n "${VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_READY:-}" ] &&\
+   [ -n "${VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_RELEASE:-}" ] &&\
+   [ -n "${VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ONCE:-}" ] &&\
+   [ -n "${VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ARM:-}" ] &&\
+   [ -e "$VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ARM" ] &&\
+   [ ! -e "$VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ONCE" ]; then\
+\t: > "$VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ONCE"\
+\t: > "$VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_READY"\
+\twhile [ ! -e "$VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_RELEASE" ]; do\
+\t\tsleep 0.05\
+\tdone\
 fi' \
 	-e '/^[[:space:]]*state="\$(cmd_status "\$token")" || return 1$/a\
 if [ -n "${VIDEOPLAYER_TEST_STATUS_TOUCH_READY:-}" ]; then\
@@ -507,6 +580,18 @@ static int has_arg(int argc, char **argv, const char *wanted)
 	return 0;
 }
 
+static int has_arg_prefix(int argc, char **argv, const char *prefix)
+{
+	size_t prefix_len = strlen(prefix);
+	int i;
+
+	for (i = 1; i < argc; ++i)
+		if (strncmp(argv[i], prefix, prefix_len) == 0)
+			return 1;
+
+	return 0;
+}
+
 static int count_pair(
 	int argc,
 	char **argv,
@@ -816,6 +901,7 @@ int main(int argc, char **argv)
 	int video_output_fd;
 	int delayed_video;
 	int fail_after_first_frame;
+	int fast_producer;
 	int finite_video;
 	int instant_video;
 	int line;
@@ -827,11 +913,22 @@ int main(int argc, char **argv)
 	unsigned long parsed_fps;
 	ssize_t marker_size;
 	const char *expected_private_lib;
+	const char *expected_decoder_threads;
+	const char *expected_pipeline_threads;
 	const char *expected_fps;
 	const char *library_path;
 
 	expected_private_lib = getenv("VIDEOPLAYER_EXPECT_PRIVATE_LIB");
+	expected_decoder_threads = getenv("VIDEOPLAYER_EXPECT_DECODER_THREADS");
 	expected_fps = getenv("VIDEOPLAYER_EXPECT_FPS");
+	if (expected_decoder_threads == NULL ||
+	    (strcmp(expected_decoder_threads, "1") != 0 &&
+	     strcmp(expected_decoder_threads, "2") != 0 &&
+	     strcmp(expected_decoder_threads, "3") != 0 &&
+	     strcmp(expected_decoder_threads, "4") != 0))
+		return 78;
+	expected_pipeline_threads = strcmp(expected_decoder_threads, "1") == 0
+		? "1" : "2";
 	library_path = getenv("LD_LIBRARY_PATH");
 	if (expected_fps == NULL || expected_fps[0] == '\0')
 		expected_fps = "8";
@@ -911,7 +1008,8 @@ int main(int argc, char **argv)
 			return 85;
 		if (marker_is(marker, marker_size, "no-audio") ||
 		    marker_is(marker, marker_size, "delayed-start") ||
-		    marker_is(marker, marker_size, "instant-media")) {
+		    marker_is(marker, marker_size, "instant-media") ||
+		    marker_is(marker, marker_size, "fast-producer")) {
 			fputs("Stream map '0:a:0' matches no streams\n", stderr);
 			return 81;
 		}
@@ -958,16 +1056,20 @@ int main(int argc, char **argv)
 	errno = 0;
 	if (argc < 2 || !has_arg(argc, argv, "-nostdin") ||
 	    has_arg(argc, argv, "-re") ||
-	    count_pair(argc, argv, "-filter_threads", "1") != 1 ||
+	    has_arg_prefix(argc, argv, "-readrate") ||
+	    count_pair(argc, argv, "-filter_threads", expected_pipeline_threads) != 1 ||
 	    count_pair(argc, argv, "-protocol_whitelist", "file,pipe") !=
 		    (audio_output != NULL ? 2 : 1) ||
 	    count_pair(argc, argv, "-fflags", "+genpts") !=
 		    (audio_output != NULL ? 2 : 1) ||
 	    count_pair(argc, argv, "-err_detect", "ignore_err") !=
 		    (audio_output != NULL ? 2 : 1) ||
-	    count_input_group(argc, argv, "2") != 1 ||
-	    count_input_group(argc, argv, "1") !=
-		    (audio_output != NULL ? 1 : 0) ||
+	    count_input_group(argc, argv, expected_decoder_threads) !=
+		    (audio_output != NULL &&
+		     strcmp(expected_decoder_threads, "1") == 0 ? 2 : 1) ||
+	    (strcmp(expected_decoder_threads, "1") != 0 &&
+	     count_input_group(argc, argv, "1") !=
+		     (audio_output != NULL ? 1 : 0)) ||
 	    fstat(3, &input) != 0 ||
 	    !S_ISREG(input.st_mode) ||
 	    input.st_size <= 0 ||
@@ -978,8 +1080,7 @@ int main(int argc, char **argv)
 	errno = 0;
 	if (audio_output != NULL &&
 	    (!tee_mode ||
-		    count_pair(argc, argv, "-threads", "1") != 1 ||
-		    count_pair(argc, argv, "-threads:v", "1") != 1 ||
+		    count_pair(argc, argv, "-threads:v", expected_pipeline_threads) != 1 ||
 		    count_pair(argc, argv, "-threads:a", "1") != 1 ||
 		    count_pair(argc, argv, "-map", "1:a:0") != 1 ||
 		    count_pair(
@@ -1005,9 +1106,8 @@ int main(int argc, char **argv)
 	if (fcntl(4, F_GETFD) != -1 || errno != EBADF)
 		return 80;
 	if (
-	    count_pair(argc, argv, "-threads", "2") != 1 ||
-	    (audio_output == NULL && count_pair(argc, argv, "-threads", "1") < 1) ||
-	    count_pair(argc, argv, "-filter_threads", "1") != 1 ||
+	    count_pair(argc, argv, "-filter_threads", expected_pipeline_threads) != 1 ||
+	    count_pair(argc, argv, "-threads:v", expected_pipeline_threads) != 1 ||
 	    count_pair(argc, argv, "-i", "/proc/self/fd/3") !=
 		    (audio_output != NULL ? 2 : 1) ||
 	    count_pair(argc, argv, "-map", "0:V:0") != 1 ||
@@ -1038,6 +1138,7 @@ int main(int argc, char **argv)
 		marker_is(marker, marker_size, "audio-finite") ||
 		marker_is(marker, marker_size, "video-short-audio-long");
 	instant_video = marker_is(marker, marker_size, "instant-media");
+	fast_producer = marker_is(marker, marker_size, "fast-producer");
 	audio_finite = marker_is(marker, marker_size, "audio-finite");
 	audio_runtime_failure =
 		marker_is(marker, marker_size, "audio-runtime-failure");
@@ -1208,7 +1309,8 @@ int main(int argc, char **argv)
 			return 69;
 		}
 
-		usleep(frame_delay_us);
+		if (!fast_producer)
+			usleep(frame_delay_us);
 	}
 
 	if (audio_output_fd >= 0)
@@ -1237,6 +1339,7 @@ printf 'no-audio extensionless fixture\n' > "$work/media/no-audio-extensionless"
 printf 'audio-runtime-failure fixture\n' > "$work/media/audio-runtime.mp4"
 printf 'audio-finite fixture\n' > "$work/media/audio-finite.mp4"
 printf 'finite-media fixture\n' > "$work/media/finite-media.mp4"
+printf 'fast-producer fixture\n' > "$work/media/fast-producer.mp4"
 printf 'video-short-audio-long fixture\n' \
 	> "$work/media/video-short-audio-long.mp4"
 printf 'instant-media fixture\n' > "$work/media/instant-media.mp4"
@@ -1679,7 +1782,8 @@ run_uncontended_audio_cgi() {
 }
 
 # The production client retries a generic 409 while a previous PCM response or
-# the chunker briefly owns audio.lock. Mirror that bounded behaviour here for
+# a terminal audio-state transition briefly owns audio.lock. Mirror that
+# bounded behaviour here for
 # requests which are expected to be ready, but never retry the authenticated
 # unavailable response and never hide a persistent lock leak.
 run_ready_audio_batch_cgi() {
@@ -1770,6 +1874,7 @@ finite_audio=36363636363636363636363636363636
 chunker_failure=37373737373737373737373737373737
 chunker_terminal_capability=48484848484848484848484848484848
 finite_media=38383838383838383838383838383838
+fast_producer=50505050505050505050505050505050
 instant_media=39393939393939393939393939393939
 delayed_start=40404040404040404040404040404040
 delayed_capability=41414141414141414141414141414141
@@ -2032,9 +2137,14 @@ assert_eq \
 	"stop after runtime failure"
 
 # Missing or undecodable audio is nonfatal: video remains available and the
-# dedicated audio endpoint reports the optional track as unavailable.
+# dedicated audio endpoint reports the optional track as unavailable. The
+# disposable one-core override also exercises the video-only decoder argv.
 assert_eq \
-	"$("$helper" start "$no_audio" "$work/media/no-audio-extensionless")" \
+	"$(
+		VIDEOPLAYER_TEST_DECODER_THREADS=1 \
+		VIDEOPLAYER_EXPECT_DECODER_THREADS=1 \
+			"$helper" start "$no_audio" "$work/media/no-audio-extensionless"
+	)" \
 	started \
 	"video-only start"
 assert_eq \
@@ -2140,6 +2250,41 @@ check_status_line "$work/stream-stopped" "403 Forbidden"
 rm -f -- "$work/media/no-audio-extensionless"
 mv -- "$work/media/no-audio-extensionless.opened" \
 	"$work/media/no-audio-extensionless"
+
+# FFmpeg must be allowed to fill the browser prebuffer faster than wall time.
+# This clock-free fake produces an audio-less stream as quickly as FIFO
+# backpressure permits. Two native-relay responses contain ten media seconds
+# at 60 FPS and must finish in substantially less wall time; the argv validator
+# above separately rejects both -re and every -readrate* pacing option.
+assert_eq \
+	"$("$helper" start "$fast_producer" "$work/media/fast-producer.mp4")" \
+	started \
+	"fast producer start"
+fast_worker="$(session_pid "$fast_producer" worker)"
+fast_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+run_mjpeg_cgi "$fast_producer" 1-1 "$work/fast-producer-1"
+IFS=: read -r fast_parts_1 fast_first_1 fast_last_1 fast_preamble_1 <<< "$(
+	check_mjpeg_response \
+		"$work/fast-producer-1" "$fast_producer" 250 initial
+)"
+run_mjpeg_cgi "$fast_producer" 1-2 "$work/fast-producer-2"
+IFS=: read -r fast_parts_2 fast_first_2 fast_last_2 fast_preamble_2 <<< "$(
+	check_mjpeg_response \
+		"$work/fast-producer-2" "$fast_producer" 250 reconnect
+)"
+fast_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+fast_elapsed_ms=$(( (fast_finished_ns - fast_started_ns) / 1000000 ))
+fast_media_ms=$(( (fast_parts_1 + fast_parts_2) * 1000 / 60 ))
+[[ "$fast_preamble_1" -eq 0 && "$fast_preamble_2" -le 8192 &&
+   "$fast_first_1" -le "$fast_last_1" &&
+   "$fast_first_2" -le "$fast_last_2" &&
+   "$fast_first_2" -gt "$fast_last_1" ]] ||
+	fail "fast producer responses did not preserve monotonic MJPEG handoff"
+[[ "$fast_media_ms" -gt $((fast_elapsed_ms * 2)) ]] ||
+	fail "renderer transport remained wall-clock paced: media=${fast_media_ms}ms, wall=${fast_elapsed_ms}ms"
+assert_eq "$($helper stop "$fast_producer")" stopped "fast producer stop"
+wait_dead "$fast_worker"
+fast_worker=""
 
 # Unknown container duration is valid but must stay unpublished rather than
 # accepting a metadata key that merely contains a spoofed Duration substring.
@@ -2404,7 +2549,11 @@ wait_dead "$long_audio_worker"
 # source-holder worker is leased, and still remain readable after that holder's
 # deliberately stale heartbeat releases fd 3.
 assert_eq \
-	"$("$helper" start "$finite_media" "$work/media/finite-media.mp4")" \
+	"$(
+		VIDEOPLAYER_TEST_DECODER_THREADS=1 \
+		VIDEOPLAYER_EXPECT_DECODER_THREADS=1 \
+			"$helper" start "$finite_media" "$work/media/finite-media.mp4"
+	)" \
 	started \
 	"finite-media start"
 finite_media_worker="$(session_pid "$finite_media" worker)"
@@ -2698,6 +2847,9 @@ if grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
 	"$work/audio-busy-response"; then
 	fail "busy PCM response falsely authorized browser-audio fallback"
 fi
+grep -Fq $'X-Videoplayer-Audio-State: busy\r' \
+	"$work/audio-busy-response" ||
+	fail "busy PCM response omitted its bounded-retry state"
 
 # Drain video while forcing audio-ring saturation. With no browser audio
 # request, the chunker must preserve the first 32 unacknowledged chunks and
@@ -2724,16 +2876,20 @@ done
 	fail "audio ring did not reach the hard-bound test condition"
 wait "$ring_fill_pid"
 ring_fill_pid=""
-kill -STOP "$chunker1"
-sleep 0.05
+: > "$audio_capacity_race_arm"
+for _ in {1..100}; do
+	[[ -e "$audio_capacity_race_ready" ]] && break
+	sleep 0.02
+done
+[[ -e "$audio_capacity_race_ready" ]] ||
+	fail "audio capacity ACK/delete race hook was not reached"
 inspect_audio_ring "$token1"
 hard_bound_count=$((AUDIO_FILE_COUNT + AUDIO_STAGED_COUNT))
 hard_bound_bytes="$AUDIO_TOTAL_BYTES"
-kill -CONT "$chunker1"
 [[ "$hard_bound_count" -le 32 ]] ||
-	fail "paused audio ring exceeded 32 storage slots: $hard_bound_count"
+	fail "saturated audio ring exceeded 32 storage slots: $hard_bound_count"
 [[ "$hard_bound_bytes" -le $((32 * 48000)) ]] ||
-	fail "paused audio ring exceeded its byte bound: $hard_bound_bytes"
+	fail "saturated audio ring exceeded its byte bound: $hard_bound_bytes"
 [[ -f "$runtime/s-$token1/audio-00000000.pcm" ]] ||
 	fail "unacknowledged first audio chunk was overwritten"
 assert_eq \
@@ -2770,8 +2926,17 @@ for sequence in {0..7}; do
 done
 run_ready_audio_batch_cgi GET "$token1" 0 8 "$work/audio-batch-retry"
 check_audio_batch_response "$work/audio-batch-retry" GET 0 8
+# The full-ring chunker is held by the disposable hook immediately after it
+# read the old ACK=0 snapshot. GET(8) now atomically advances ACK and deletes
+# 0..7. Holding audio.lock before releasing the hook proves both invariants:
+# the chunker rechecks ACK after observing the missing oldest file, and its
+# capacity path no longer collides with valid browser requests. The old
+# implementation either reports false corruption or blocks on this lock.
 run_ready_audio_batch_cgi GET "$token1" 8 8 "$work/audio-batch-get-8"
 check_audio_batch_response "$work/audio-batch-get-8" GET 8 8
+exec 7< "$runtime/s-$token1/audio.lock"
+flock -x 7
+: > "$audio_capacity_race_release"
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$token1/audio-ack")" \
 	8 \
@@ -2788,8 +2953,9 @@ for _ in {1..100}; do
 	[[ "$audio_unblocked" -eq 1 ]] && break
 	sleep 0.02
 done
+exec 7<&-
 [[ "$audio_unblocked" -eq 1 ]] ||
-	fail "valid next audio batch did not unblock the shared producer"
+	fail "valid next audio batch did not unblock the lock-free shared producer"
 
 # Model an active browser consumer while the MJPEG lifecycle cases run. Each
 # request advances the ACK by one batch and keeps only its own retryable batch;

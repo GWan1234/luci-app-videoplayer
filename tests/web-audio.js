@@ -2751,6 +2751,83 @@ async function main() {
 		bufferedAudio.bufferedUntil === 0.5,
 		'buffered PCM batch was not retained as two sequential chunks');
 	check(bufferedPollDelay === 0, 'buffered PCM did not immediately drain the next batch');
+
+	/* A slow producer exposes the edge of each complete eight-chunk batch for
+	 * roughly two media seconds. Back off repeated 202 responses instead of
+	 * running an expensive CGI/ring scan at 20 requests per second. */
+	const notReadyDelays = [];
+	app._scheduleCpuAudioPoll = (activeSession, delay) => {
+		check(activeSession === bufferedSession,
+			'wrong adaptive PCM session scheduled');
+		notReadyDelays.push(delay);
+	};
+	request.get = () => Promise.resolve({
+		status: 202,
+		ok: false,
+		headers: { get: () => null }
+	});
+	bufferedAudio.errors = 2;
+	for (let attempt = 0; attempt < 8; attempt++)
+		await app._pollCpuBufferedAudio(bufferedSession);
+	check(JSON.stringify(notReadyDelays) ===
+		JSON.stringify([ 50, 100, 200, 250, 250, 250, 250, 250 ]),
+		'buffered PCM 202 polling did not use the bounded exponential backoff');
+	check(notReadyDelays.slice(-4).reduce((sum, delay) => sum + delay, 0) === 1000,
+		'sustained empty PCM polling exceeded four CGI requests per second');
+	check(bufferedAudio.errors === 0,
+		'a healthy buffered PCM 202 did not reset prior transport failures');
+
+	/* audio.lock contention is an authenticated retryable state, not evidence
+	 * that the synchronized PCM ring was lost. Recovery is bounded; a lock which
+	 * remains busy beyond the old request lifetime still fails closed. */
+	const bufferedBusyClock = installFakeClock(2500000);
+	const originalBufferedBusyFailure = app._failCpuBufferedPlayback;
+	let bufferedBusyFailures = 0;
+	let bufferedBusyResponses = 0;
+	app._failCpuBufferedPlayback = activeSession => {
+		check(activeSession === bufferedSession,
+			'buffered PCM busy failure targeted the wrong session');
+		bufferedBusyFailures++;
+	};
+	bufferedAudio.errors = 2;
+	request.get = () => Promise.resolve({
+		status: bufferedBusyResponses++ < 2 ? 409 : 202,
+		ok: false,
+		headers: {
+			get: name => bufferedBusyResponses <= 2 &&
+				String(name).toLowerCase() === 'x-videoplayer-audio-state'
+				? 'busy'
+				: null
+		}
+	});
+	await app._pollCpuBufferedAudio(bufferedSession);
+	bufferedBusyClock.advance(800);
+	await app._pollCpuBufferedAudio(bufferedSession);
+	await app._pollCpuBufferedAudio(bufferedSession);
+	check(bufferedBusyFailures === 0 && bufferedAudio.errors === 0 &&
+		bufferedAudio.busyStartedAt == null &&
+		notReadyDelays.at(-1) === 50,
+		'transient authenticated PCM busy state did not recover into normal polling');
+	bufferedBusyResponses = 0;
+	bufferedAudio.busyStartedAt = null;
+	bufferedAudio.errors = 0;
+	request.get = () => Promise.resolve({
+		status: 409,
+		ok: false,
+		headers: {
+			get: name => String(name).toLowerCase() ===
+				'x-videoplayer-audio-state' ? 'busy' : null
+		}
+	});
+	await app._pollCpuBufferedAudio(bufferedSession);
+	bufferedBusyClock.advance(3000);
+	await app._pollCpuBufferedAudio(bufferedSession);
+	await app._pollCpuBufferedAudio(bufferedSession);
+	await app._pollCpuBufferedAudio(bufferedSession);
+	check(bufferedBusyFailures === 1,
+		'persistent authenticated PCM busy state escaped its bounded failure window');
+	app._failCpuBufferedPlayback = originalBufferedBusyFailure;
+	bufferedBusyClock.restore();
 	app._scheduleCpuAudioPoll = originalAudioScheduler;
 
 	/* Playback schedules buffered PCM at one fixed rate. Approaching a missing
@@ -3439,12 +3516,20 @@ async function main() {
 	let eofStarts = 0;
 	let eofFailures = 0;
 	let eofReconnects = 0;
+	let eofReconnectDelays = [];
 	let eofStatusSchedules = 0;
 	app._maybeStartCpuBufferedPlayback = () => { eofStarts++; };
 	app._scheduleCpuBufferedPresentation = () => {};
 	app._scheduleCpuStreamStatus = () => { eofStatusSchedules++; };
-	app._scheduleCpuStreamReconnect = () => { eofReconnects++; };
+	app._scheduleCpuStreamReconnect = (activeSession, delay) => {
+		check(activeSession === app._cpuSession,
+			'EOF reconnect targeted a stale CPU session');
+		eofReconnects++;
+		eofReconnectDelays.push(delay);
+	};
 	app._failCpuBufferedPlayback = () => { eofFailures++; };
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
 	const makeEofSession = generation => ({
 		active: true,
 		generation,
@@ -3483,6 +3568,70 @@ async function main() {
 		streamStatusWarned: false,
 		finishing: null
 	});
+	/* Fetch EOF is observed only after the CGI has closed stdout and released
+	 * stream.lock. Repeated buffered handoffs therefore reconnect immediately;
+	 * retaining the native-image 250 ms grace here needlessly throttles a slow
+	 * renderer by five percent at the five-media-second segment cap. */
+	for (let round = 0; round < 2; round++) {
+		const handoffSession = makeEofSession(140 + round);
+		const handoffAttempt = {
+			mode: 'fetch', streamId: String(140 + round) + '-1',
+			responseStatus: 200, bodyEndedClean: true, ready: true,
+			ended: false, cancelled: false, completed: false,
+			transportEnded: true, terminalDrain: false, terminalCheck: false,
+			decodeInFlight: null, queuedFrame: null, reader: null, controller: null
+		};
+
+		handoffSession.streamVisibleAttempt = handoffAttempt;
+		handoffSession.videoTerminalDrainCandidateId = handoffAttempt.streamId;
+		app._cpuSession = handoffSession;
+		app._playGeneration = handoffSession.generation;
+		app._completeCpuFetchStream(handoffSession, handoffAttempt);
+		check(handoffAttempt.ended && eofReconnectDelays.at(-1) === 0 &&
+			handoffSession.streamNextHandoffAt <= Date.now(),
+			'clean buffered Fetch EOF retained an unnecessary handoff delay');
+	}
+	const verifyingSession = makeEofSession(142);
+	const verifyingCleanAttempt = {
+		mode: 'fetch', streamId: '142-1', responseStatus: 200,
+		bodyEndedClean: true, ready: true, ended: false, cancelled: false,
+		completed: false, transportEnded: true, terminalDrain: false,
+		terminalCheck: false, decodeInFlight: null, queuedFrame: null,
+		reader: null, controller: null
+	};
+	verifyingSession.videoTerminalDrainCandidateId = '142-1';
+	verifyingSession.streamVisibleAttempt = verifyingCleanAttempt;
+	app._cpuSession = verifyingSession;
+	app._playGeneration = 142;
+	app._completeCpuFetchStream(verifyingSession, verifyingCleanAttempt);
+	let resolveDeferredStatus;
+	rpcHandlers.renderer_status = () => new Promise(resolve => {
+		resolveDeferredStatus = resolve;
+	});
+	const deferredStatusPoll = app._pollCpuStreamStatus(verifyingSession);
+	await Promise.resolve();
+	const eofGapStatuses = [ 409, 202, 410 ];
+	for (let retry = 0; retry < eofGapStatuses.length; retry++) {
+		const eofGapAttempt = {
+			mode: 'fetch', streamId: '142-' + String(retry + 2),
+			responseStatus: eofGapStatuses[retry], ready: false, ended: false,
+			cancelled: false, completed: false, terminalDrain: false,
+			terminalCheck: false, bodyEndedClean: false,
+			decodeInFlight: null, queuedFrame: null, reader: null, controller: null
+		};
+
+		verifyingSession.streamPending = eofGapAttempt;
+		app._handleCpuStreamFailure(verifyingSession, eofGapAttempt);
+	}
+	check(eofFailures === 0 && verifyingSession.streamFetchErrors === 0,
+		'bodyless 202/409/410 EOF-gap responses exhausted the fetch startup budget');
+	resolveDeferredStatus({ state: 'ended' });
+	await deferredStatusPoll;
+	check(verifyingSession.producerEnded && eofFailures === 0,
+		'deferred terminal status lost the preceding clean handoff evidence');
+	eofReconnects = 0;
+	eofReconnectDelays = [];
+	eofStatusSchedules = 0;
 	const pressureSession = makeEofSession(123);
 	const pressureAttempt = {
 		mode: 'fetch',
@@ -4333,9 +4482,11 @@ async function main() {
 	await app._pollCpuAudioDrainer(drainSession);
 	check(drainSession.audioDrainer.fetchSequence === 8,
 		'discard drainer did not consume its first full batch');
+	drainSession.audioDrainer.errors = 2;
 	await app._pollCpuAudioDrainer(drainSession);
-	check(drainSession.audioDrainer.fetchSequence === 8,
-		'HTTP 202 incorrectly advanced the discard cursor');
+	check(drainSession.audioDrainer.fetchSequence === 8 &&
+		drainSession.audioDrainer.errors === 0,
+		'healthy HTTP 202 advanced the discard cursor or retained old failures');
 	await app._pollCpuAudioDrainer(drainSession);
 	check(
 		drainQueries.length === 3 &&
@@ -4347,6 +4498,7 @@ async function main() {
 	);
 	const drainBusyClock = installFakeClock(4000000);
 	let overlapBusyResponse = 0;
+	drainSession.audioDrainer.errors = 2;
 	request.get = () => Promise.resolve({
 		status: overlapBusyResponse++ < 2 ? 409 : 204,
 		ok: false,

@@ -37,6 +37,8 @@ const CPU_AUDIO_CHUNK_BYTES = 48000;
 const CPU_AUDIO_CHUNK_MS = 250;
 const CPU_AUDIO_REQUEST_TIMEOUT_MS = 2500;
 const CPU_AUDIO_BUSY_RETRY_MS = CPU_AUDIO_REQUEST_TIMEOUT_MS + 500;
+const CPU_AUDIO_NOT_READY_MIN_MS = 50;
+const CPU_AUDIO_NOT_READY_MAX_MS = CPU_AUDIO_CHUNK_MS;
 const CPU_AUDIO_START_TIMEOUT_MS = 10000;
 const CPU_AUDIO_DRAIN_TIMEOUT_MS = 5000;
 const CPU_AUDIO_INITIAL_LEAD_SECONDS = 0.12;
@@ -2781,9 +2783,15 @@ return view.extend({
 				return { done: true };
 			if (res.status === 202) {
 				drainer.busyStartedAt = null;
-				return { retry: true, delay: 50 };
+				drainer.errors = 0;
+				return {
+					retry: true,
+					delay: self._nextCpuAudioNotReadyDelay(drainer)
+				};
 			}
 			if (res.status === 204) {
+				drainer.busyStartedAt = null;
+				drainer.notReadyDelay = null;
 				drainer.producerEnded = true;
 				drainer.active = false;
 				return { done: true };
@@ -2791,6 +2799,8 @@ return view.extend({
 			if (res.status === 409 && String(
 				res.headers && res.headers.get('X-Videoplayer-Audio-State') || ''
 			).toLowerCase() === 'unavailable') {
+				drainer.busyStartedAt = null;
+				drainer.notReadyDelay = null;
 				/* This authenticated state is emitted only after the worker has
 				 * replaced the failed PCM chunker with its own direct FIFO sink. */
 				drainer.producerEnded = true;
@@ -2798,6 +2808,7 @@ return view.extend({
 				return { done: true };
 			}
 			if (res.status === 409) {
+				drainer.notReadyDelay = null;
 				const now = Date.now();
 
 				if (!Number.isFinite(drainer.busyStartedAt))
@@ -2807,8 +2818,10 @@ return view.extend({
 				 * starts, so generic lock-busy 409s remain retryable for longer
 				 * than that request's complete timeout. Persistent 409 still
 				 * fails closed after this bounded overlap window. */
-				if (now - drainer.busyStartedAt < CPU_AUDIO_BUSY_RETRY_MS)
+				if (now - drainer.busyStartedAt < CPU_AUDIO_BUSY_RETRY_MS) {
+					drainer.errors = 0;
 					return { retry: true, delay: 100 };
+				}
 				throw new Error(_('The router PCM acknowledgement stream remained busy.'));
 			}
 			if (res.status === 404 || res.status === 410)
@@ -2818,6 +2831,7 @@ return view.extend({
 					_('Audio drain request failed with HTTP %d').format(res.status)
 				);
 			drainer.busyStartedAt = null;
+			drainer.notReadyDelay = null;
 
 			const get = function (name) {
 				return String(res.headers.get(name) || '');
@@ -4494,6 +4508,10 @@ return view.extend({
 	},
 
 	_completeCpuFetchStream: function (session, attempt) {
+		const handoffDelay = session && session.bufferedPlayback
+			? 0
+			: CPU_STREAM_HANDOFF_GRACE_MS;
+
 		if (!this._isCurrentCpuSession(session) || attempt.cancelled ||
 		    attempt.completed)
 			return;
@@ -4534,7 +4552,7 @@ return view.extend({
 		if (session.streamRefreshTimer != null)
 			window.clearTimeout(session.streamRefreshTimer);
 		session.streamRefreshTimer = null;
-		session.streamNextHandoffAt = Date.now() + CPU_STREAM_HANDOFF_GRACE_MS;
+		session.streamNextHandoffAt = Date.now() + handoffDelay;
 		this._disposeCpuFetchAttempt(attempt, session);
 		this._scheduleCpuStreamStatus(session, 0);
 		/* Even a drain request which reached a clean body EOF is followed by a
@@ -4544,7 +4562,7 @@ return view.extend({
 			session,
 			session.bufferedPlayback && session.producerEnded
 				? 0
-				: CPU_STREAM_HANDOFF_GRACE_MS
+				: handoffDelay
 		);
 	},
 
@@ -5118,6 +5136,15 @@ return view.extend({
 		const now = Date.now();
 		const fetchStartupFailure = attempt && attempt.mode === 'fetch' &&
 			!attempt.ready;
+		const cleanHandoffStatusRetry = !!(
+			session && session.bufferedPlayback && fetchStartupFailure &&
+			session.videoTerminalDrainBodyClean === true &&
+			session.videoTerminalDrainCandidateId &&
+			attempt.streamId !== session.videoTerminalDrainCandidateId &&
+			(Number(attempt.responseStatus) === 202 ||
+			 Number(attempt.responseStatus) === 409 ||
+			 Number(attempt.responseStatus) === 410)
+		);
 		const ambiguousBufferedResponse = !!(
 			session && session.bufferedPlayback && attempt &&
 			attempt.mode === 'fetch' && !attempt.terminalCheck &&
@@ -5139,7 +5166,7 @@ return view.extend({
 			session.streamProbeTimer = null;
 			session.streamProbeAttempt = null;
 		}
-		if (fetchStartupFailure) {
+		if (fetchStartupFailure && !cleanHandoffStatusRetry) {
 			session.streamFetchErrors =
 				(Number(session.streamFetchErrors) || 0) + 1;
 			if (!session.bufferedPlayback &&
@@ -5210,6 +5237,28 @@ return view.extend({
 					session,
 					Math.min(CPU_STREAM_MAX_RECONNECT_MS, 500)
 				);
+			return;
+		}
+		if (cleanHandoffStatusRetry) {
+			/* A clean bounded response is an exact FIFO checkpoint. Its immediate
+			 * successor can legitimately receive 202/409 while the next relay is
+			 * becoming available, or 410 when FFmpeg reached EOF before the status
+			 * RPC observed `ended`. These responses carry no body and consume no
+			 * frames, so verify status and retry without spending the three-strike
+			 * fetch-startup budget. The ordinary outage deadline remains the bound. */
+			if (!Number.isFinite(session.streamOutageStartedAt))
+				session.streamOutageStartedAt = now;
+			session.streamErrors++;
+			if (now - session.streamOutageStartedAt >=
+			    CPU_STREAM_OUTAGE_TIMEOUT_MS) {
+				this._failCpuBufferedPlayback(
+					session,
+					_('The buffered router video stream could not be verified after a clean handoff.')
+				);
+				return;
+			}
+			this._scheduleCpuStreamStatus(session, 0);
+			this._scheduleCpuStreamReconnect(session, 250);
 			return;
 		}
 		if (!Number.isFinite(session.streamOutageStartedAt))
@@ -5722,6 +5771,20 @@ return view.extend({
 		}, Math.max(0, Number(delay) || 0));
 	},
 
+	_nextCpuAudioNotReadyDelay: function (audio) {
+		let delay = Number(audio && audio.notReadyDelay);
+
+		if (!Number.isFinite(delay) || delay < CPU_AUDIO_NOT_READY_MIN_MS)
+			delay = CPU_AUDIO_NOT_READY_MIN_MS;
+		delay = Math.min(CPU_AUDIO_NOT_READY_MAX_MS, delay);
+		if (audio)
+			audio.notReadyDelay = Math.min(
+				CPU_AUDIO_NOT_READY_MAX_MS,
+				delay * 2
+			);
+		return delay;
+	},
+
 	_resetCpuAudioQueue: function (audio) {
 		(audio.sources || []).forEach(function (source) {
 			try { source.onended = null; source.stop(); }
@@ -5878,9 +5941,22 @@ return view.extend({
 			    session.audio !== audio || !audio.active ||
 			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
 				return { done: true };
-			if (res.status === 202)
-				return { retry: true, delay: 50 };
+			const responseAudioState = String(
+				res.headers && res.headers.get('X-Videoplayer-Audio-State') || ''
+			).toLowerCase();
+			if (res.status !== 409 || responseAudioState !== 'busy')
+				audio.busyStartedAt = null;
+			if (res.status === 202) {
+				audio.busyStartedAt = null;
+				audio.errors = 0;
+				return {
+					retry: true,
+					delay: self._nextCpuAudioNotReadyDelay(audio)
+				};
+			}
 			if (res.status === 204) {
+				audio.busyStartedAt = null;
+				audio.notReadyDelay = null;
 				audio.producerEnded = true;
 				audio.ended = true;
 				self._maybeStartCpuBufferedPlayback(session);
@@ -5890,11 +5966,25 @@ return view.extend({
 			if (res.status === 409 && String(
 				res.headers && res.headers.get('X-Videoplayer-Audio-State') || ''
 			).toLowerCase() === 'unavailable') {
+				audio.busyStartedAt = null;
+				audio.notReadyDelay = null;
 				return self._disableCpuAudio(
 					session,
 					_('Router-decoded PCM audio became unavailable; using protected browser audio while router-rendered video continues.'),
 					true
 				).then(function () { return { done: true }; });
+			}
+			if (res.status === 409 && responseAudioState === 'busy') {
+				const now = Date.now();
+
+				audio.notReadyDelay = null;
+				if (!Number.isFinite(audio.busyStartedAt))
+					audio.busyStartedAt = now;
+				if (now - audio.busyStartedAt < CPU_AUDIO_BUSY_RETRY_MS) {
+					audio.errors = 0;
+					return { retry: true, delay: 100 };
+				}
+				throw new Error(_('The router PCM buffer remained busy.'));
 			}
 			if (res.status === 409 || res.status === 404 || res.status === 410) {
 				self._failCpuBufferedPlayback(
@@ -5907,7 +5997,8 @@ return view.extend({
 				throw new Error(
 					_('Audio request failed with HTTP %d').format(res.status)
 				);
-
+			audio.busyStartedAt = null;
+			audio.notReadyDelay = null;
 			const type = String(res.headers.get('Content-Type') || '')
 				.split(';', 1)[0].trim().toLowerCase();
 			const format = String(
@@ -6068,7 +6159,14 @@ return view.extend({
 			    session.audio !== audio || !audio.active ||
 			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
 				return { done: true };
+			const responseAudioState = String(
+				res.headers && res.headers.get('X-Videoplayer-Audio-State') || ''
+			).toLowerCase();
+			if (res.status !== 409 || responseAudioState !== 'busy')
+				audio.busyStartedAt = null;
 			if (res.status === 202) {
+				audio.busyStartedAt = null;
+				audio.errors = 0;
 				if (!audio.hasDecoded &&
 				    Date.now() - audio.startedAt > CPU_AUDIO_START_TIMEOUT_MS) {
 					self._disableCpuAudio(
@@ -6080,6 +6178,8 @@ return view.extend({
 				return { retry: true, delay: 125 };
 			}
 			if (res.status === 204) {
+				audio.busyStartedAt = null;
+				audio.notReadyDelay = null;
 				self._endCpuAudioGracefully(session);
 				return { done: true };
 			}
@@ -6101,6 +6201,17 @@ return view.extend({
 					return { retry: true, delay: 0 };
 				}
 			}
+			if (res.status === 409 && responseAudioState === 'busy') {
+				const now = Date.now();
+
+				audio.notReadyDelay = null;
+				if (!Number.isFinite(audio.busyStartedAt))
+					audio.busyStartedAt = now;
+				if (now - audio.busyStartedAt < CPU_AUDIO_BUSY_RETRY_MS) {
+					audio.errors = 0;
+					return { retry: true, delay: 100 };
+				}
+			}
 			if (res.status === 409 || res.status === 404 || res.status === 410) {
 				self._disableCpuAudio(
 					session,
@@ -6110,7 +6221,8 @@ return view.extend({
 			}
 			if (!res.ok || res.status !== 200)
 				throw new Error(_('Audio request failed with HTTP %d').format(res.status));
-
+			audio.busyStartedAt = null;
+			audio.notReadyDelay = null;
 			const type = String(res.headers.get('Content-Type') || '')
 				.split(';', 1)[0].trim().toLowerCase();
 			const contentLength = Number(res.headers.get('Content-Length'));
