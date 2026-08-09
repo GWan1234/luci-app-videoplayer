@@ -3158,13 +3158,17 @@ cmd_worker() {
 			now="$(date +%s 2>/dev/null)" || break
 			valid_decimal "$now" 12 || break
 			load_current 2>/dev/null || break
-			[ "$CURRENT_TOKEN" = "$token" ] &&
-				[ "$CURRENT_EXPIRY" -gt "$now" ] || break
+			if [ "$CURRENT_TOKEN" != "$token" ] ||
+			   [ "$CURRENT_EXPIRY" -le "$now" ]; then
+				break
+			fi
 			load_status "$token" 2>/dev/null || break
 			[ "$SESSION_STATUS" = "ended" ] || break
 			load_heartbeat "$token" 2>/dev/null || break
-			[ "$HEARTBEAT_TIME" -le "$now" ] &&
-				[ $((now - HEARTBEAT_TIME)) -le "$HEARTBEAT_TIMEOUT" ] || break
+			if [ "$HEARTBEAT_TIME" -gt "$now" ] ||
+			   [ $((now - HEARTBEAT_TIME)) -gt "$HEARTBEAT_TIMEOUT" ]; then
+				break
+			fi
 			sleep 1
 		done
 	fi
@@ -4329,12 +4333,12 @@ cmd_cgi() {
 	last_check_cs="$started_cs"
 	last_progress_cs="$started_cs"
 	router_fps="$(get_router_fps)"
-	valid_decimal "$router_fps" 2 &&
-		[ "$router_fps" -ge 1 ] && [ "$router_fps" -le 60 ] || {
+	if ! valid_decimal "$router_fps" 2 ||
+	   [ "$router_fps" -lt 1 ] || [ "$router_fps" -gt 60 ]; then
 		exec 5<&-
 		exec 7<&-
 		http_error "503 Service Unavailable" "Invalid router frame rate"
-	}
+	fi
 	segment_frame_limit=$((router_fps * 5))
 
 	write_mjpeg_headers "$boundary"
@@ -4581,9 +4585,10 @@ cmd_audio_cgi() {
 
 	[ -z "${HTTP_RANGE:-}" ] ||
 		http_error "416 Range Not Satisfiable" "Range requests are not supported"
-	[ "$response_count" -ge 1 ] &&
-		[ "$response_count" -le "$AUDIO_BATCH_MAX_SEGMENTS" ] ||
+	if [ "$response_count" -lt 1 ] ||
+	   [ "$response_count" -gt "$AUDIO_BATCH_MAX_SEGMENTS" ]; then
 		http_error "503 Service Unavailable" "Invalid audio batch"
+	fi
 	end_sequence=$((sequence + response_count - 1))
 	cursor="$sequence"
 	while [ "$cursor" -le "$end_sequence" ]; do

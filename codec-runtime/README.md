@@ -52,8 +52,8 @@ The package installs two private executables at:
 It does not replace `/usr/bin/ffmpeg`, any system `libav*.so`, or any other
 global library. The libav components are linked statically into the private
 FFmpeg executable. The small frame-aligned MJPEG relay is compiled for the
-same target ABI. Each executable's only permitted dynamic dependency is the
-target's `libc`.
+same target ABI, with its GCC compiler support routines linked statically.
+Each executable's only permitted dynamic dependency is the target's `libc`.
 Network protocols, AV devices, hardware accelerators, and auto-detected
 external libraries are disabled.
 

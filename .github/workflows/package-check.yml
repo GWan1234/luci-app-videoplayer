@@ -90,6 +90,9 @@ jobs:
           grep -Fx \
             'define Package/luci-videoplayer-codec-runtime' \
             codec-runtime/package/Makefile
+          grep -F \
+            '$(TARGET_LDFLAGS) -static-libgcc -Wl,-z,relro' \
+            codec-runtime/package/Makefile
           grep -Fx 'format=3' codec-runtime/package/files/build-info.template
           grep -Fx 'openwrt_release=@OPENWRT_RELEASE@' \
             codec-runtime/package/files/build-info.template

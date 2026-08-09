@@ -194,11 +194,13 @@ define Build/Configure
 	)
 endef
 
+# Keep GCC compiler support routines inside the private relay on every target
+# ABI so the codec package retains its intentional libc-only runtime dependency.
 define Build/Compile
 	+$(MAKE) $(PKG_JOBS) -C $(PKG_BUILD_DIR) ffmpeg
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_CPPFLAGS) \
 		-std=c99 -Wall -Wextra -Werror -Os \
-		$(TARGET_LDFLAGS) -Wl,-z,relro -Wl,-z,now \
+		$(TARGET_LDFLAGS) -static-libgcc -Wl,-z,relro -Wl,-z,now \
 		-o $(PKG_BUILD_DIR)/videoplayer-mjpeg-relay \
 		$(CURDIR)/src/videoplayer-mjpeg-relay.c
 	$(INSTALL_DIR) $(PKG_BUILD_DIR)/.pkgdir/.videoplayer-validation

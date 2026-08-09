@@ -19,14 +19,20 @@ source_helper="$repo_root/luci-app-videoplayer/root/usr/libexec/videoplayer-rend
 source_stream="$repo_root/luci-app-videoplayer/root/www/cgi-bin/videoplayer-stream"
 source_rpc="$repo_root/luci-app-videoplayer/root/usr/libexec/rpcd/luci.videoplayer"
 source_relay="$repo_root/codec-runtime/package/src/videoplayer-mjpeg-relay.c"
+source_codec_makefile="$repo_root/codec-runtime/package/Makefile"
 [[ -f "$source_helper" ]] || fail "renderer helper not found"
 [[ -f "$source_stream" ]] || fail "stream CGI not found"
 [[ -f "$source_rpc" ]] || fail "rpcd backend not found"
 [[ -f "$source_relay" ]] || fail "MJPEG relay source not found"
+[[ -f "$source_codec_makefile" ]] || fail "codec package Makefile not found"
 
-for tool in cc flock python3 readlink sed stat timeout; do
+for tool in cc flock python3 readelf readlink sed stat timeout; do
 	command -v "$tool" >/dev/null || fail "$tool is required"
 done
+
+grep -Fq "\$(TARGET_LDFLAGS) -static-libgcc -Wl,-z,relro" \
+	"$source_codec_makefile" ||
+	fail "MJPEG relay does not statically link compiler support routines"
 
 work="$(mktemp -d /tmp/videoplayer-renderer-ci.XXXXXX)"
 bin="$work/bin"
@@ -201,8 +207,12 @@ grep -Fq 'VIDEOPLAYER_TEST_REQUIRE_NATIVE_RELAY' "$helper" ||
 # anchor deliberately remains open until an authenticated terminal marker is
 # published, so the relay must recognize that marker while waiting for the
 # absent next part headers and synthesize one standards-compliant close marker.
-cc -std=c99 -Wall -Wextra -Werror -O2 \
+cc -std=c99 -Wall -Wextra -Werror -O2 -static-libgcc \
 	-o "$host_relay" "$source_relay"
+if readelf -d "$host_relay" |
+	grep -Eq 'Shared library: \[libgcc(_s)?\.so'; then
+	fail "native MJPEG relay unexpectedly depends on shared libgcc"
+fi
 relay_boundary=videoplayer-0123456789abcdef0123456789abcdef
 relay_nonce=1-9
 relay_marker="$work/relay-terminal.marker"
