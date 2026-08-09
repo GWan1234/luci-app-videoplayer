@@ -1241,7 +1241,7 @@ printf 'duration-unknown fixture\n' > "$work/media/duration-unknown.mp4"
 rpc_token=57575757575757575757575757575757
 rpc_start_fields="$(
 	# These harness overrides are invoked indirectly by sourced RPC handlers.
-	# shellcheck disable=SC2034,SC2329
+	# shellcheck disable=SC2034,SC2317,SC2329
 	(
 		# shellcheck disable=SC1090
 		source "$rpc_harness"
@@ -1274,7 +1274,7 @@ printf '%s\n' "$rpc_start_fields" |
 
 rpc_status_fields="$(
 	# These harness overrides are invoked indirectly by the sourced status handler.
-	# shellcheck disable=SC2034,SC2329
+	# shellcheck disable=SC2034,SC2317,SC2329
 	(
 		# shellcheck disable=SC1090
 		source "$rpc_harness"
