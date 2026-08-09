@@ -21,25 +21,39 @@ CONTROL_LOCK="/tmp/videoplayer-render-v1.lock"
 WORKER_LOCK="/tmp/videoplayer-render-v1.worker.lock"
 LAYOUT="snapshot-v1"
 TOKEN_TTL=21600
-HEARTBEAT_TIMEOUT=12
+# Background tabs may throttle JavaScript timers to roughly one callback per
+# minute. Keep one extra 30-second scheduling margin before reclaiming the one
+# allowed renderer; TOKEN_TTL remains the absolute six-hour upper bound.
+HEARTBEAT_TIMEOUT=90
 STARTUP_TIMEOUT=15
 STARTUP_POLL_INTERVAL=0.1
+MEDIA_PROBE_TIMEOUT=5
+MEDIA_PROBE_LOG_MAX_BYTES=65536
+MAX_DURATION_MS=21600000
 SHORT_MEDIA_START_GRACE=5
 SHORT_MEDIA_GRACE_POLL_INTERVAL=0.25
 STOP_TIMEOUT=6
 MAX_PATH_LENGTH=4096
 MJPEG_SEGMENT_SECONDS=45
+# Once an opening boundary has been consumed it cannot be handed back to a
+# successor response. Give the worker's terminal-state poll a fresh bounded
+# window while keeping the total accepted response below the browser's 60 s
+# timeout (45 s ordinary segment + 10 s terminal/header resolution).
+MJPEG_HEADER_WAIT_SECONDS=10
+VIDEO_DRAIN_TIMEOUT=120
 MAX_AUDIO_BYTES=48000
 AUDIO_SAMPLE_RATE=48000
 AUDIO_CHANNELS=2
 AUDIO_FRAMES_PER_CHUNK=12000
 AUDIO_RING_SEGMENTS=32
+AUDIO_BATCH_MAX_SEGMENTS=8
 AUDIO_PROBE_TIMEOUT=5
 FFMPEG_LOG_MAX_BYTES=65536
 FFMPEG_LOG_HEAD_BYTES=16384
 FFMPEG_LOG_TAIL_BYTES=49151
 PRIVATE_FFMPEG_BIN="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
 PRIVATE_FFMPEG_LIB_DIR="/usr/lib/videoplayer-ffmpeg"
+MJPEG_RELAY_BIN="/usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay"
 
 FFMPEG_BIN=""
 FFMPEG_LIBRARY_PATH=""
@@ -435,6 +449,97 @@ load_status() {
 	return 0
 }
 
+write_media_info() {
+	local token="$1" duration_ms="$2" total_frames="$3" fps="$4"
+	local dir tmp expected_frames
+
+	valid_token "$token" || return 1
+	valid_decimal "$duration_ms" 10 &&
+		[ "$duration_ms" -le "$MAX_DURATION_MS" ] || return 1
+	valid_decimal "$total_frames" 10 || return 1
+	case "$fps" in
+		5|8|12|15|20|24|30|48|50|60) ;;
+		*) return 1 ;;
+	esac
+	if [ "$duration_ms" -eq 0 ]; then
+		expected_frames=0
+	else
+		expected_frames=$(((duration_ms * fps + 999) / 1000))
+	fi
+	[ "$total_frames" -eq "$expected_frames" ] || return 1
+
+	dir="$RUNTIME_DIR/s-$token"
+	tmp="$dir/.media-info.$$"
+	session_dir_is_safe "$token" || return 1
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n%s\n' \
+			"$LAYOUT" "$duration_ms" "$total_frames" "$fps" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/media-info"
+}
+
+load_media_info() {
+	local token="$1" dir version duration_ms total_frames fps extra
+	local expected_frames
+
+	MEDIA_DURATION_MS=""
+	MEDIA_TOTAL_FRAMES=""
+	valid_token "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/media-info" 600 || return 1
+	exec 7< "$dir/media-info" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r duration_ms <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r total_frames <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r fps <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+
+	[ "$version" = "$LAYOUT" ] || return 1
+	valid_decimal "$duration_ms" 10 &&
+		[ "$duration_ms" -le "$MAX_DURATION_MS" ] || return 1
+	valid_decimal "$total_frames" 10 || return 1
+	case "$fps" in
+		5|8|12|15|20|24|30|48|50|60) ;;
+		*) return 1 ;;
+	esac
+	if [ "$duration_ms" -eq 0 ]; then
+		expected_frames=0
+	else
+		expected_frames=$(((duration_ms * fps + 999) / 1000))
+	fi
+	[ "$total_frames" -eq "$expected_frames" ] || return 1
+	MEDIA_DURATION_MS="$duration_ms"
+	MEDIA_TOTAL_FRAMES="$total_frames"
+	return 0
+}
+
 write_heartbeat() {
 	local token="$1" now="$2" dir tmp
 
@@ -545,6 +650,60 @@ load_audio_state() {
 	return 0
 }
 
+write_audio_ack() {
+	local token="$1" sequence="$2" dir tmp
+
+	valid_token "$token" && valid_decimal "$sequence" 8 || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	tmp="$dir/.audio-ack.$$"
+	session_dir_is_safe "$token" || return 1
+	if safe_regular_file "$dir/audio-ack" 600; then
+		load_audio_ack "$token" || return 1
+		[ "$sequence" -ge "$AUDIO_ACK_SEQUENCE" ] || return 1
+	fi
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n' "$LAYOUT" "$sequence" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/audio-ack"
+}
+
+load_audio_ack() {
+	local token="$1" dir version sequence extra
+
+	AUDIO_ACK_SEQUENCE=""
+	valid_token "$token" || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/audio-ack" 600 || return 1
+	exec 7< "$dir/audio-ack" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r sequence <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	[ "$version" = "$LAYOUT" ] && valid_decimal "$sequence" 8 || return 1
+	AUDIO_ACK_SEQUENCE="$sequence"
+	return 0
+}
+
 write_browser_audio_capability() {
 	local token="$1" capability="$2"
 	local dir="$RUNTIME_DIR/s-$token" tmp
@@ -613,6 +772,19 @@ fixed_root_directory_is_safe() {
 	canonical="$(readlink -f -- "$path" 2>/dev/null)" || return 1
 	[ "$canonical" = "$path" ] || return 1
 	metadata="$(stat -c '%u:%a' -- "$path" 2>/dev/null)" || return 1
+	[ "$metadata" = "0:755" ]
+}
+
+mjpeg_relay_is_safe() {
+	local bin_dir resolved metadata
+
+	bin_dir="${MJPEG_RELAY_BIN%/*}"
+	fixed_root_directory_is_safe "$bin_dir" || return 1
+	[ -f "$MJPEG_RELAY_BIN" ] && [ ! -L "$MJPEG_RELAY_BIN" ] || return 1
+	resolved="$(readlink -f -- "$MJPEG_RELAY_BIN" 2>/dev/null)" || return 1
+	[ "$resolved" = "$MJPEG_RELAY_BIN" ] || return 1
+	metadata="$(stat -c '%u:%a' -- "$MJPEG_RELAY_BIN" 2>/dev/null)" ||
+		return 1
 	[ "$metadata" = "0:755" ]
 }
 
@@ -743,13 +915,15 @@ probe_selected_audio() {
 
 	output="$(invoke_selected_ffmpeg -hide_banner -muxers 2>/dev/null)" ||
 		return 1
-	printf '%s\n' "$output" |
-		grep -Eq '^[[:space:]]*E[[:space:]]+s16le([[:space:]]|$)' ||
-		return 1
+	for component in s16le tee; do
+		printf '%s\n' "$output" |
+			grep -Eq "^[[:space:]]*E[[:space:]]+${component}([[:space:]]|$)" ||
+			return 1
+	done
 
 	output="$(invoke_selected_ffmpeg -hide_banner -filters 2>/dev/null)" ||
 		return 1
-	for component in aresample aformat asetnsamples; do
+	for component in aresample aformat apad asetnsamples; do
 		printf '%s\n' "$output" |
 			grep -Eq "^[[:space:]]*[^[:space:]]+[[:space:]]+${component}[[:space:]]" ||
 			return 1
@@ -1056,8 +1230,9 @@ load_worker_identity() {
 
 process_matches_ffmpeg_role() {
 	local pid="$1" start="$2" token="$3" role="$4"
-	local actual arg1 output
+	local actual arg1 output video_output audio_output boundary tee_output
 
+	valid_token "$token" || return 1
 	actual="$(process_start_time "$pid" 2>/dev/null)" || return 1
 	[ "$actual" = "$start" ] || return 1
 	[ -r "/proc/$pid/cmdline" ] || return 1
@@ -1066,13 +1241,21 @@ process_matches_ffmpeg_role() {
 		ffmpeg|/usr/bin/ffmpeg|"$PRIVATE_FFMPEG_BIN") ;;
 		*) return 1 ;;
 	esac
+	video_output="$RUNTIME_DIR/s-$token/video.pipe"
+	audio_output="$RUNTIME_DIR/s-$token/audio.pipe"
+	boundary="videoplayer-$token"
+	tee_output="[select=v:f=mpjpeg:boundary_tag=$boundary]$video_output|[select=a:f=s16le:onfail=ignore]$audio_output"
 	case "$role" in
-		video) output="$RUNTIME_DIR/s-$token/video.pipe" ;;
-		audio) output="$RUNTIME_DIR/s-$token/audio.pipe" ;;
+		video) output="$video_output" ;;
+		audio) output="$audio_output" ;;
 		*) return 1 ;;
 	esac
+	# Video-only/legacy workers expose their FIFO as one complete argv item.
+	# The unified A/V worker exposes both fixed, token-derived paths in one
+	# exact tee target. Never use a substring match here: this predicate gates
+	# signals sent by orphan cleanup and must not accept an unrelated process.
 	tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null |
-		grep -Fqx -- "$output"
+		grep -Fqx -e "$output" -e "$tee_output"
 }
 
 process_matches_ffmpeg() {
@@ -1310,6 +1493,102 @@ validate_source_path() {
 	return 0
 }
 
+duration_ms_from_probe_log() {
+	local path="$1"
+
+	safe_regular_file "$path" 600 || return 1
+	awk -v maximum="$MAX_DURATION_MS" '
+		substr($0, 1, 12) == "  Duration: " {
+			value = substr($0, 13)
+			separator = index(value, ", start: ")
+			if (!separator)
+				next
+			value = substr(value, 1, separator - 1)
+			if (value == "N/A")
+				next
+			if (split(value, hms, ":") != 3 ||
+			    hms[1] !~ /^[0-9]+$/ ||
+			    length(hms[2]) != 2 || hms[2] !~ /^[0-9][0-9]$/ ||
+			    hms[2] + 0 > 59 ||
+			    split(hms[3], second, /\./) != 2 ||
+			    length(second[1]) != 2 ||
+			    second[1] !~ /^[0-9][0-9]$/ || second[1] + 0 > 59 ||
+			    second[2] !~ /^[0-9]+$/ || length(second[2]) > 9)
+				next
+			fraction = substr(second[2] "000", 1, 3) + 0
+			seconds_total = (hms[1] + 0) * 3600
+			seconds_total += (hms[2] + 0) * 60
+			seconds_total += second[1] + 0
+			milliseconds = seconds_total * 1000 + fraction
+			if (milliseconds >= 1 && milliseconds <= maximum) {
+				printf "%.0f\n", milliseconds
+				found = 1
+				exit
+			}
+		}
+		END { if (!found) exit 1 }
+	' "$path" 2>/dev/null
+}
+
+probe_source_media_info() {
+	local token="$1" fps="$2" dir log duration_ms=0 total_frames=0
+
+	valid_token "$token" || return 1
+	case "$fps" in
+		5|8|12|15|20|24|30|48|50|60) ;;
+		*) return 1 ;;
+	esac
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	log="$dir/.media-probe.$$"
+	rm -f -- "$log" 2>/dev/null || return 1
+	(umask 077; : > "$log") || return 1
+	chmod 0600 "$log" 2>/dev/null || {
+		rm -f -- "$log" 2>/dev/null || :
+		return 1
+	}
+
+	# FFprobe is intentionally absent from the compact runtime. FFmpeg prints
+	# container duration while opening the already-verified descriptor, before
+	# rejecting the deliberately missing output. Keep all probe output bounded;
+	# this invocation has no configured media output, so stdout carries no frames.
+	(
+		if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
+			timeout -k 1 "$MEDIA_PROBE_TIMEOUT" \
+				env LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
+				"$FFMPEG_BIN" \
+				-hide_banner -loglevel info -nostats -nostdin \
+				-protocol_whitelist file,pipe \
+				-i /proc/self/fd/3 \
+				4<&- 5<&- 6<&- 7<&- 8<&- 9<&- \
+				</dev/null 2>&1
+		else
+			timeout -k 1 "$MEDIA_PROBE_TIMEOUT" \
+				"$FFMPEG_BIN" \
+				-hide_banner -loglevel info -nostats -nostdin \
+				-protocol_whitelist file,pipe \
+				-i /proc/self/fd/3 \
+				4<&- 5<&- 6<&- 7<&- 8<&- 9<&- \
+				</dev/null 2>&1
+		fi
+	) | head -c "$MEDIA_PROBE_LOG_MAX_BYTES" \
+		3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&- > "$log"
+	chmod 0600 "$log" 2>/dev/null || {
+		rm -f -- "$log" 2>/dev/null || :
+		return 1
+	}
+	if duration_ms="$(duration_ms_from_probe_log "$log" 2>/dev/null)" &&
+	   valid_decimal "$duration_ms" 10 &&
+	   [ "$duration_ms" -le "$MAX_DURATION_MS" ]; then
+		total_frames=$(((duration_ms * fps + 999) / 1000))
+	else
+		duration_ms=0
+		total_frames=0
+	fi
+	rm -f -- "$log" 2>/dev/null || :
+	write_media_info "$token" "$duration_ms" "$total_frames" "$fps"
+}
+
 probe_source_audio() {
 	local token="$1" dir tmp rc size
 
@@ -1406,6 +1685,65 @@ audio_file_is_valid() {
 	[ "$size" -eq "$MAX_AUDIO_BYTES" ]
 }
 
+open_audio_file() {
+	local token="$1" sequence="$2" dir path opened metadata kind size
+
+	valid_token "$token" && valid_decimal "$sequence" 8 || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	path="$dir/audio-$(printf '%08d' "$sequence").pcm"
+	[ -f "$path" ] && [ ! -L "$path" ] || return 1
+	exec 7< "$path" || return 1
+	opened="$(readlink -f -- /proc/self/fd/7 2>/dev/null)" || {
+		exec 7<&-
+		return 1
+	}
+	case "$opened" in
+		"$path"|"$path (deleted)") ;;
+		*)
+			exec 7<&-
+			return 1
+			;;
+	esac
+	metadata="$(stat -L -c '%F:%s:%u:%a' -- /proc/self/fd/7 2>/dev/null)" || {
+		exec 7<&-
+		return 1
+	}
+	kind="${metadata%%:*}"
+	metadata="${metadata#*:}"
+	size="${metadata%%:*}"
+	metadata="${metadata#*:}"
+	if [ "$kind" != "regular file" ] ||
+	   ! valid_decimal "$size" 10 ||
+	   [ "$size" -ne "$MAX_AUDIO_BYTES" ] ||
+	   [ "$metadata" != "0:600" ]; then
+		exec 7<&-
+		return 1
+	fi
+	return 0
+}
+
+delete_audio_before() {
+	local token="$1" before="$2" dir path name sequence
+
+	valid_token "$token" && valid_decimal "$before" 8 || return 1
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	for path in "$dir"/audio-????????.pcm; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		[ -f "$path" ] && [ ! -L "$path" ] &&
+			safe_regular_file "$path" 600 || return 1
+		name="${path##*/}"
+		sequence="${name#audio-}"
+		sequence="${sequence%.pcm}"
+		[ "${#sequence}" -eq 8 ] || return 1
+		sequence="$(normalize_audio_sequence "$sequence" 2>/dev/null)" || return 1
+		if [ "$sequence" -lt "$before" ]; then
+			rm -f -- "$path" 2>/dev/null || return 1
+		fi
+	done
+	return 0
+}
+
 safe_audio_fifo() {
 	local path="$1" canonical metadata
 
@@ -1438,7 +1776,7 @@ audio_published_high() {
 	AUDIO_PUBLISHED_HIGH=""
 	load_audio_state "$token" || return 1
 	case "$AUDIO_STATE" in
-		unavailable) return 1 ;;
+		unavailable|error) return 1 ;;
 	esac
 	audio_sequence_bounds "$token" || return 1
 	# The chunker publishes only complete 48,000-byte files with an atomic
@@ -1451,6 +1789,7 @@ cmd_audio_chunker() {
 	local token="$1" worker_pid="$2" worker_start="$3"
 	local dir pipe sequence=0 padded destination tmp size oldest_sequence oldest
 	local pid start reader_pid="" watchdog_pid="" stopping=0
+	local capacity_failed=0 capacity_full=0
 
 	valid_token "$token" &&
 		valid_decimal "$worker_pid" 10 &&
@@ -1460,6 +1799,8 @@ cmd_audio_chunker() {
 	dir="$RUNTIME_DIR/s-$token"
 	pipe="$dir/audio.pipe"
 	safe_audio_fifo "$pipe" || exit 1
+	ensure_lock_file "$dir/audio.lock" || exit 1
+	exec 8< "$dir/audio.lock" || exit 1
 	[ "$(
 		stat -L -c '%d:%i:%F' -- /proc/self/fd/0 2>/dev/null
 	)" = "$(
@@ -1518,18 +1859,40 @@ cmd_audio_chunker() {
 		destination="$dir/audio-$padded.pcm"
 		tmp="$dir/.audio-$padded.$$"
 
-		# Keep staging inside the same hard limit as published audio. Removing
-		# the oldest block before reading means 31 complete files plus at most
-		# one partial temp file can exist even if this process is SIGKILLed.
+		# Capacity is checked before another FIFO read. Unacknowledged PCM must
+		# never be overwritten: a full ring backpressures this shared FFmpeg
+		# process, keeping audio and video on the same producer clock while the
+		# browser owns the long prebuffer.
 		if [ "$sequence" -ge "$AUDIO_RING_SEGMENTS" ]; then
 			oldest_sequence=$((sequence - AUDIO_RING_SEGMENTS))
 			oldest="$dir/audio-$(printf '%08d' "$oldest_sequence").pcm"
-			if [ -e "$oldest" ] || [ -L "$oldest" ]; then
-				if ! safe_regular_file "$oldest" 600 ||
-				   ! rm -f -- "$oldest" 2>/dev/null; then
-					stopping=1
-					break
+			capacity_failed=0
+			capacity_full=0
+			flock -x 8 || capacity_failed=1
+			if [ "$capacity_failed" -eq 0 ]; then
+				load_audio_ack "$token" || capacity_failed=1
+			fi
+			if [ "$capacity_failed" -eq 0 ]; then
+				if [ -e "$oldest" ] || [ -L "$oldest" ]; then
+					if ! safe_regular_file "$oldest" 600; then
+						capacity_failed=1
+					elif [ "$oldest_sequence" -lt "$AUDIO_ACK_SEQUENCE" ]; then
+						rm -f -- "$oldest" 2>/dev/null || capacity_failed=1
+					else
+						capacity_full=1
+					fi
+				elif [ "$oldest_sequence" -ge "$AUDIO_ACK_SEQUENCE" ]; then
+					capacity_failed=1
 				fi
+			fi
+			flock -u 8 2>/dev/null || capacity_failed=1
+			if [ "$capacity_failed" -ne 0 ]; then
+				stopping=1
+				break
+			fi
+			if [ "$capacity_full" -eq 1 ]; then
+				sleep 0.05
+				continue
 			fi
 		fi
 		if ! rm -f -- "$tmp"; then
@@ -1690,6 +2053,80 @@ load_video_clock() {
 	return 0
 }
 
+write_video_drain_marker() {
+	local token="$1" nonce="$2" state="$3" dir path tmp
+
+	valid_token "$token" && valid_cgi_nonce "$nonce" || return 1
+	case "$state" in
+		ready) path="video-drain-ready" ;;
+		complete) path="video-drained" ;;
+		*) return 1 ;;
+	esac
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	tmp="$dir/.$path.$$"
+	rm -f -- "$tmp" || return 1
+	if ! (
+		umask 077
+		printf '%s\n%s\n%s\n%s\n' \
+			"$LAYOUT" "$token" "$nonce" "$state" > "$tmp"
+	); then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	chmod 0600 "$tmp" 2>/dev/null || {
+		rm -f -- "$tmp"
+		return 1
+	}
+	mv -f -- "$tmp" "$dir/$path"
+}
+
+load_video_drain_marker() {
+	local token="$1" expected="$2" expected_nonce="${3:-}" dir path
+	local version stored_token stored_nonce state extra
+
+	VIDEO_DRAIN_MARKER_NONCE=""
+	valid_token "$token" || return 1
+	[ -z "$expected_nonce" ] || valid_cgi_nonce "$expected_nonce" || return 1
+	case "$expected" in
+		ready) path="video-drain-ready" ;;
+		complete) path="video-drained" ;;
+		*) return 1 ;;
+	esac
+	dir="$RUNTIME_DIR/s-$token"
+	session_dir_is_safe "$token" || return 1
+	safe_regular_file "$dir/$path" 600 || return 1
+	exec 7< "$dir/$path" || return 1
+	IFS= read -r version <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_token <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r stored_nonce <&7 || {
+		exec 7<&-
+		return 1
+	}
+	IFS= read -r state <&7 || {
+		exec 7<&-
+		return 1
+	}
+	if IFS= read -r extra <&7; then
+		: "$extra"
+		exec 7<&-
+		return 1
+	fi
+	exec 7<&-
+	[ "$version" = "$LAYOUT" ] && [ "$stored_token" = "$token" ] &&
+		valid_cgi_nonce "$stored_nonce" &&
+		{ [ -z "$expected_nonce" ] || [ "$stored_nonce" = "$expected_nonce" ]; } &&
+		[ "$state" = "$expected" ] || return 1
+	VIDEO_DRAIN_MARKER_NONCE="$stored_nonce"
+	return 0
+}
+
 cmd_worker() {
 	local token="$1" dir video_pipe boundary cr prefetch prefetch_tmp
 	local prefetch_pid="" prefetch_start="" prefetch_rc=1 prefetch_launching=0
@@ -1699,6 +2136,7 @@ cmd_worker() {
 	local drain_pid="" drain_start="" drain_launching=0
 	local audio_pipe audio_capable=0 audio_running_written=0 audio_finalized=0
 	local audio_failed=0 chunker_launching=0 audio_anchor_open=0
+	local fallback_audio_state=""
 	local audio_standby_open=0 audio_file last_audio router_fps ffmpeg_launching=0
 	local audio_path_metadata audio_standby_metadata
 	local running_written=0 stopping=0 failure_reason=""
@@ -1706,6 +2144,8 @@ cmd_worker() {
 	local video_reader_open=0 video_path_metadata video_anchor_metadata
 	local video_reader_metadata
 	local video_started_cs="" short_media_deadline_cs="" current_cs=""
+	local video_drain_deadline_cs="" terminal_status_written=0
+	local video_drain_nonce=""
 	local prefetch_line extra _audio_wait _chunker_wait _prefetch_wait
 
 	valid_token "$token" || exit 2
@@ -1740,7 +2180,8 @@ cmd_worker() {
 	rm -f -- "$dir/frame.jpg" "$dir/frame.jpg.tmp" \
 		"$video_pipe" "$prefetch" "$prefetch_tmp" "$log_pipe" "$log_file" \
 		"$dir/audio-state" "$dir/audio" "$dir/chunker" "$audio_pipe" \
-		"$dir/video-clock" "$dir/browser-audio-capability" \
+		"$dir/video-clock" "$dir/browser-audio-capability" "$dir/media-info" \
+		"$dir/video-drain-ready" "$dir/video-drained" \
 		2>/dev/null || :
 	for audio_file in "$dir"/audio-????????.pcm; do
 		if [ ! -f "$audio_file" ] || [ -L "$audio_file" ]; then
@@ -1748,6 +2189,11 @@ cmd_worker() {
 		fi
 		rm -f -- "$audio_file" 2>/dev/null || :
 	done
+	if ! probe_source_media_info "$token" "$router_fps"; then
+		write_status "$token" error "Cannot publish media duration" 2>/dev/null || :
+		exec 3<&-
+		exit 1
+	fi
 	if probe_selected_audio && probe_source_audio "$token"; then
 		audio_capable=1
 	fi
@@ -1806,8 +2252,32 @@ cmd_worker() {
 		return 1
 	}
 
+	write_audio_state_locked() {
+		local state="$1" attempts=0 result=1
+
+		# Serialize every state transition which can race a live PCM response.
+		# A killed CGI must not retain this lock through its body-copy child;
+		# cmd_audio_cgi() closes descriptor 8 explicitly before spawning dd.
+		ensure_lock_file "$dir/audio.lock" || return 1
+		exec 6< "$dir/audio.lock" || return 1
+		while ! flock -xn 6 2>/dev/null; do
+			attempts=$((attempts + 1))
+			if [ "$attempts" -ge "$STOP_TIMEOUT" ] ||
+			   ! worker_current "$token"; then
+				exec 6<&-
+				return 1
+			fi
+			sleep 1
+		done
+		if write_audio_state "$token" "$state" 2>/dev/null; then
+			result=0
+		fi
+		exec 6<&-
+		return "$result"
+	}
+
 	finalize_audio_state() {
-		local producer_rc="$1" final_chunker_rc="$2"
+		local producer_rc="$1" final_chunker_rc="$2" final_state
 
 		rm -f -- "$dir/audio" "$dir/chunker" "$audio_pipe" \
 			2>/dev/null || :
@@ -1816,16 +2286,17 @@ cmd_worker() {
 		   audio_sequence_bounds "$token"; then
 			last_audio="$dir/audio-$(printf '%08d' "$AUDIO_HIGHEST").pcm"
 			if audio_file_is_valid "$last_audio"; then
-				write_audio_state "$token" ended 2>/dev/null || :
+				final_state=ended
 				audio_running_written=1
 			else
-				write_audio_state "$token" error 2>/dev/null || :
+				final_state=error
 			fi
 		elif [ "$audio_running_written" -eq 1 ]; then
-			write_audio_state "$token" error 2>/dev/null || :
+			final_state=error
 		else
-			write_audio_state "$token" unavailable 2>/dev/null || :
+			final_state=unavailable
 		fi
+		write_audio_state_locked "$final_state" || return 1
 		audio_finalized=1
 	}
 
@@ -2277,41 +2748,67 @@ cmd_worker() {
 		-loglevel error \
 		-nostats \
 		-nostdin \
-		-re \
-		-protocol_whitelist file,pipe \
-		-threads 2 \
-		-fflags +genpts \
-		-err_detect ignore_err \
-		-filter_threads 1 \
-		-i /proc/self/fd/3
+		-filter_threads 1
 	if [ "$audio_capable" -eq 1 ]; then
+		# Two independently opened demux contexts prevent an overlong audio
+		# stream in one container from delaying video-stream EOF until the
+		# entire container has been consumed. They both refer to the worker's
+		# immutable source descriptor; decoding still occurs in one FFmpeg
+		# process, and only the selected stream from each context is decoded.
+		# The tee parent is one logical A/V output even though each slave gets
+		# only its selected stream. Infinite silence padding makes video the
+		# shortest stream: -shortest therefore cuts overlong audio at video EOF,
+		# while a short audio track is padded instead of truncating long video.
+		# Keeping both slaves under one muxer also preserves the shared producer
+		# clock and the existing bounded backpressure across both FIFOs.
 		set -- "$@" \
-			-map 0:a:0 \
-			-vn \
+			-protocol_whitelist file,pipe \
+			-threads 2 \
+			-fflags +genpts \
+			-err_detect ignore_err \
+			-i /proc/self/fd/3 \
+			-protocol_whitelist file,pipe \
+			-threads 1 \
+			-fflags +genpts \
+			-err_detect ignore_err \
+			-i /proc/self/fd/3 \
+			-map 0:V:0 \
+			-map 1:a:0 \
 			-sn \
 			-dn \
 			-map_metadata -1 \
-			-af "aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,asetnsamples=n=${AUDIO_FRAMES_PER_CHUNK}:p=1" \
-			-threads 1 \
+			-vf "fps=fps=$router_fps:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
+			-af "aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=${AUDIO_FRAMES_PER_CHUNK}:p=1" \
+			-threads:v 1 \
+			-threads:a 1 \
+			-c:v mjpeg \
+			-q:v 8 \
 			-c:a pcm_s16le \
+			-shortest \
 			-flush_packets 1 \
-			-f s16le \
-			"$audio_pipe"
+			-f tee \
+			"[select=v:f=mpjpeg:boundary_tag=$boundary]$video_pipe|[select=a:f=s16le:onfail=ignore]$audio_pipe"
+	else
+		set -- "$@" \
+			-protocol_whitelist file,pipe \
+			-threads 2 \
+			-fflags +genpts \
+			-err_detect ignore_err \
+			-i /proc/self/fd/3 \
+			-map 0:V:0 \
+			-an \
+			-sn \
+			-dn \
+			-map_metadata -1 \
+			-vf "fps=fps=$router_fps:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
+			-threads 1 \
+			-c:v mjpeg \
+			-q:v 8 \
+			-flush_packets 1 \
+			-f mpjpeg \
+			-boundary_tag "$boundary" \
+			"$video_pipe"
 	fi
-	set -- "$@" \
-		-map 0:V:0 \
-		-an \
-		-sn \
-		-dn \
-		-map_metadata -1 \
-		-vf "fps=fps=$router_fps:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
-		-threads 1 \
-		-c:v mjpeg \
-		-q:v 8 \
-		-flush_packets 1 \
-		-f mpjpeg \
-		-boundary_tag "$boundary" \
-		"$video_pipe"
 	ffmpeg_launching=1
 	if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
 		LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
@@ -2374,7 +2871,7 @@ cmd_worker() {
 		fi
 		if [ "$running_written" -eq 0 ]; then
 			[ $((now - HEARTBEAT_TIME)) -le \
-			  $((STARTUP_TIMEOUT + AUDIO_PROBE_TIMEOUT + 3)) ] || {
+			  $((STARTUP_TIMEOUT + MEDIA_PROBE_TIMEOUT + AUDIO_PROBE_TIMEOUT + 3)) ] || {
 				kill -TERM "$ffmpeg_pid" 2>/dev/null || :
 				stopping=1
 				break
@@ -2398,16 +2895,29 @@ cmd_worker() {
 						exec 4<&-
 						audio_standby_open=0
 					fi
-					finalize_audio_state 0 "$chunker_rc"
+					if ! finalize_audio_state 0 "$chunker_rc"; then
+						failure_reason="Cannot publish final audio state"
+						kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+						break
+					fi
 				else
 					audio_failed=1
-					if [ "$audio_running_written" -eq 1 ]; then
-						write_audio_state "$token" error 2>/dev/null || :
-					else
-						write_audio_state "$token" unavailable 2>/dev/null || :
-					fi
 					if ! start_audio_drain; then
 						failure_reason="Cannot preserve video after audio pipeline failure"
+						kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+						break
+					fi
+					# Publish the browser-fallback state only after the verified
+					# sink owns the tee audio slave. This keeps the authenticated
+					# 409 response from promising preserved CPU video during the
+					# narrow interval in which drain startup could still fail.
+					if [ "$audio_running_written" -eq 1 ]; then
+						fallback_audio_state=error
+					else
+						fallback_audio_state=unavailable
+					fi
+					if ! write_audio_state_locked "$fallback_audio_state"; then
+						failure_reason="Cannot publish audio fallback state"
 						kill -TERM "$ffmpeg_pid" 2>/dev/null || :
 						break
 					fi
@@ -2417,8 +2927,12 @@ cmd_worker() {
 				if [ "$audio_running_written" -eq 0 ] &&
 				   audio_file_is_valid "$dir/audio-00000000.pcm" &&
 				   audio_file_is_valid "$dir/audio-00000001.pcm"; then
-					if write_audio_state "$token" running; then
-						audio_running_written=1
+					audio_running_written=1
+					if ! write_audio_state_locked running; then
+						audio_running_written=0
+						failure_reason="Cannot publish running audio state"
+						kill -TERM "$ffmpeg_pid" 2>/dev/null || :
+						break
 					fi
 				fi
 			fi
@@ -2484,7 +2998,9 @@ cmd_worker() {
 	if [ "$audio_capable" -eq 1 ] &&
 	   [ "$audio_finalized" -eq 0 ] &&
 	   [ "$audio_failed" -eq 0 ]; then
-		finalize_audio_state "$rc" "$chunker_rc"
+		if ! finalize_audio_state "$rc" "$chunker_rc"; then
+			failure_reason="Cannot publish final audio state"
+		fi
 	fi
 	rm -f -- "$dir/audio" "$dir/chunker" "$audio_pipe" 2>/dev/null || :
 	if [ "$stopping" -eq 0 ] &&
@@ -2502,7 +3018,7 @@ cmd_worker() {
 		   load_heartbeat "$token" &&
 		   [ "$HEARTBEAT_TIME" -le "$now" ] &&
 		   [ $((now - HEARTBEAT_TIME)) -le \
-		     $((STARTUP_TIMEOUT + AUDIO_PROBE_TIMEOUT + 3)) ]; then
+		     $((STARTUP_TIMEOUT + MEDIA_PROBE_TIMEOUT + AUDIO_PROBE_TIMEOUT + 3)) ]; then
 			observe_video_prefetch "$now" || :
 		fi
 	fi
@@ -2531,6 +3047,74 @@ cmd_worker() {
 			sleep "$SHORT_MEDIA_GRACE_POLL_INTERVAL"
 		done
 	fi
+	if [ "$stopping" -eq 0 ] &&
+	   [ -z "$failure_reason" ] &&
+	   [ "$rc" -eq 0 ] &&
+	   [ "$running_written" -eq 1 ]; then
+		# Publish terminal state while retaining the FIFO's final writer. A CGI
+		# which was already streaming, or the explicit drain request opened by the
+		# browser, first opens its verified read descriptor and then writes the
+		# root-owned ready marker. Only then may this worker close the anchor: the
+		# reader receives every queued byte followed by a real EOF.
+		if ! write_status "$token" ended "End of video"; then
+			failure_reason="Cannot publish terminal renderer state"
+		else
+			terminal_status_written=1
+			current_cs="$(monotonic_centiseconds 2>/dev/null)" ||
+				current_cs=""
+			if ! valid_decimal "$current_cs" 18; then
+				failure_reason="Cannot initialize terminal video drain clock"
+			else
+				# Claim and completion share one monotonic deadline. The worker can
+				# therefore never retain the final FIFO writer for more than two
+				# minutes in total, even if the browser claims it near the limit.
+				video_drain_deadline_cs=$((current_cs +
+					VIDEO_DRAIN_TIMEOUT * 100))
+				while ! load_video_drain_marker "$token" ready 2>/dev/null; do
+					worker_current "$token" || {
+						stopping=1
+						break
+					}
+					current_cs="$(monotonic_centiseconds 2>/dev/null)" || {
+						failure_reason="Cannot read terminal video drain clock"
+						break
+					}
+					if [ "$current_cs" -ge "$video_drain_deadline_cs" ]; then
+						failure_reason="Browser did not claim the terminal video drain"
+						break
+					fi
+					sleep 0.1
+				done
+				if [ "$stopping" -eq 0 ] && [ -z "$failure_reason" ]; then
+					video_drain_nonce="$VIDEO_DRAIN_MARKER_NONCE"
+					valid_cgi_nonce "$video_drain_nonce" ||
+						failure_reason="Terminal video drain nonce is invalid"
+				fi
+			fi
+			if [ "$stopping" -eq 0 ] && [ -z "$failure_reason" ]; then
+				if [ "$video_anchor_open" -eq 1 ]; then
+					exec 9>&-
+					video_anchor_open=0
+				fi
+				while ! load_video_drain_marker \
+					"$token" complete "$video_drain_nonce" 2>/dev/null; do
+					worker_current "$token" || {
+						stopping=1
+						break
+					}
+					current_cs="$(monotonic_centiseconds 2>/dev/null)" || {
+						failure_reason="Cannot read final video drain clock"
+						break
+					}
+					if [ "$current_cs" -ge "$video_drain_deadline_cs" ]; then
+						failure_reason="Browser did not finish the terminal video drain"
+						break
+					fi
+					sleep 0.1
+				done
+			fi
+		fi
+	fi
 	if [ "$video_anchor_open" -eq 1 ]; then
 		exec 9>&-
 		video_anchor_open=0
@@ -2543,8 +3127,10 @@ cmd_worker() {
 	ffmpeg_pid=""
 	rm -f -- "$dir/ffmpeg" 2>/dev/null || :
 	rm -f -- "$log_pipe" "$log_file" "$video_pipe" "$prefetch" \
-		"$prefetch_tmp" 2>/dev/null || :
-	exec 3<&-
+		"$prefetch_tmp" "$dir/video-drain-ready" 2>/dev/null || :
+	if [ -n "$failure_reason" ] || [ "$stopping" -eq 1 ]; then
+		rm -f -- "$dir/video-drained" 2>/dev/null || :
+	fi
 
 	if worker_current "$token" 2>/dev/null; then
 		if [ -n "$failure_reason" ]; then
@@ -2552,11 +3138,37 @@ cmd_worker() {
 		elif [ "$stopping" -eq 1 ]; then
 			write_status "$token" stopped "Renderer stopped" 2>/dev/null || :
 		elif [ "$rc" -eq 0 ] && [ "$running_written" -eq 1 ]; then
-			write_status "$token" ended "End of video" 2>/dev/null || :
+			[ "$terminal_status_written" -eq 1 ] ||
+				write_status "$token" ended "End of video" 2>/dev/null || :
 		else
 			write_status "$token" error "FFmpeg pipeline failed" 2>/dev/null || :
 		fi
 	fi
+	if [ "$stopping" -eq 0 ] && [ -z "$failure_reason" ] &&
+	   [ "$rc" -eq 0 ] && [ "$running_written" -eq 1 ] &&
+	   [ "$terminal_status_written" -eq 1 ]; then
+		# Keep only the validated source fd, worker identity, and global worker
+		# lock after a clean terminal drain. Buffered playback may activate the
+		# protected browser-audio fallback minutes after FFmpeg has finished, and
+		# later HTML-media Range requests still need the same immutable open file.
+		# Authenticated status-touch calls renew this lease; page close, Stop,
+		# replacement, 90 seconds without a touch, or the six-hour token expiry
+		# releases it deterministically.
+		while :; do
+			now="$(date +%s 2>/dev/null)" || break
+			valid_decimal "$now" 12 || break
+			load_current 2>/dev/null || break
+			[ "$CURRENT_TOKEN" = "$token" ] &&
+				[ "$CURRENT_EXPIRY" -gt "$now" ] || break
+			load_status "$token" 2>/dev/null || break
+			[ "$SESSION_STATUS" = "ended" ] || break
+			load_heartbeat "$token" 2>/dev/null || break
+			[ "$HEARTBEAT_TIME" -le "$now" ] &&
+				[ $((now - HEARTBEAT_TIME)) -le "$HEARTBEAT_TIMEOUT" ] || break
+			sleep 1
+		done
+	fi
+	exec 3<&-
 	exit 0
 }
 
@@ -2626,7 +3238,9 @@ cmd_start() {
 	if ! write_session_request "$token" "$expiry" "$path" ||
 	   ! write_status "$token" starting "" ||
 	   ! write_heartbeat "$token" "$now" ||
+	   ! write_audio_ack "$token" 0 ||
 	   ! ensure_lock_file "$dir/stream.lock" ||
+	   ! ensure_lock_file "$dir/audio.lock" ||
 	   ! write_current "$token" "$expiry"; then
 		remove_session_dir "$token" 2>/dev/null || :
 		rm -f -- "$CURRENT_FILE" 2>/dev/null || :
@@ -2657,10 +3271,10 @@ cmd_start() {
 	}
 
 	i=0
-	# The worker can spend AUDIO_PROBE_TIMEOUT validating a real audio frame
-	# before the independent MJPEG startup timeout begins. Keep this outer
-	# controller alive for both bounded phases plus scheduling overhead.
-	while [ "$i" -lt $((STARTUP_TIMEOUT + AUDIO_PROBE_TIMEOUT + 2)) ]; do
+	# The worker can spend both probe deadlines reading safe metadata and one
+	# real audio frame before the independent MJPEG startup timeout begins.
+	while [ "$i" -lt \
+		$((STARTUP_TIMEOUT + MEDIA_PROBE_TIMEOUT + AUDIO_PROBE_TIMEOUT + 2)) ]; do
 		if load_current 2>/dev/null && [ "$CURRENT_TOKEN" = "$token" ] &&
 		   load_status "$token" 2>/dev/null; then
 			case "$SESSION_STATUS" in
@@ -2749,6 +3363,90 @@ cmd_status() {
 	printf '%s\n' "$SESSION_STATUS"
 }
 
+cmd_status_touch() {
+	local token="$1" state now
+
+	valid_token "$token" || return 1
+	state="$(cmd_status "$token")" || return 1
+	case "$state" in
+		ended)
+			now="$(date +%s 2>/dev/null)" || return 1
+			valid_decimal "$now" 12 || return 1
+			load_current || return 1
+			[ "$CURRENT_TOKEN" = "$token" ] &&
+				[ "$CURRENT_EXPIRY" -gt "$now" ] || return 1
+			# A clean worker deliberately remains alive after terminal video drain
+			# to hold fd 3 for later protected browser-audio Range requests. Renew
+			# only after the exact current worker and source descriptor revalidate;
+			# an ordinary ended session with no live holder remains a clean result.
+			if load_live_source "$token" 2>/dev/null; then
+				refresh_heartbeat "$token" "$now" || return 1
+				state="$(cmd_status "$token")" || return 1
+			fi
+			;;
+		starting|running)
+			now="$(date +%s 2>/dev/null)" || return 1
+			valid_decimal "$now" 12 || return 1
+			load_current || return 1
+			[ "$CURRENT_TOKEN" = "$token" ] &&
+				[ "$CURRENT_EXPIRY" -gt "$now" ] || return 1
+			load_status "$token" || return 1
+			case "$SESSION_STATUS" in
+				ended)
+					# A clean producer may finish between cmd_status() above
+					# and this authenticated revalidation. Renew the newly
+					# terminal source holder through the same exact fd/process
+					# validation used by an initially ended touch.
+					if load_live_source "$token" 2>/dev/null; then
+						refresh_heartbeat "$token" "$now" || return 1
+					fi
+					printf '%s\n' "$SESSION_STATUS"
+					return 0
+					;;
+				error|stopped)
+					# Return the newer terminal state instead of converting a
+					# normal transition into an RPC transport error.
+					printf '%s\n' "$SESSION_STATUS"
+					return 0
+					;;
+				starting|running) state="$SESSION_STATUS" ;;
+				*) return 1 ;;
+			esac
+			if ! load_worker_identity "$token" worker ||
+			   ! process_matches_worker \
+				"$WORKER_PID" "$WORKER_START" "$token"; then
+				# Close the second race window: worker teardown writes the
+				# terminal status before its process exits. Re-read through
+				# cmd_status(), which also validates current token and expiry.
+				state="$(cmd_status "$token")" || return 1
+				case "$state" in
+					ended|error|stopped|expired|inactive)
+						printf '%s\n' "$state"
+						return 0
+						;;
+					*) return 1 ;;
+				esac
+			fi
+			refresh_heartbeat "$token" "$now" || return 1
+			# Report a terminal transition that happened while the lease
+			# was refreshed; stale "running" would make the browser open an
+			# unnecessary successor stream at EOF.
+			state="$(cmd_status "$token")" || return 1
+			;;
+	esac
+	printf '%s\n' "$state"
+}
+
+cmd_media_info() {
+	local token="$1"
+
+	valid_token "$token" || return 1
+	load_current || return 1
+	[ "$CURRENT_TOKEN" = "$token" ] || return 1
+	load_media_info "$token" || return 1
+	printf '%s\t%s\n' "$MEDIA_DURATION_MS" "$MEDIA_TOTAL_FRAMES"
+}
+
 load_live_source() {
 	local token="$1" metadata device inode size
 
@@ -2757,7 +3455,10 @@ load_live_source() {
 	valid_token "$token" || return 1
 	worker_current "$token" || return 1
 	load_status "$token" || return 1
-	[ "$SESSION_STATUS" = "running" ] || return 1
+	case "$SESSION_STATUS" in
+		running|ended) ;;
+		*) return 1 ;;
+	esac
 	load_worker_identity "$token" worker || return 1
 	process_matches_worker "$WORKER_PID" "$WORKER_START" "$token" || return 1
 	load_session_request "$token" || return 1
@@ -2781,6 +3482,28 @@ load_live_source() {
 	worker_current "$token" || return 1
 	LIVE_SOURCE_ID="$device:$inode:$size"
 	return 0
+}
+
+live_audio_fallback_is_safe() {
+	local token="$1"
+
+	# The trusted unavailable response is useful only while the current worker
+	# still owns the validated source descriptor. This includes the bounded
+	# terminal-drain window after video status becomes ended, but never a stale
+	# ended session whose worker has already exited.
+	load_audio_state "$token" || return 1
+	case "$AUDIO_STATE" in
+		unavailable|error) ;;
+		*) return 1 ;;
+	esac
+	load_live_source "$token" || return 1
+	# Re-read after the process/current/source checks. Post-start writers use
+	# audio.lock, so a caller holding that lock gets a stable terminal snapshot.
+	load_audio_state "$token" || return 1
+	case "$AUDIO_STATE" in
+		unavailable|error) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 cmd_source() {
@@ -2927,6 +3650,27 @@ http_error() {
 	exit 0
 }
 
+http_audio_unavailable() {
+	# This response is emitted only after the session token, renderer state,
+	# worker identity, expiry, and persisted audio state have all been checked.
+	# The dedicated header lets LuCI distinguish the renderer's intentional
+	# PCM-unavailable/fail-closed state from unrelated HTTP 409 responses (for
+	# example, a competing audio request). In that state the worker either has
+	# no PCM producer or is draining the shared tee slave so MJPEG can continue.
+	printf 'Status: 409 Conflict\r\n'
+	printf 'Content-Type: text/plain; charset=utf-8\r\n'
+	printf 'Cache-Control: no-store\r\n'
+	printf 'X-Content-Type-Options: nosniff\r\n'
+	printf 'Referrer-Policy: no-referrer\r\n'
+	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
+	printf 'X-Videoplayer-Audio-State: unavailable\r\n'
+	printf '\r\n'
+	if [ "${REQUEST_METHOD:-GET}" != "HEAD" ]; then
+		printf '%s\n' "Audio is unavailable"
+	fi
+	exit 0
+}
+
 http_no_content() {
 	printf 'Status: 204 No Content\r\n'
 	printf 'Content-Length: 0\r\n'
@@ -2934,6 +3678,23 @@ http_no_content() {
 	printf 'X-Content-Type-Options: nosniff\r\n'
 	printf 'Referrer-Policy: no-referrer\r\n'
 	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
+	printf '\r\n'
+	exit 0
+}
+
+http_video_drain_complete() {
+	local nonce="$1"
+
+	valid_cgi_nonce "$nonce" || http_error "500 Internal Server Error" \
+		"Invalid terminal video drain marker"
+	printf 'Status: 204 No Content\r\n'
+	printf 'Content-Length: 0\r\n'
+	printf 'Cache-Control: no-store\r\n'
+	printf 'X-Content-Type-Options: nosniff\r\n'
+	printf 'Referrer-Policy: no-referrer\r\n'
+	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
+	printf 'X-Videoplayer-Video-Drain: complete\r\n'
+	printf 'X-Videoplayer-Video-Drain-ID: %s\r\n' "$nonce"
 	printf '\r\n'
 	exit 0
 }
@@ -2953,18 +3714,31 @@ valid_cgi_nonce() {
 }
 
 parse_frame_query() {
-	local query="$1" first rest value
+	local query="$1" first rest tail value
 
 	CGI_TOKEN=""
 	CGI_FRAME_MODE="stream"
+	CGI_FRAME_DRAIN=0
+	CGI_FRAME_NONCE=""
 	[ -n "$query" ] || return 1
 	case "$query" in
 		*'&'*)
 			first="${query%%&*}"
 			rest="${query#*&}"
-			case "$rest" in *'&'*) return 1 ;; esac
+			case "$rest" in
+				*'&'*)
+					tail="${rest#*&}"
+					rest="${rest%%&*}"
+					case "$tail" in
+						drain=1) CGI_FRAME_DRAIN=1 ;;
+						drain=check) CGI_FRAME_DRAIN=2 ;;
+						*) return 1 ;;
+					esac
+					;;
+			esac
 			case "$rest" in
 				frame=*)
+					[ "$CGI_FRAME_DRAIN" -eq 0 ] || return 1
 					CGI_FRAME_MODE="single"
 					value="${rest#frame=}"
 					;;
@@ -2974,6 +3748,7 @@ parse_frame_query() {
 				*) return 1 ;;
 			esac
 			valid_cgi_nonce "$value" || return 1
+			CGI_FRAME_NONCE="$value"
 			;;
 		*) first="$query" ;;
 	esac
@@ -2985,11 +3760,19 @@ parse_frame_query() {
 }
 
 parse_audio_query() {
-	local query="$1" first second chunk
+	local query="$1" first second third="" chunk count=1
 
 	CGI_TOKEN=""
 	CGI_AUDIO_CHUNK=""
+	CGI_AUDIO_COUNT=1
 	case "$query" in
+		token=*\&chunk=*\&count=*)
+			first="${query%%&*}"
+			query="${query#*&}"
+			second="${query%%&*}"
+			third="${query#*&}"
+			case "$third" in *'&'*) return 1 ;; esac
+			;;
 		token=*\&chunk=*)
 			first="${query%%&*}"
 			second="${query#*&}"
@@ -3000,8 +3783,18 @@ parse_audio_query() {
 	CGI_TOKEN="${first#token=}"
 	chunk="${second#chunk=}"
 	valid_token "$CGI_TOKEN" || return 1
+	if [ -n "$third" ]; then
+		case "$third" in count=*) count="${third#count=}" ;; *) return 1 ;; esac
+		count="$(normalize_audio_sequence "$count" 2>/dev/null)" || return 1
+		[ "$count" -ge 1 ] &&
+			[ "$count" -le "$AUDIO_BATCH_MAX_SEGMENTS" ] || return 1
+		CGI_AUDIO_COUNT="$count"
+	fi
 	case "$chunk" in
-		live) CGI_AUDIO_CHUNK="live" ;;
+		live)
+			[ "$CGI_AUDIO_COUNT" -eq 1 ] || return 1
+			CGI_AUDIO_CHUNK="live"
+			;;
 		*)
 			CGI_AUDIO_CHUNK="$(
 				normalize_audio_sequence "$chunk" 2>/dev/null
@@ -3103,25 +3896,230 @@ claim_mjpeg_prefetch() {
 mjpeg_read_boundary() {
 	local boundary="$1" cr line
 
+	CGI_MJPEG_CLOSED=0
 	cr="$(printf '\r')"
 	while IFS= read -r line; do
-		[ "$line" = "--$boundary$cr" ] && return 0
+		if [ "$line" = "--$boundary$cr" ]; then
+			return 0
+		fi
+		if [ "$line" = "--$boundary--$cr" ]; then
+			CGI_MJPEG_CLOSED=1
+			return 0
+		fi
 	done
 	return 1
 }
 
+mjpeg_read_next_boundary_timed() {
+	local boundary="$1" timeout_seconds="$2" cr line=""
+
+	CGI_MJPEG_CLOSED=0
+	CGI_MJPEG_TIMED_OUT=0
+	valid_decimal "$timeout_seconds" 4 &&
+		[ "$timeout_seconds" -ge 1 ] || return 1
+	cr="$(printf '\r')"
+	# BusyBox ash provides read -t on OpenWrt. If a timeout happens after any
+	# byte of the next boundary was consumed, `line` is non-empty and the caller
+	# fails closed; only a zero-byte timeout is a clean segment handoff.
+	# shellcheck disable=SC3045
+	if ! IFS= read -r -t "$timeout_seconds" line; then
+		[ -z "$line" ] || return 1
+		CGI_MJPEG_TIMED_OUT=1
+		return 0
+	fi
+	if [ "$line" = "--$boundary$cr" ]; then
+		return 0
+	fi
+	if [ "$line" = "--$boundary--$cr" ]; then
+		CGI_MJPEG_CLOSED=1
+		return 0
+	fi
+	return 1
+}
+
+mjpeg_read_part_headers() {
+	local first_line="${1:-}" have_first="${2:-0}"
+	local cr line name value bytes=0 saw_type=0 saw_length=0 saw_end=0
+
+	CGI_MJPEG_LENGTH=""
+	cr="$(printf '\r')"
+	while :; do
+		if [ "$have_first" -eq 1 ]; then
+			line="$first_line"
+			have_first=0
+		else
+			IFS= read -r line || return 1
+		fi
+		bytes=$((bytes + ${#line} + 1))
+		[ "$bytes" -le 16384 ] || return 1
+		if [ "$line" = "$cr" ]; then
+			saw_end=1
+			break
+		fi
+		case "$line" in
+			*:* ) ;;
+			*) return 1 ;;
+		esac
+		name="${line%%:*}"
+		value="${line#*:}"
+		while [ "${value# }" != "$value" ] ||
+		      [ "${value#	}" != "$value" ]; do
+			value="${value#?}"
+		done
+		value="${value%"$cr"}"
+		case "$name" in
+			Content-Type|Content-type|content-Type|content-type)
+				[ "$saw_type" -eq 0 ] && [ "$value" = "image/jpeg" ] ||
+					return 1
+				saw_type=1
+				;;
+			Content-Length|Content-length|content-Length|content-length)
+				[ "$saw_length" -eq 0 ] || return 1
+				valid_decimal "$value" 7 && [ "$value" -ge 4 ] &&
+					[ "$value" -le 4194304 ] || return 1
+				CGI_MJPEG_LENGTH="$value"
+				saw_length=1
+				;;
+		esac
+	done
+	[ "$saw_end" -eq 1 ] && [ "$saw_type" -eq 1 ] &&
+		[ "$saw_length" -eq 1 ]
+}
+
+mjpeg_wait_first_header() {
+	local token="$1" boundary="$2" nonce="$3" timeout_seconds="$4"
+	local line="" current_cs header_started_cs header_deadline_cs
+
+	CGI_MJPEG_TERMINAL_TRAILER=0
+	CGI_MJPEG_FIRST_HEADER=""
+	valid_decimal "$timeout_seconds" 4 &&
+		[ "$timeout_seconds" -ge 1 ] || return 1
+	header_started_cs="$(monotonic_centiseconds 2>/dev/null)" || return 1
+	header_deadline_cs=$((header_started_cs + timeout_seconds * 100))
+	while :; do
+		line=""
+		# Prefer a queued header over the terminal marker: the FIFO may still
+		# contain a complete final frame when the worker publishes that marker.
+		# BusyBox ash and the bash lifecycle fixture both preserve a partial line
+		# in `line` on timeout, which must be treated as a fatal truncation.
+		# shellcheck disable=SC3045
+		if IFS= read -r -t 1 line; then
+			CGI_MJPEG_FIRST_HEADER="$line"
+			return 0
+		fi
+		[ -z "$line" ] || return 1
+		if load_video_drain_marker \
+			"$token" ready "$nonce" 2>/dev/null; then
+			CGI_MJPEG_TERMINAL_TRAILER=1
+			return 0
+		fi
+		current_cs="$(monotonic_centiseconds 2>/dev/null)" || return 1
+		[ "$current_cs" -lt "$header_deadline_cs" ] || return 1
+		# EOF on a still-retained FIFO may return immediately instead of waiting.
+		sleep 0.05
+	done
+}
+
 mjpeg_copy_aligned() {
-	local boundary="$1" prefetched="$2"
+	local token="$1" boundary="$2" prefetched="$3" nonce="$4"
+	local max_frames="$5" cr trailer
+	local started_cs deadline_cs current_cs remaining_cs wait_seconds
+	local frame_count=0 payload_bytes=0 have_prefetched_headers
+
+	valid_decimal "$max_frames" 3 &&
+		[ "$max_frames" -ge 1 ] && [ "$max_frames" -le 300 ] || return 1
 
 	exec 5<&-
 	exec 7<&-
+	cr="$(printf '\r')"
+	started_cs="$(monotonic_centiseconds 2>/dev/null)" || return 1
+	deadline_cs=$((started_cs + MJPEG_SEGMENT_SECONDS * 100))
 	if [ "$prefetched" = "1" ]; then
-		printf '%s\r\n' "--$boundary" || exit 1
+		have_prefetched_headers=1
 	else
-		mjpeg_read_boundary "$boundary" || exit 1
-		printf '%s\r\n' "--$boundary" || exit 1
+		have_prefetched_headers=0
+		if load_video_drain_marker \
+			"$token" ready "$nonce" 2>/dev/null; then
+			if ! mjpeg_read_boundary "$boundary"; then
+				printf '%s\r\n' "--$boundary--" || return 1
+				return 0
+			fi
+		else
+			mjpeg_read_next_boundary_timed \
+				"$boundary" "$MJPEG_SEGMENT_SECONDS" || exit 1
+			if [ "$CGI_MJPEG_TIMED_OUT" -eq 1 ]; then
+				printf '%s\r\n' "--$boundary--" || exit 1
+				return 2
+			fi
+		fi
+		if [ "$CGI_MJPEG_CLOSED" -eq 1 ]; then
+			printf '%s\r\n' "--$boundary--" || exit 1
+			return 0
+		fi
 	fi
-	exec cat
+	while :; do
+		if [ "$have_prefetched_headers" -eq 1 ]; then
+			have_prefetched_headers=0
+			mjpeg_read_part_headers || return 1
+		else
+			mjpeg_wait_first_header \
+				"$token" "$boundary" "$nonce" \
+				"$MJPEG_HEADER_WAIT_SECONDS" || return 1
+			if [ "$CGI_MJPEG_TERMINAL_TRAILER" -eq 1 ]; then
+				printf '%s\r\n' "--$boundary--" || return 1
+				return 0
+			fi
+			mjpeg_read_part_headers "$CGI_MJPEG_FIRST_HEADER" 1 || return 1
+		fi
+		printf '%s\r\n' "--$boundary" || return 1
+		printf 'Content-Type: image/jpeg\r\n' || return 1
+		printf 'Content-Length: %s\r\n\r\n' "$CGI_MJPEG_LENGTH" ||
+			return 1
+		dd iflag=fullblock bs="$CGI_MJPEG_LENGTH" count=1 2>/dev/null ||
+			return 1
+		IFS= read -r trailer || return 1
+		[ "$trailer" = "$cr" ] || return 1
+		printf '\r\n' || return 1
+		frame_count=$((frame_count + 1))
+		payload_bytes=$((payload_bytes + CGI_MJPEG_LENGTH))
+		if ! load_video_drain_marker "$token" ready "$nonce" 2>/dev/null; then
+			if [ "$frame_count" -ge "$max_frames" ] ||
+			   [ "$payload_bytes" -ge 16777216 ]; then
+				printf '%s\r\n' "--$boundary--" || return 1
+				return 2
+			fi
+			current_cs="$(monotonic_centiseconds 2>/dev/null)" || return 1
+			if [ "$current_cs" -ge "$deadline_cs" ]; then
+				printf '%s\r\n' "--$boundary--" || return 1
+				return 2
+			fi
+		fi
+		if load_video_drain_marker \
+			"$token" ready "$nonce" 2>/dev/null; then
+			if ! mjpeg_read_boundary "$boundary"; then
+				printf '%s\r\n' "--$boundary--" || return 1
+				return 0
+			fi
+		else
+			current_cs="$(monotonic_centiseconds 2>/dev/null)" || return 1
+			remaining_cs=$((deadline_cs - current_cs))
+			if [ "$remaining_cs" -le 0 ]; then
+				printf '%s\r\n' "--$boundary--" || return 1
+				return 2
+			fi
+			wait_seconds=$(((remaining_cs + 99) / 100))
+			mjpeg_read_next_boundary_timed \
+				"$boundary" "$wait_seconds" || return 1
+			if [ "$CGI_MJPEG_TIMED_OUT" -eq 1 ]; then
+				printf '%s\r\n' "--$boundary--" || return 1
+				return 2
+			fi
+		fi
+		if [ "$CGI_MJPEG_CLOSED" -eq 1 ]; then
+			printf '%s\r\n' "--$boundary--" || return 1
+			return 0
+		fi
+	done
 }
 
 process_read_chars() {
@@ -3171,9 +4169,10 @@ stop_cgi_copy() {
 	CGI_COPY_START=""
 }
 
-mjpeg_session_is_live() {
+mjpeg_session_state() {
 	local token="$1" now="$2" dir
 
+	CGI_MJPEG_SESSION_STATE=""
 	valid_token "$token" && valid_decimal "$now" 12 || return 1
 	get_enabled || return 1
 	[ "$(get_render_mode)" = "router" ] || return 1
@@ -3181,7 +4180,10 @@ mjpeg_session_is_live() {
 	[ "$CURRENT_TOKEN" = "$token" ] &&
 		[ "$CURRENT_EXPIRY" -gt "$now" ] || return 1
 	load_status "$token" || return 1
-	[ "$SESSION_STATUS" = "running" ] || return 1
+	case "$SESSION_STATUS" in
+		running|ended) CGI_MJPEG_SESSION_STATE="$SESSION_STATUS" ;;
+		*) return 1 ;;
+	esac
 	load_worker_identity "$token" worker || return 1
 	process_matches_worker "$WORKER_PID" "$WORKER_START" "$token" || return 1
 	dir="$RUNTIME_DIR/s-$token"
@@ -3205,8 +4207,9 @@ write_mjpeg_headers() {
 }
 
 cmd_cgi() {
-	local now dir status boundary started_cs deadline_cs current_cs
-	local last_check_cs last_progress_cs last_rchar=0 rchar
+	local now dir status boundary started_cs current_cs copy_rc=1 terminal=0
+	local last_check_cs last_progress_cs last_rchar=0 rchar relay_marker
+	local router_fps segment_frame_limit
 
 	CGI_COPY_PID=""
 	CGI_COPY_START=""
@@ -3239,9 +4242,23 @@ cmd_cgi() {
 	status="$SESSION_STATUS"
 	case "$status" in
 		starting) http_error "202 Accepted" "Renderer is starting" ;;
-		ended|stopped) http_error "410 Gone" "Playback ended" ;;
+		ended)
+			[ "$CGI_FRAME_DRAIN" -ne 0 ] ||
+				http_error "410 Gone" "Playback ended"
+			if load_video_drain_marker \
+				"$CGI_TOKEN" complete "$CGI_FRAME_NONCE" 2>/dev/null; then
+				http_video_drain_complete "$CGI_FRAME_NONCE"
+			fi
+			[ "$CGI_FRAME_DRAIN" -eq 1 ] ||
+				http_error "202 Accepted" "Terminal video drain is not complete"
+			terminal=1
+			;;
+		stopped) http_error "410 Gone" "Playback ended" ;;
 		error) http_error "503 Service Unavailable" "Renderer failed" ;;
-		running) ;;
+		running)
+			[ "$CGI_FRAME_DRAIN" -eq 0 ] ||
+				http_error "409 Conflict" "Terminal drain is not ready"
+			;;
 	esac
 	if ! load_worker_identity "$CGI_TOKEN" worker ||
 	   ! process_matches_worker "$WORKER_PID" "$WORKER_START" "$CGI_TOKEN"; then
@@ -3269,8 +4286,26 @@ cmd_cgi() {
 		http_error "409 Conflict" "A video stream is already active"
 	now="$(date +%s 2>/dev/null)" ||
 		http_error "503 Service Unavailable" "Clock unavailable"
-	mjpeg_session_is_live "$CGI_TOKEN" "$now" ||
+	mjpeg_session_state "$CGI_TOKEN" "$now" ||
 		http_error "410 Gone" "Playback ended"
+	case "$CGI_MJPEG_SESSION_STATE" in
+		ended)
+			[ "$CGI_FRAME_DRAIN" -ne 0 ] ||
+				http_error "410 Gone" "Playback ended"
+			if load_video_drain_marker \
+				"$CGI_TOKEN" complete "$CGI_FRAME_NONCE" 2>/dev/null; then
+				exec 8<&-
+				http_video_drain_complete "$CGI_FRAME_NONCE"
+			fi
+			[ "$CGI_FRAME_DRAIN" -eq 1 ] ||
+				http_error "202 Accepted" "Terminal video drain is not complete"
+			terminal=1
+			;;
+		running)
+			[ "$CGI_FRAME_DRAIN" -eq 0 ] ||
+				http_error "409 Conflict" "Terminal drain is not ready"
+			;;
+	esac
 	claim_mjpeg_prefetch "$CGI_TOKEN" "$boundary" ||
 		http_error "503 Service Unavailable" "Invalid MJPEG startup data"
 	# Keep this open last: the secure state loaders above intentionally use
@@ -3278,18 +4313,44 @@ cmd_cgi() {
 	# duplicated into the direct child below.
 	open_cgi_video_fifo "$CGI_TOKEN" ||
 		http_error "503 Service Unavailable" "Cannot open MJPEG stream"
+	if [ "$terminal" -eq 1 ]; then
+		write_video_drain_marker "$CGI_TOKEN" "$CGI_FRAME_NONCE" ready || {
+			exec 5<&-
+			exec 7<&-
+			http_error "503 Service Unavailable" \
+				"Cannot claim terminal video drain"
+		}
+	fi
 	started_cs="$(monotonic_centiseconds 2>/dev/null)" || {
 		exec 5<&-
 		exec 7<&-
 		http_error "503 Service Unavailable" "Monotonic clock unavailable"
 	}
-	deadline_cs=$((started_cs + MJPEG_SEGMENT_SECONDS * 100))
 	last_check_cs="$started_cs"
 	last_progress_cs="$started_cs"
+	router_fps="$(get_router_fps)"
+	valid_decimal "$router_fps" 2 &&
+		[ "$router_fps" -ge 1 ] && [ "$router_fps" -le 60 ] || {
+		exec 5<&-
+		exec 7<&-
+		http_error "503 Service Unavailable" "Invalid router frame rate"
+	}
+	segment_frame_limit=$((router_fps * 5))
 
 	write_mjpeg_headers "$boundary"
-	mjpeg_copy_aligned "$boundary" "$CGI_MJPEG_PREFETCH" \
-		<&5 3<&- 4<&- 5<&- 6<&- 7<&- 9<&- &
+	relay_marker="$dir/video-drain-ready"
+	if mjpeg_relay_is_safe; then
+		"$MJPEG_RELAY_BIN" \
+			"$boundary" "$CGI_MJPEG_PREFETCH" \
+			"$MJPEG_SEGMENT_SECONDS" "$relay_marker" "$CGI_FRAME_NONCE" \
+			"$segment_frame_limit" \
+			<&5 3<&- 4<&- 5<&- 6<&- 7<&- 9<&- &
+	else
+		mjpeg_copy_aligned \
+			"$CGI_TOKEN" "$boundary" "$CGI_MJPEG_PREFETCH" \
+			"$CGI_FRAME_NONCE" "$segment_frame_limit" \
+			<&5 3<&- 4<&- 5<&- 6<&- 7<&- 9<&- &
+	fi
 	CGI_COPY_PID=$!
 	exec 5<&-
 	exec 7<&-
@@ -3298,49 +4359,99 @@ cmd_cgi() {
 	)" || CGI_COPY_START=""
 	if [ -z "$CGI_COPY_START" ] ||
 	   ! direct_child_matches "$CGI_COPY_PID" "$CGI_COPY_START"; then
-		stop_cgi_copy
-		exec 8<&-
-		exit 0
-	fi
-	trap 'stop_cgi_copy; exec 8<&-; exit 0' HUP INT TERM
-	trap 'stop_cgi_copy' 0
-
-	# The direct child remains unreaped until stop_cgi_copy(), so its PID
-	# cannot be reused during this loop after the identity check above.
-	while process_is_running "$CGI_COPY_PID"; do
-		sleep 0.5
-		current_cs="$(monotonic_centiseconds 2>/dev/null)" || break
-		[ "$current_cs" -lt "$deadline_cs" ] || break
-		[ $((current_cs - last_check_cs)) -ge 100 ] || continue
-		last_check_cs="$current_cs"
-		now="$(date +%s 2>/dev/null)" || break
-		valid_decimal "$now" 12 || break
-		mjpeg_session_is_live "$CGI_TOKEN" "$now" || break
-		rchar="$(process_read_chars "$CGI_COPY_PID" 2>/dev/null)" ||
-			rchar=""
-		if valid_decimal "$rchar" 20 &&
-		   [ "$rchar" -gt "$last_rchar" ]; then
-			refresh_heartbeat "$CGI_TOKEN" "$now" || break
-			last_rchar="$rchar"
-			last_progress_cs="$current_cs"
-		elif [ -z "$rchar" ]; then
-			# Some minimal kernels omit per-task I/O accounting. The bounded
-			# CGI lifetime and worker/status checks remain safe; only the
-			# progress-sensitive lease optimization is unavailable there.
-			refresh_heartbeat "$CGI_TOKEN" "$now" || break
-			last_progress_cs="$current_cs"
+		if ! process_is_running "$CGI_COPY_PID"; then
+			# A tiny terminal segment can finish and be reaped by the shell
+			# before /proc exposes a start time. Never invent an identity or
+			# signal that PID: wait only for our recorded child job and retain
+			# its real exit status for the nonce-bound completion marker below.
+			wait "$CGI_COPY_PID" 2>/dev/null
+			copy_rc=$?
+			CGI_COPY_PID=""
+			CGI_COPY_START=""
+		else
+			stop_cgi_copy
+			exec 8<&-
+			exit 0
 		fi
-		[ $((current_cs - last_progress_cs)) -le \
-			$((HEARTBEAT_TIMEOUT * 100)) ] || break
-	done
-	stop_cgi_copy
+	fi
+	if [ -n "$CGI_COPY_PID" ]; then
+		trap 'stop_cgi_copy; exec 8<&-; exit 0' HUP INT TERM
+		trap 'stop_cgi_copy' 0
+
+		# The direct child remains unreaped until stop_cgi_copy(), so its PID
+		# cannot be reused during this loop after the identity check above.
+		while process_is_running "$CGI_COPY_PID"; do
+			sleep 0.5
+			current_cs="$(monotonic_centiseconds 2>/dev/null)" || break
+			[ $((current_cs - last_check_cs)) -ge 100 ] || continue
+			last_check_cs="$current_cs"
+			now="$(date +%s 2>/dev/null)" || break
+			valid_decimal "$now" 12 || break
+			mjpeg_session_state "$CGI_TOKEN" "$now" || break
+			if [ "$CGI_MJPEG_SESSION_STATE" = "ended" ]; then
+				if [ "$terminal" -eq 0 ]; then
+					write_video_drain_marker \
+						"$CGI_TOKEN" "$CGI_FRAME_NONCE" ready || break
+					terminal=1
+				fi
+				# Once ended, the worker closes the retained FIFO anchor and the
+				# relay must be allowed to reach actual EOF without an idle cutoff.
+				continue
+			fi
+			rchar="$(process_read_chars "$CGI_COPY_PID" 2>/dev/null)" ||
+				rchar=""
+			if valid_decimal "$rchar" 20 &&
+			   [ "$rchar" -gt "$last_rchar" ]; then
+				refresh_heartbeat "$CGI_TOKEN" "$now" || break
+				last_rchar="$rchar"
+				last_progress_cs="$current_cs"
+			elif [ -z "$rchar" ]; then
+				# Some minimal kernels omit per-task I/O accounting. The bounded
+				# CGI lifetime and worker/status checks remain safe; only the
+				# progress-sensitive lease optimization is unavailable there.
+				refresh_heartbeat "$CGI_TOKEN" "$now" || break
+				last_progress_cs="$current_cs"
+			fi
+			if [ $((current_cs - last_progress_cs)) -gt \
+			     $((HEARTBEAT_TIMEOUT * 100)) ]; then
+				# A bounded relay can legitimately stop reading while the shared tee
+				# is backpressured by the PCM ring. Hidden tabs may also delay their
+				# successor request. Keep this CGI child only while the independently
+				# authenticated browser lease is still fresh; both stalled data and a
+				# stale client heartbeat are required before forced cleanup.
+				if ! load_heartbeat "$CGI_TOKEN" 2>/dev/null ||
+				   [ "$HEARTBEAT_TIME" -gt "$now" ] ||
+				   [ $((now - HEARTBEAT_TIME)) -gt "$HEARTBEAT_TIMEOUT" ]; then
+					break
+				fi
+			fi
+		done
+		if process_is_running "$CGI_COPY_PID"; then
+			stop_cgi_copy
+			copy_rc=1
+		else
+			wait "$CGI_COPY_PID" 2>/dev/null
+			copy_rc=$?
+			CGI_COPY_PID=""
+			CGI_COPY_START=""
+		fi
+	fi
+	if [ "$copy_rc" -eq 0 ] && [ "$terminal" -eq 1 ] &&
+	   load_status "$CGI_TOKEN" 2>/dev/null &&
+	   [ "$SESSION_STATUS" = "ended" ] &&
+	   load_video_drain_marker \
+		"$CGI_TOKEN" ready "$CGI_FRAME_NONCE" 2>/dev/null; then
+		write_video_drain_marker \
+			"$CGI_TOKEN" "$CGI_FRAME_NONCE" complete 2>/dev/null || :
+	fi
 	trap - 0 HUP INT TERM
 	exec 8<&-
 	exit 0
 }
 
 cmd_audio_cgi() {
-	local now dir path opened metadata kind size sequence state require_worker=0
+	local now dir path sequence state require_worker=0
+	local requested_count response_count available end_sequence cursor total_size
 
 	case "${REQUEST_METHOD:-GET}" in
 		GET|HEAD) ;;
@@ -3384,10 +4495,35 @@ cmd_audio_cgi() {
 	state="$AUDIO_STATE"
 	case "$state" in
 		unavailable|error)
-			http_error "409 Conflict" "Audio is unavailable"
+			if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+				http_audio_unavailable
+			fi
+			case "$SESSION_STATUS" in
+				ended) http_error "410 Gone" "Audio playback ended" ;;
+				*) http_error "503 Service Unavailable" \
+					"Audio fallback source is unavailable" ;;
+			esac
 			;;
 	esac
+	dir="$RUNTIME_DIR/s-$CGI_TOKEN"
+	ensure_lock_file "$dir/audio.lock" ||
+		http_error "503 Service Unavailable" "Cannot initialize audio stream"
+	exec 8< "$dir/audio.lock" ||
+		http_error "503 Service Unavailable" "Cannot initialize audio stream"
+	# Never let a competing or stalled browser consume another uhttpd worker.
+	# PCM batches are short and retryable, so fail this request immediately.
+	flock -xn 8 2>/dev/null ||
+		http_error "409 Conflict" "An audio request is already active"
+	# The state may have changed while this request waited for audio.lock.
+	# Only the authenticated terminal state is allowed to trigger the protected
+	# browser-audio handoff; generic lock/content errors remain distinguishable.
+	if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+		http_audio_unavailable
+	fi
 	if ! audio_published_high "$CGI_TOKEN"; then
+		if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+			http_audio_unavailable
+		fi
 		state="$AUDIO_STATE"
 		case "$state" in
 			starting|running)
@@ -3397,69 +4533,85 @@ cmd_audio_cgi() {
 		esac
 	fi
 	state="$AUDIO_STATE"
+	requested_count="$CGI_AUDIO_COUNT"
 	if [ "$CGI_AUDIO_CHUNK" = "live" ]; then
 		sequence="$AUDIO_PUBLISHED_HIGH"
+		response_count=1
 	else
 		sequence="$CGI_AUDIO_CHUNK"
 		if [ "$sequence" -lt "$AUDIO_LOWEST" ]; then
+			if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+				http_audio_unavailable
+			fi
 			http_error "410 Gone" "Audio segment expired"
 		fi
 		if [ "$sequence" -gt "$AUDIO_PUBLISHED_HIGH" ]; then
+			if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+				http_audio_unavailable
+			fi
 			case "$state" in
 				starting|running)
 					http_error "202 Accepted" "Audio segment is not ready"
 					;;
-				ended) http_no_content ;;
+				ended)
+					if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+						http_audio_unavailable
+					fi
+					http_no_content
+					;;
 				*) http_error "410 Gone" "Audio playback ended" ;;
 			esac
 		fi
+		available=$((AUDIO_PUBLISHED_HIGH - sequence + 1))
+		if [ "$available" -lt "$requested_count" ]; then
+			if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+				http_audio_unavailable
+			fi
+			case "$state" in
+				starting|running)
+					http_error "202 Accepted" "Complete audio batch is not ready"
+					;;
+				ended) response_count="$available" ;;
+				*) http_error "410 Gone" "Audio playback ended" ;;
+			esac
+		else
+			response_count="$requested_count"
+		fi
 	fi
 
-	dir="$RUNTIME_DIR/s-$CGI_TOKEN"
-	path="$dir/audio-$(printf '%08d' "$sequence").pcm"
 	[ -z "${HTTP_RANGE:-}" ] ||
 		http_error "416 Range Not Satisfiable" "Range requests are not supported"
-	if [ ! -f "$path" ] || [ -L "$path" ]; then
-		http_error "410 Gone" "Audio segment is unavailable"
-	fi
-	exec 7< "$path" ||
-		http_error "503 Service Unavailable" "Cannot open audio segment"
-	opened="$(readlink -f -- /proc/self/fd/7 2>/dev/null)" || {
-		exec 7<&-
-		http_error "503 Service Unavailable" "Cannot verify audio segment"
-	}
-	case "$opened" in
-		"$path"|"$path (deleted)") ;;
-		*)
-			exec 7<&-
-			http_error "503 Service Unavailable" "Cannot verify audio segment"
-			;;
-	esac
-	metadata="$(stat -L -c '%F:%s:%u:%a' -- /proc/self/fd/7 2>/dev/null)" || {
-		exec 7<&-
-		http_error "503 Service Unavailable" "Cannot inspect audio segment"
-	}
-	kind="${metadata%%:*}"
-	metadata="${metadata#*:}"
-	size="${metadata%%:*}"
-	metadata="${metadata#*:}"
-	if [ "$kind" != "regular file" ] ||
-	   ! valid_decimal "$size" 10 ||
-	   [ "$size" -ne "$MAX_AUDIO_BYTES" ] ||
-	   [ "$metadata" != "0:600" ]; then
-		exec 7<&-
-		http_error "503 Service Unavailable" "Invalid audio segment"
-	fi
+	[ "$response_count" -ge 1 ] &&
+		[ "$response_count" -le "$AUDIO_BATCH_MAX_SEGMENTS" ] ||
+		http_error "503 Service Unavailable" "Invalid audio batch"
+	end_sequence=$((sequence + response_count - 1))
+	cursor="$sequence"
+	while [ "$cursor" -le "$end_sequence" ]; do
+		path="$dir/audio-$(printf '%08d' "$cursor").pcm"
+		if ! audio_file_is_valid "$path"; then
+			if live_audio_fallback_is_safe "$CGI_TOKEN"; then
+				http_audio_unavailable
+			fi
+			http_error "410 Gone" "Audio segment is unavailable"
+		fi
+		cursor=$((cursor + 1))
+	done
+	total_size=$((response_count * MAX_AUDIO_BYTES))
 	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
-		refresh_heartbeat "$CGI_TOKEN" "$now" || {
-			exec 7<&-
+		# A validated request for S acknowledges only chunks before S. Keeping
+		# S..batch-end makes a lost response safely retryable. The atomic ack is
+		# committed before deletion so the chunker can finish a partial cleanup.
+		write_audio_ack "$CGI_TOKEN" "$sequence" ||
+			http_error "503 Service Unavailable" "Cannot acknowledge audio batch"
+		delete_audio_before "$CGI_TOKEN" "$sequence" ||
+			http_error "503 Service Unavailable" "Cannot release audio buffer"
+		refresh_heartbeat "$CGI_TOKEN" "$now" ||
 			http_error "503 Service Unavailable" "Cannot refresh renderer lease"
-		}
 	fi
 
 	printf 'Status: 200 OK\r\n'
 	printf 'Content-Type: application/octet-stream\r\n'
-	printf 'Content-Length: %s\r\n' "$size"
+	printf 'Content-Length: %s\r\n' "$total_size"
 	printf 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n'
 	printf 'Pragma: no-cache\r\n'
 	printf 'Expires: 0\r\n'
@@ -3469,14 +4621,33 @@ cmd_audio_cgi() {
 	printf 'Content-Security-Policy: default-src '"'"'none'"'"'\r\n'
 	printf 'X-Videoplayer-Audio-Format: s16le\r\n'
 	printf 'X-Videoplayer-Audio-Sequence: %s\r\n' "$sequence"
+	printf 'X-Videoplayer-Audio-Chunk-Count: %s\r\n' "$response_count"
 	printf 'X-Videoplayer-Audio-Sample-Rate: %s\r\n' "$AUDIO_SAMPLE_RATE"
 	printf 'X-Videoplayer-Audio-Channels: %s\r\n' "$AUDIO_CHANNELS"
 	printf 'X-Videoplayer-Audio-Frames: %s\r\n' "$AUDIO_FRAMES_PER_CHUNK"
+	printf 'X-Videoplayer-Audio-Frames-Per-Chunk: %s\r\n' \
+		"$AUDIO_FRAMES_PER_CHUNK"
+	printf 'X-Videoplayer-Audio-Total-Frames: %s\r\n' \
+		"$((response_count * AUDIO_FRAMES_PER_CHUNK))"
 	printf '\r\n'
 	if [ "${REQUEST_METHOD:-GET}" = "GET" ]; then
-		dd bs="$MAX_AUDIO_BYTES" count=1 <&7 2>/dev/null
+		cursor="$sequence"
+		while [ "$cursor" -le "$end_sequence" ]; do
+			if ! open_audio_file "$CGI_TOKEN" "$cursor"; then
+				exec 8<&-
+				exit 0
+			fi
+			if ! dd iflag=fullblock bs="$MAX_AUDIO_BYTES" count=1 \
+				<&7 8<&- 2>/dev/null; then
+				exec 7<&-
+				exec 8<&-
+				exit 0
+			fi
+			exec 7<&-
+			cursor=$((cursor + 1))
+		done
 	fi
-	exec 7<&-
+	exec 8<&-
 	exit 0
 }
 
@@ -3506,6 +4677,14 @@ case "${1:-}" in
 	status)
 		[ "$#" -eq 2 ] || exit 2
 		cmd_status "$2"
+		;;
+	status-touch)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_status_touch "$2"
+		;;
+	media-info)
+		[ "$#" -eq 2 ] || exit 2
+		cmd_media_info "$2"
 		;;
 	source)
 		[ "$#" -eq 2 ] || exit 2

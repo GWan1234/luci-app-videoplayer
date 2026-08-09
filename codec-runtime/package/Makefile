@@ -186,14 +186,21 @@ define Build/Configure
 			--enable-encoder=pcm_s16le \
 			--enable-muxer=mpjpeg \
 			--enable-muxer=pcm_s16le \
+			--enable-muxer=tee \
 			--enable-filter=aresample \
 			--enable-filter=aformat \
+			--enable-filter=apad \
 			--enable-filter=asetnsamples \
 	)
 endef
 
 define Build/Compile
 	+$(MAKE) $(PKG_JOBS) -C $(PKG_BUILD_DIR) ffmpeg
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_CPPFLAGS) \
+		-std=c99 -Wall -Wextra -Werror -Os \
+		$(TARGET_LDFLAGS) -Wl,-z,relro -Wl,-z,now \
+		-o $(PKG_BUILD_DIR)/videoplayer-mjpeg-relay \
+		$(CURDIR)/src/videoplayer-mjpeg-relay.c
 	$(INSTALL_DIR) $(PKG_BUILD_DIR)/.pkgdir/.videoplayer-validation
 	$(CP) $(PKG_BUILD_DIR)/config.h \
 		$(PKG_BUILD_DIR)/config_components.h \
@@ -204,6 +211,8 @@ define Package/luci-videoplayer-codec-runtime/install
 	$(INSTALL_DIR) $(1)/usr/libexec/videoplayer-ffmpeg
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ffmpeg \
 		$(1)/usr/libexec/videoplayer-ffmpeg/ffmpeg
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/videoplayer-mjpeg-relay \
+		$(1)/usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay
 	$(INSTALL_DIR) $(1)/usr/share/luci-videoplayer-codec-runtime
 	$(INSTALL_DATA) ./files/build-info \
 		$(1)/usr/share/luci-videoplayer-codec-runtime/build-info

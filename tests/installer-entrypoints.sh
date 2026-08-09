@@ -477,4 +477,102 @@ then
 	exit 1
 fi
 
+# Same-version codec packages built before the unified tee/apad renderer have
+# the same r3 package version. The capability profile must turn that legacy
+# metadata into a repair action without executing the incomplete binary.
+codec_build_info="$tmp/codec-build-info"
+codec_ffmpeg="$tmp/codec-ffmpeg"
+codec_relay="$tmp/codec-relay"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$codec_ffmpeg"
+chmod 0755 "$codec_ffmpeg"
+cat > "$codec_build_info" <<'EOF'
+openwrt_release=25.12.5
+openwrt_revision=r33051-f5dae5ece4
+compatible_arch=aarch64_cortex-a53
+package_format=apk
+EOF
+if sh -s -- \
+	"$codec_installer_without_main" "$codec_build_info" "$codec_ffmpeg" \
+	"$codec_relay" <<'EOF'
+set -eu
+installer="$1"
+build_info="$2"
+ffmpeg="$3"
+relay="$4"
+# shellcheck disable=SC1090
+. "$installer"
+PRIVATE_BUILD_INFO="$build_info"
+PRIVATE_FFMPEG="$ffmpeg"
+PRIVATE_RELAY="$relay"
+DISTRIB_RELEASE_VALUE=25.12.5
+DISTRIB_REVISION_VALUE=r33051-f5dae5ece4
+DISTRIB_ARCH_VALUE=aarch64_cortex-a53
+PACKAGE_FORMAT=apk
+installed_runtime_matches_router
+EOF
+then
+	printf '%s\n' \
+		'Legacy same-version codec metadata unexpectedly skipped repair.' >&2
+	exit 1
+fi
+printf '%s\n' 'renderer_profile=buffered-tee-v1' >> "$codec_build_info"
+if sh -s -- \
+	"$codec_installer_without_main" "$codec_build_info" "$codec_ffmpeg" \
+	"$codec_relay" <<'EOF'
+set -eu
+installer="$1"
+build_info="$2"
+ffmpeg="$3"
+relay="$4"
+# shellcheck disable=SC1090
+. "$installer"
+PRIVATE_BUILD_INFO="$build_info"
+PRIVATE_FFMPEG="$ffmpeg"
+PRIVATE_RELAY="$relay"
+DISTRIB_RELEASE_VALUE=25.12.5
+DISTRIB_REVISION_VALUE=r33051-f5dae5ece4
+DISTRIB_ARCH_VALUE=aarch64_cortex-a53
+PACKAGE_FORMAT=apk
+installed_runtime_matches_router
+EOF
+then
+	printf '%s\n' \
+		'Same-version codec metadata without the MJPEG relay skipped repair.' >&2
+	exit 1
+fi
+printf '%s\n' '#!/bin/sh' 'exit 64' > "$codec_relay"
+chmod 0755 "$codec_relay"
+sh -s -- \
+	"$codec_installer_without_main" "$codec_build_info" "$codec_ffmpeg" \
+	"$codec_relay" <<'EOF'
+set -eu
+installer="$1"
+build_info="$2"
+ffmpeg="$3"
+relay="$4"
+# shellcheck disable=SC1090
+. "$installer"
+PRIVATE_BUILD_INFO="$build_info"
+PRIVATE_FFMPEG="$ffmpeg"
+PRIVATE_RELAY="$relay"
+DISTRIB_RELEASE_VALUE=25.12.5
+DISTRIB_REVISION_VALUE=r33051-f5dae5ece4
+DISTRIB_ARCH_VALUE=aarch64_cortex-a53
+PACKAGE_FORMAT=apk
+# GitHub-hosted runners execute this fixture as an unprivileged user, while an
+# installed OpenWrt package is necessarily root-owned. Narrowly emulate only
+# the package manager's ownership result; every unrelated stat call stays real.
+stat() {
+	if [ "$#" -eq 3 ] && [ "$1" = -c ] && [ "$2" = '%u:%a' ] &&
+	   [ "$3" = "$PRIVATE_RELAY" ]; then
+		printf '%s\n' '0:755'
+		return 0
+	fi
+	command stat "$@"
+}
+installed_runtime_matches_router
+[ "$(select_runtime_action = 0)" = repair ]
+[ "$(select_runtime_action = 1)" = current ]
+EOF
+
 printf '%s\n' "Remote installer entry-point checks passed."

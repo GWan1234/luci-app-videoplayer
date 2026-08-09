@@ -15,9 +15,12 @@ PACKAGE_NAME="luci-videoplayer-codec-runtime"
 CODEC_VERSION="6.1.4"
 CODEC_RELEASE="3"
 TARGET_PACKAGE_VERSION="$CODEC_VERSION-r$CODEC_RELEASE"
+RENDERER_PROFILE="buffered-tee-v1"
 INDEX_OBJECT="dist/INDEX.tsv"
 SOURCE_COMMIT_OBJECT="dist/SOURCE_COMMIT"
 PRIVATE_FFMPEG="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
+PRIVATE_RELAY="/usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay"
+PRIVATE_BUILD_INFO="/usr/share/luci-videoplayer-codec-runtime/build-info"
 
 # POSIX ulimit -f counts 512-byte blocks.
 MAX_METADATA_BLOCKS="256"
@@ -61,9 +64,13 @@ read_release_value() {
 }
 
 installed_runtime_matches_router() {
-	build_info="/usr/share/luci-videoplayer-codec-runtime/build-info"
+	build_info="$PRIVATE_BUILD_INFO"
 	[ -r "$build_info" ] &&
 		[ -x "$PRIVATE_FFMPEG" ] &&
+		[ -f "$PRIVATE_RELAY" ] &&
+		[ ! -L "$PRIVATE_RELAY" ] &&
+		[ -x "$PRIVATE_RELAY" ] &&
+		[ "$(stat -c '%u:%a' "$PRIVATE_RELAY" 2>/dev/null)" = "0:755" ] &&
 		[ "$(sed -n 's/^openwrt_release=//p' "$build_info")" = \
 			"$DISTRIB_RELEASE_VALUE" ] &&
 		[ "$(sed -n 's/^openwrt_revision=//p' "$build_info")" = \
@@ -71,7 +78,9 @@ installed_runtime_matches_router() {
 		[ "$(sed -n 's/^compatible_arch=//p' "$build_info")" = \
 			"$DISTRIB_ARCH_VALUE" ] &&
 		[ "$(sed -n 's/^package_format=//p' "$build_info")" = \
-			"$PACKAGE_FORMAT" ]
+			"$PACKAGE_FORMAT" ] &&
+		[ "$(sed -n 's/^renderer_profile=//p' "$build_info")" = \
+			"$RENDERER_PROFILE" ]
 }
 
 select_runtime_action() {
@@ -296,7 +305,7 @@ command -v id >/dev/null 2>&1 ||
 [ "$(id -u)" = "0" ] ||
 	die "Run this installer as root."
 
-for required_command in grep mktemp sed sha256sum tr wc; do
+for required_command in grep mktemp sed sha256sum stat tr wc; do
 	command -v "$required_command" >/dev/null 2>&1 ||
 		die "Required command is missing: $required_command"
 done
@@ -607,6 +616,14 @@ fi
 
 [ -x "$PRIVATE_FFMPEG" ] ||
 	die "The installed private FFmpeg is missing or not executable: $PRIVATE_FFMPEG"
+[ -f "$PRIVATE_RELAY" ] && [ ! -L "$PRIVATE_RELAY" ] &&
+	[ -x "$PRIVATE_RELAY" ] &&
+	[ "$(stat -c '%u:%a' "$PRIVATE_RELAY" 2>/dev/null)" = "0:755" ] ||
+	die "The installed MJPEG relay is missing or unsafe: $PRIVATE_RELAY"
+RELAY_PROBE_RC="0"
+"$PRIVATE_RELAY" </dev/null >/dev/null 2>&1 || RELAY_PROBE_RC="$?"
+[ "$RELAY_PROBE_RC" -eq 64 ] ||
+	die "The installed MJPEG relay failed its executable probe."
 
 DECODERS_REPORT="$WORK_DIR/ffmpeg-decoders"
 ENCODERS_REPORT="$WORK_DIR/ffmpeg-encoders"
@@ -659,13 +676,13 @@ check_component "$ENCODERS_REPORT" \
 	'^[[:space:]]*A[^[:space:]]*[[:space:]]+pcm_s16le([[:space:]]|$)' \
 	"the PCM S16LE audio encoder" ||
 	COMPONENTS_OK="0"
-for MUXER in image2 mpjpeg s16le; do
+for MUXER in image2 mpjpeg s16le tee; do
 	check_component "$MUXERS_REPORT" \
 		"^[[:space:]]*E[[:space:]]+$MUXER([[:space:]]|$)" \
 		"the $MUXER muxer" ||
 		COMPONENTS_OK="0"
 done
-for FILTER in fps scale format aresample aformat asetnsamples; do
+for FILTER in fps scale format aresample aformat apad asetnsamples; do
 	check_component "$FILTERS_REPORT" \
 		"^[[:space:]]*[^[:space:]]+[[:space:]]+${FILTER}[[:space:]]" \
 		"the $FILTER filter" ||
@@ -677,10 +694,11 @@ done
 printf '%s\n' \
 	"Codec runtime installation complete." \
 	"Verified private FFmpeg: $PRIVATE_FFMPEG" \
+	"Verified frame-aligned MJPEG relay: $PRIVATE_RELAY" \
 	"Verified video decoders: h264, hevc, vc1" \
 	"Verified audio decoders: aac, ac3, eac3, alac, dca, flac, mp3, opus, pcm_s16le, truehd, vorbis" \
 	"Verified video pipeline: mjpeg encoder, mpjpeg stream, image2 compatibility, fps, scale, format" \
-	"Verified audio pipeline: pcm_s16le, s16le, aresample, aformat, asetnsamples"
+	"Verified audio pipeline: pcm_s16le, s16le, tee, aresample, aformat, apad, asetnsamples"
 }
 
 main "$@"

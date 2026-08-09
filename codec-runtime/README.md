@@ -42,21 +42,25 @@ executable.
 
 ## Runtime isolation
 
-The package installs one executable at:
+The package installs two private executables at:
 
 ```text
 /usr/libexec/videoplayer-ffmpeg/ffmpeg
+/usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay
 ```
 
 It does not replace `/usr/bin/ffmpeg`, any system `libav*.so`, or any other
 global library. The libav components are linked statically into the private
-executable. Its only permitted dynamic dependency is the target's `libc`.
+FFmpeg executable. The small frame-aligned MJPEG relay is compiled for the
+same target ABI. Each executable's only permitted dynamic dependency is the
+target's `libc`.
 Network protocols, AV devices, hardware accelerators, and auto-detected
 external libraries are disabled.
 
 The build enables native software decoders and the components required for
 H.264-to-continuous-MJPEG video output and AAC-to-48 kHz stereo PCM audio
-output. This includes the `mpjpeg` streaming muxer plus H.264, HEVC, VC-1,
+output. This includes the `mpjpeg`, raw PCM, and `tee` muxers plus the `apad`
+filter used to end both outputs on the video timeline; H.264, HEVC, VC-1,
 MPEG-4, VP8, VP9, AV1, MJPEG, AAC, AC-3, E-AC-3, DTS, FLAC, MP3, Opus,
 TrueHD, and Vorbis, subject to what FFmpeg 6.1.4 supports. It is not a promise
 to decode every existing or future media format, DRM system, encrypted stream,
@@ -72,6 +76,11 @@ Every matrix entry records:
 - SDK filename and SHA-256 checksum;
 - `feeds.buildinfo` checksum and packages-feed commit;
 - QEMU user-mode emulator and the applicable runtime or static validation mode.
+
+`BUILD_INFO` also records the `buffered-tee-v1` renderer profile. The
+installer uses that capability marker to force-reinstall an older
+`6.1.4-r3` package which predates the unified tee/apad output or its
+frame-aligned relay, while retaining the explicitly fixed package version.
 
 Multiple OpenWrt targets can share a userspace package ABI. The representative
 SDK target is therefore build provenance, not an installation restriction.
@@ -93,9 +102,10 @@ feed's FFmpeg patch set, and builds the private package with
 
 Each resulting executable is checked for:
 
-- an isolated two-file package payload;
+- an isolated three-file package payload;
 - exact package name, version, ABI, internal build metadata, and ELF target;
 - no dynamic libav dependency, RPATH, or unexpected shared library;
+- frame-aligned MJPEG relay resynchronization after a truncated segment;
 - required decoder, encoder, demuxer, muxer, and filter lists;
 - H.264-to-multipart-MJPEG decoding under the architecture's QEMU user
   emulator when the ISA is faithfully supported;

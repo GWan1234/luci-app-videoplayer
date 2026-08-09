@@ -121,6 +121,32 @@ function fakeImageElement() {
 	return node;
 }
 
+function fakeCanvasElement() {
+	const context = {
+		drawCalls: [],
+		clearCalls: 0,
+		drawImage(...args) {
+			this.drawCalls.push(args);
+		},
+		clearRect() {
+			this.clearCalls++;
+		}
+	};
+	return {
+		id: 'videoplayer-cpu-canvas',
+		className: 'videoplayer-cpu-canvas',
+		width: 640,
+		height: 360,
+		hidden: true,
+		parentNode: null,
+		getContext(type) {
+			return type === '2d' ? context : null;
+		},
+		setAttribute() {},
+		context
+	};
+}
+
 function fakeImageParent(initialNode) {
 	const parent = {
 		children: [],
@@ -203,6 +229,7 @@ function fakeContext(options = {}) {
 		closed: false,
 		resumed: false,
 		resumeCalls: 0,
+		suspendCalls: 0,
 		createGain() {
 			return {
 				gain: {
@@ -264,6 +291,13 @@ function fakeContext(options = {}) {
 				return Promise.reject(outcome);
 			this.state = 'running';
 			return Promise.resolve(outcome);
+		},
+		suspend() {
+			this.suspendCalls++;
+			this.state = 'suspended';
+			if (typeof this.onstatechange === 'function')
+				this.onstatechange();
+			return Promise.resolve();
 		},
 		close() {
 			this.closed = true;
@@ -342,6 +376,11 @@ function deferred() {
 		reject = rejectPromise;
 	});
 	return { promise, resolve, reject };
+}
+
+async function flushMicrotasks(rounds = 8) {
+	for (let i = 0; i < rounds; i++)
+		await Promise.resolve();
 }
 
 function installFakeClock(start = 100000) {
@@ -1130,7 +1169,7 @@ async function main() {
 			media_offset_ms: 500
 		};
 	};
-	const originalAudioScheduler = app._scheduleCpuAudioPoll;
+	const bufferedOriginalAudioScheduler = app._scheduleCpuAudioPoll;
 	let primaryPcmPolls = 0;
 	app._scheduleCpuAudioPoll = () => {
 		primaryPcmPolls++;
@@ -1216,7 +1255,7 @@ async function main() {
 		'PCM failure did not close its AudioContext');
 	app._canUseCpuFetchStream = originalCanUseCpuFetchStream;
 	app._startCpuFetchStream = originalStartCpuFetchStream;
-	app._scheduleCpuAudioPoll = originalAudioScheduler;
+	app._scheduleCpuAudioPoll = bufferedOriginalAudioScheduler;
 
 	/* Native multipart <img> transport has no per-frame clock. Even if PCM is
 	 * available, it must be closed and replaced by browser audio rather than
@@ -2075,8 +2114,8 @@ async function main() {
 	await syncAudio.playPromise;
 	check(Math.abs(syncElement.currentTime - 0.1) < 0.001,
 		'audio did not hard-resync to the slow displayed video frame');
-	check(syncElement.playbackRate < 1 && syncElement.playbackRate >= 0.25,
-		'audio playback rate did not follow the bounded slow video clock');
+	check(syncElement.playbackRate === 1 && syncElement.preservesPitch,
+		'browser audio changed pitch to follow a slow video clock');
 
 	/* While one JPEG is decoding, retain only the newest complete part. */
 	app._consumeCpuMjpegChunk(syncSession, syncAttempt, makeMjpegPart(jpeg));
@@ -2266,10 +2305,10 @@ async function main() {
 	const offsetSource = pcmSyncContext.createdSources.at(-1);
 	check(Math.abs(offsetSource.startOffset - 0.125) < 0.001,
 		'PCM AudioBufferSource did not start at the sub-chunk offset');
-	check(Math.abs(offsetSource.videoplayerPlaybackRate - 0.5) < 0.001,
-		'PCM playback rate did not follow the displayed video rate');
+	check(Math.abs(offsetSource.videoplayerPlaybackRate - 1) < 0.001,
+		'PCM playback rate changed pitch to follow the displayed video rate');
 	check(Math.abs(offsetSource.videoplayerMediaStart - 1.375) < 0.001 &&
-		Math.abs(offsetSource.videoplayerEndAt - offsetSource.videoplayerStartAt - 0.25) < 0.001,
+		Math.abs(offsetSource.videoplayerEndAt - offsetSource.videoplayerStartAt - 0.125) < 0.001,
 		'PCM source timeline metadata does not match its offset and rate');
 	pcmSyncSession.videoFrameAt = Date.now() - 1000;
 	app._pollCpuAvSync(pcmSyncSession);
@@ -2476,6 +2515,7 @@ async function main() {
 	const unsupportedAttempt = {
 		id: 1,
 		mode: 'fetch',
+		streamId: '94-1',
 		openedAt: Date.now(),
 		lastProgressAt: Date.now(),
 		ready: false,
@@ -2536,6 +2576,1913 @@ async function main() {
 	delete window.AbortController;
 	window.Blob = originalBlob;
 	fetchClock.restore();
+
+	/* Buffered router playback waits for a full two-minute A/V horizon, while a
+	 * short file can start as soon as its complete duration has arrived. */
+	const originalBufferedStart = app._startCpuBufferedPlayback;
+	let bufferedStarts = 0;
+	app._startCpuBufferedPlayback = () => { bufferedStarts++; };
+	const gateSession = {
+		active: true,
+		generation: 120,
+		bufferedPlayback: true,
+		bufferState: 'buffering',
+		fps: 10,
+		durationSeconds: 1,
+		durationSealed: false,
+		renderedSeconds: 119.99,
+		playedSeconds: 0,
+		producerEnded: false,
+		videoProducerDrained: false,
+		audio: {
+			active: true,
+			bufferedUntil: 180,
+			producerEnded: false
+		}
+	};
+	app._cpuSession = gateSession;
+	app._playGeneration = 120;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._maybeStartCpuBufferedPlayback(gateSession);
+	check(bufferedStarts === 0 &&
+		!app._cpuBufferedPlaybackFinished(gateSession),
+		'forged one-second metadata bypassed the strict 120-second gate');
+	gateSession.renderedSeconds = 120;
+	app._maybeStartCpuBufferedPlayback(gateSession);
+	check(bufferedStarts === 1, 'the complete 120-second buffer did not start playback');
+	gateSession.durationSeconds = 45;
+	gateSession.renderedSeconds = 44.9;
+	gateSession.audio.bufferedUntil = 45;
+	app._maybeStartCpuBufferedPlayback(gateSession);
+	check(bufferedStarts === 1,
+		'a known short file started before its exact duration or clean EOF');
+	gateSession.renderedSeconds = 45;
+	app._maybeStartCpuBufferedPlayback(gateSession);
+	check(bufferedStarts === 1,
+		'a known short file started from advisory duration before clean EOF');
+	gateSession.producerEnded = true;
+	gateSession.videoProducerDrained = true;
+	gateSession.audio.producerEnded = true;
+	app._sealCpuBufferedDuration(gateSession);
+	app._maybeStartCpuBufferedPlayback(gateSession);
+	check(bufferedStarts === 2 && gateSession.durationSealed,
+		'a clean known short file did not start from its sealed duration');
+	gateSession.durationSeconds = 1;
+	gateSession.durationSealed = false;
+	gateSession.renderedSeconds = 30;
+	gateSession.videoProducerDrained = false;
+	gateSession.audio.producerEnded = false;
+	app._maybeStartCpuBufferedPlayback(gateSession);
+	check(bufferedStarts === 2,
+		'short video started before its video/audio EOF was complete');
+	gateSession.videoProducerDrained = true;
+	gateSession.audio.producerEnded = true;
+	app._sealCpuBufferedDuration(gateSession);
+	app._maybeStartCpuBufferedPlayback(gateSession);
+	check(bufferedStarts === 3,
+		'clean short video did not start after complete EOF');
+	check(gateSession.durationSeconds === 30 && gateSession.durationSealed,
+		'clean EOF did not replace forged metadata with rendered media time');
+	app._startCpuBufferedPlayback = originalBufferedStart;
+
+	/* Both progress values are media times, are independently labelled, and use
+	 * the backend duration when present. Unknown duration remains explicit. */
+	elements['vp-cpu-rendered-time'] = { textContent: '' };
+	elements['vp-cpu-played-time'] = { textContent: '' };
+	gateSession.renderedSeconds = 120.8;
+	gateSession.playedSeconds = 31.9;
+	gateSession.durationSeconds = 600;
+	app._updateCpuBufferedCounters(gateSession, true);
+	check(elements['vp-cpu-rendered-time'].textContent === '02:00 / 10:00',
+		'rendered-time counter is not a labelled media duration');
+	check(elements['vp-cpu-played-time'].textContent === '00:31 / 10:00',
+		'played-time counter is not a labelled media duration');
+	gateSession.durationSeconds = null;
+	app._updateCpuBufferedCounters(gateSession, true);
+	check(elements['vp-cpu-rendered-time'].textContent.endsWith(' / ?'),
+		'unknown backend duration was not shown as unknown');
+	delete elements['vp-cpu-rendered-time'];
+	delete elements['vp-cpu-played-time'];
+
+	/* PCM prefetch starts at sequence zero and drains multiple contiguous chunks
+	 * per request into browser-owned memory. */
+	const bufferedContext = fakeContext();
+	const bufferedAudio = {
+		active: true,
+		context: bufferedContext,
+		gain: bufferedContext.createGain(),
+		url: '/cgi-bin/videoplayer-audio?token=' + 'f'.repeat(32),
+		pollGeneration: 0,
+		inFlight: false,
+		inFlightGeneration: null,
+		fetchSequence: 0,
+		playSequence: null,
+		batchMaxChunks: 8,
+		bufferedChunks: Object.create(null),
+		bufferedBytes: 0,
+		bufferedUntil: 0,
+		producerEnded: false,
+		ended: false,
+		errors: 0,
+		sources: []
+	};
+	const bufferedCanvas = fakeCanvasElement();
+	const bufferedSession = {
+		active: true,
+		generation: 121,
+		bufferedPlayback: true,
+		bufferState: 'buffering',
+		producerEnded: false,
+		fps: 10,
+		durationSeconds: 600,
+		renderedSeconds: 0,
+		playedSeconds: 0,
+		videoFrames: [],
+		videoFrameIndex: 0,
+		videoBufferBytes: 0,
+		videoDecodeBytes: 0,
+		videoDecodeInFlight: null,
+		videoDecodeGeneration: 0,
+		displayedSequence: -1,
+		canvas: bufferedCanvas,
+		canvasContext: bufferedCanvas.context,
+		audio: bufferedAudio,
+		presentationTimer: null,
+		finishing: null
+	};
+	app._cpuSession = bufferedSession;
+	app._playGeneration = 121;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	let bufferedQuery = null;
+	let bufferedPollDelay = null;
+	const originalAudioScheduler = app._scheduleCpuAudioPoll;
+	app._scheduleCpuAudioPoll = (activeSession, delay) => {
+		check(activeSession === bufferedSession, 'wrong buffered audio session scheduled');
+		bufferedPollDelay = delay;
+	};
+	request.get = (url, options) => {
+		bufferedQuery = options.query;
+		const values = {
+			'content-type': 'application/octet-stream',
+			'content-length': '96000',
+			'x-videoplayer-audio-format': 's16le',
+			'x-videoplayer-audio-sequence': '0',
+			'x-videoplayer-audio-chunk-count': '2',
+			'x-videoplayer-audio-frames-per-chunk': '12000',
+			'x-videoplayer-audio-total-frames': '24000',
+			'x-videoplayer-audio-sample-rate': '48000',
+			'x-videoplayer-audio-channels': '2'
+		};
+		return Promise.resolve({
+			status: 200,
+			ok: true,
+			headers: { get: name => values[String(name).toLowerCase()] || null },
+			blob: () => new Blob([ new Uint8Array(96000) ])
+		});
+	};
+	await app._pollCpuBufferedAudio(bufferedSession);
+	check(bufferedQuery.chunk === '0' && bufferedQuery.count === '8',
+		'buffered PCM did not start at zero with the advertised batch size');
+	check(bufferedAudio.fetchSequence === 2 &&
+		bufferedAudio.bufferedChunks[0] instanceof ArrayBuffer &&
+		bufferedAudio.bufferedChunks[1] instanceof ArrayBuffer &&
+		bufferedAudio.bufferedUntil === 0.5,
+		'buffered PCM batch was not retained as two sequential chunks');
+	check(bufferedPollDelay === 0, 'buffered PCM did not immediately drain the next batch');
+	app._scheduleCpuAudioPoll = originalAudioScheduler;
+
+	/* Playback schedules buffered PCM at one fixed rate. Approaching a missing
+	 * next chunk suspends the clock without stopping already scheduled sources. */
+	bufferedSession.bufferState = 'playing';
+	bufferedSession.playClockContextAt = 1.12;
+	bufferedSession.playClockMediaBase = 0;
+	bufferedSession.renderedSeconds = 120;
+	bufferedAudio.playSequence = 0;
+	bufferedAudio.nextPlayTime = 1.12;
+	app._fillCpuBufferedAudioQueue(bufferedSession);
+	const fixedRateSource = bufferedContext.createdSources.at(-1);
+	check(fixedRateSource.videoplayerPlaybackRate === 1 &&
+		fixedRateSource.playbackRate.value === 1,
+		'buffered PCM was pitch-shifted away from normal speed');
+	const originalCreatePcmBuffer = bufferedContext.createBuffer;
+	const originalScheduleDisable = app._disableCpuAudio;
+	let scheduleDisableCalls = 0;
+	bufferedContext.createBuffer = () => {
+		throw new Error('closed AudioContext fixture');
+	};
+	app._disableCpuAudio = (activeSession, message, backendDraining) => {
+		check(activeSession === bufferedSession &&
+			/closed AudioContext fixture/.test(message) && !backendDraining,
+			'Web Audio scheduling exception used an unsafe fallback path');
+		scheduleDisableCalls++;
+		return Promise.resolve(true);
+	};
+	const retainedPlaySequence = bufferedAudio.playSequence;
+	const retainedChunk = new ArrayBuffer(48000);
+	const retainedNextPlayTime = bufferedAudio.nextPlayTime;
+	const retainedBufferedBytes = bufferedAudio.bufferedBytes;
+	const previousRetainedChunk =
+		bufferedAudio.bufferedChunks[retainedPlaySequence];
+	bufferedAudio.bufferedChunks[retainedPlaySequence] = retainedChunk;
+	bufferedAudio.bufferedBytes += retainedChunk.byteLength;
+	bufferedAudio.nextPlayTime = bufferedContext.currentTime;
+	check(app._fillCpuBufferedAudioQueue(bufferedSession) === false &&
+		scheduleDisableCalls === 1 &&
+		bufferedAudio.playSequence === retainedPlaySequence &&
+		bufferedAudio.bufferedChunks[retainedPlaySequence] === retainedChunk,
+		'Web Audio createBuffer exception escaped or discarded unscheduled PCM');
+	if (previousRetainedChunk instanceof ArrayBuffer)
+		bufferedAudio.bufferedChunks[retainedPlaySequence] = previousRetainedChunk;
+	else
+		delete bufferedAudio.bufferedChunks[retainedPlaySequence];
+	bufferedAudio.bufferedBytes = retainedBufferedBytes;
+	bufferedAudio.nextPlayTime = retainedNextPlayTime;
+	bufferedContext.createBuffer = originalCreatePcmBuffer;
+	app._disableCpuAudio = originalScheduleDisable;
+	bufferedSession.playClockContextAt = 1;
+	bufferedContext.currentTime = 11;
+	bufferedAudio.nextPlayTime = 11.01;
+	const originalPresentationScheduler = app._scheduleCpuBufferedPresentation;
+	app._scheduleCpuBufferedPresentation = () => {};
+	app._pollCpuBufferedPresentation(bufferedSession);
+	check(bufferedSession.bufferState === 'rebuffering' &&
+		bufferedContext.suspendCalls === 1 && !fixedRateSource.stopped &&
+		Math.abs(bufferedSession.playedSeconds - 10) < 0.001 &&
+		Math.abs(app._cpuBufferedPlaybackTime(bufferedSession) - 10) < 0.001,
+		'a PCM underrun chopped the scheduled source instead of suspending its clock');
+	bufferedAudio.bufferedUntil = 39.9;
+	app._maybeStartCpuBufferedPlayback(bufferedSession);
+	check(bufferedSession.bufferState === 'rebuffering',
+		'rebuffer resumed before the 30-second refill watermark');
+	bufferedAudio.bufferedUntil = 40;
+	app._maybeStartCpuBufferedPlayback(bufferedSession);
+	await flushMicrotasks();
+	check(bufferedSession.bufferState === 'playing' &&
+		bufferedContext.resumeCalls >= 1 &&
+		Math.abs(app._cpuBufferedPlaybackTime(bufferedSession) - 10) < 0.001,
+		'30-second refill did not resume the same suspended audio clock');
+	bufferedContext.currentTime = 12;
+	check(Math.abs(app._cpuBufferedPlaybackTime(bufferedSession) - 11) < 0.001,
+		'rebuffer resume double-counted the already played media time');
+
+	/* FFmpeg may report ended while the last open CGI is still draining. Keep
+	 * audio paused when playback catches that incomplete video tail; only the
+	 * independently confirmed transport drain can permit terminal completion. */
+	bufferedSession.producerEnded = true;
+	bufferedSession.videoProducerDrained = false;
+	bufferedSession.renderedSeconds = 11.1;
+	bufferedAudio.producerEnded = true;
+	bufferedAudio.nextPlayTime = 20;
+	app._pollCpuBufferedPresentation(bufferedSession);
+	check(bufferedSession.bufferState === 'rebuffering',
+		'terminal status let audio run ahead of a still-draining video tail');
+	bufferedSession.playedSeconds = 11.1;
+	check(!app._cpuBufferedPlaybackFinished(bufferedSession),
+		'incomplete final video transport was treated as finished');
+	bufferedSession.videoProducerDrained = true;
+	bufferedSession.lastBufferedFrameSequence = 110;
+	bufferedSession.displayedSequence = 110;
+	bufferedSession.videoFrameIndex = bufferedSession.videoFrames.length;
+	check(app._cpuBufferedPlaybackFinished(bufferedSession),
+		'clean final video drain did not permit terminal completion');
+	bufferedSession.producerEnded = false;
+	bufferedSession.videoProducerDrained = false;
+	bufferedAudio.producerEnded = false;
+
+	const originalBufferedFailure = app._failCpuBufferedPlayback;
+	let capFailures = 0;
+	app._failCpuBufferedPlayback = (activeSession, message) => {
+		check(activeSession === bufferedSession && /512 MiB/.test(message),
+			'hard-cap failure did not identify its memory limit');
+		capFailures++;
+	};
+	const capAttempt = { ready: true, cancelled: false };
+	bufferedSession.streamVisibleAttempt = capAttempt;
+	bufferedSession.videoBufferBytes = 512 * 1024 * 1024 - 2;
+	app._acceptCpuBufferedFrame(
+		bufferedSession,
+		capAttempt,
+		new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+		0
+	);
+	check(capFailures === 1 && bufferedSession.videoFrames.length === 0,
+		'buffer hard cap retained a frame instead of failing before OOM');
+	bufferedSession.videoBufferBytes = 0;
+	app._failCpuBufferedPlayback = originalBufferedFailure;
+
+	/* JPEGs are decoded off-DOM and drawn onto one persistent canvas. Stopping a
+	 * session invalidates a late decode callback and releases all queued bytes. */
+	window.Blob = global.Blob;
+	bufferedSession.bufferState = 'playing';
+	const originalFrameObjectUrl = window.URL.createObjectURL;
+	const originalFrameSetupFailure = app._failCpuBufferedPlayback;
+	let frameSetupFailures = 0;
+	window.URL.createObjectURL = () => {
+		throw new Error('blob URL memory fixture');
+	};
+	app._failCpuBufferedPlayback = (activeSession, message) => {
+		check(activeSession === bufferedSession &&
+			/blob URL memory fixture/.test(message),
+			'JPEG setup exception reported the wrong buffered failure');
+		frameSetupFailures++;
+	};
+	bufferedSession.videoFrames = [ {
+		bytes: new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+		sequence: 99,
+		mediaTime: 9.9
+	} ];
+	bufferedSession.videoFrameIndex = 0;
+	bufferedSession.videoBufferBytes = 4;
+	bufferedSession.videoDecodeBytes = 0;
+	bufferedSession.videoDecodeInFlight = null;
+	app._decodeCpuBufferedFrame(bufferedSession, 99);
+	check(frameSetupFailures === 1 &&
+		bufferedSession.videoDecodeInFlight === null &&
+		bufferedSession.videoDecodeBytes === 0 &&
+		bufferedSession.videoBufferBytes === 0,
+		'JPEG Blob URL exception leaked decode bytes or stalled presentation');
+	window.URL.createObjectURL = originalFrameObjectUrl;
+	app._failCpuBufferedPlayback = originalFrameSetupFailure;
+	bufferedSession.videoFrames = [ {
+		bytes: new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+		sequence: 0,
+		mediaTime: 0
+	} ];
+	bufferedSession.videoFrameIndex = 0;
+	bufferedSession.videoBufferBytes = 4;
+	bufferedSession.videoDecodeBytes = 0;
+	bufferedSession.videoDecodeInFlight = null;
+	app._decodeCpuBufferedFrame(bufferedSession, 0);
+	const firstCanvasDecode = bufferedSession.videoDecodeInFlight;
+	check(firstCanvasDecode && bufferedCanvas.context.drawCalls.length === 0,
+		'buffered JPEG was not decoded off-DOM');
+	firstCanvasDecode.node.naturalWidth = 640;
+	firstCanvasDecode.node.naturalHeight = 360;
+	firstCanvasDecode.node.onload();
+	check(bufferedCanvas.context.drawCalls.length === 1 &&
+		bufferedSession.canvas === bufferedCanvas &&
+		bufferedSession.displayedSequence === 0,
+		'buffered JPEG replaced the surface instead of drawing on its canvas');
+	bufferedSession.videoFrames = [ {
+		bytes: new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+		sequence: 1,
+		mediaTime: 0.1
+	} ];
+	bufferedSession.videoFrameIndex = 0;
+	bufferedSession.videoBufferBytes = 4;
+	app._decodeCpuBufferedFrame(bufferedSession, 1);
+	bufferedSession.videoDecodeInFlight.node.onerror();
+	check(bufferedCanvas.context.drawCalls.length === 1,
+		'a failed JPEG decode erased the last complete canvas frame');
+	bufferedSession.videoFrames = [ {
+		bytes: new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+		sequence: 2,
+		mediaTime: 0.2
+	} ];
+	bufferedSession.videoFrameIndex = 0;
+	bufferedSession.videoBufferBytes = 4;
+	app._decodeCpuBufferedFrame(bufferedSession, 2);
+	bufferedSession.videoDecodeInFlight.node.naturalWidth = 640;
+	bufferedSession.videoDecodeInFlight.node.naturalHeight = 360;
+	bufferedSession.videoDecodeInFlight.node.onload();
+	check(bufferedCanvas.context.drawCalls.length === 2 &&
+		bufferedSession.displayedSequence === 2,
+		'a decode error prevented a later/reconnected frame from drawing');
+
+	/* At 50/60 FPS the old fixed 20 ms end tolerance detached the session while
+	 * its final JPEG was still decoding. Completion now waits for that exact
+	 * sequence to reach the persistent canvas and for the queue to be empty. */
+	for (const tailFps of [ 50, 60 ]) {
+		const finalSequence = tailFps;
+		const renderedEnd = (finalSequence + 1) / tailFps;
+		bufferedSession.fps = tailFps;
+		bufferedSession.producerEnded = true;
+		bufferedSession.videoProducerDrained = true;
+		bufferedAudio.producerEnded = true;
+		bufferedSession.renderedSeconds = renderedEnd;
+		bufferedSession.playedSeconds = renderedEnd - 0.0005;
+		bufferedSession.lastBufferedFrameSequence = finalSequence;
+		bufferedSession.lastDecodeFailureSequence = -1;
+		bufferedSession.displayedSequence = finalSequence - 1;
+		bufferedSession.videoFrames = [ {
+			bytes: new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+			sequence: finalSequence,
+			mediaTime: finalSequence / tailFps
+		} ];
+		bufferedSession.videoFrameIndex = 0;
+		bufferedSession.videoBufferBytes = 4;
+		bufferedSession.videoDecodeBytes = 0;
+		bufferedSession.videoDecodeInFlight = null;
+		app._decodeCpuBufferedFrame(bufferedSession, finalSequence);
+		const finalDecode = bufferedSession.videoDecodeInFlight;
+		check(finalDecode && !app._cpuBufferedPlaybackFinished(bufferedSession),
+			`${tailFps} FPS playback finished during its final async decode`);
+		finalDecode.node.naturalWidth = 640;
+		finalDecode.node.naturalHeight = 360;
+		finalDecode.node.onload();
+		check(app._cpuBufferedPlaybackFinished(bufferedSession),
+			`${tailFps} FPS playback did not finish after its final canvas draw`);
+		bufferedSession.playedSeconds = renderedEnd - 0.0015;
+		check(!app._cpuBufferedPlaybackFinished(bufferedSession),
+			`${tailFps} FPS playback retained the unsafe 20 ms end tolerance`);
+	}
+
+	/* Returning from a hidden/rebuffering state in the final sub-250 ms tail must
+	 * resume long enough to present the last frame; the ordinary 30-second refill
+	 * watermark and PCM-chunk tolerance must not deadlock clean EOF. */
+	const originalTailResume = app._resumeCpuBufferedPlayback;
+	let tailResumes = 0;
+	app._resumeCpuBufferedPlayback = activeSession => {
+		check(activeSession === bufferedSession,
+			'final-tail resume targeted the wrong session');
+		tailResumes++;
+	};
+	document.hidden = false;
+	bufferedSession.bufferState = 'hidden';
+	bufferedSession.fps = 60;
+	bufferedSession.renderedSeconds = 10;
+	bufferedSession.playedSeconds = 9.99;
+	bufferedSession.lastBufferedFrameSequence = 599;
+	bufferedSession.displayedSequence = 598;
+	bufferedSession.videoFrames = [ {
+		bytes: new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+		sequence: 599,
+		mediaTime: 599 / 60
+	} ];
+	bufferedSession.videoFrameIndex = 0;
+	bufferedSession.videoDecodeInFlight = null;
+	app._maybeStartCpuBufferedPlayback(bufferedSession);
+	check(tailResumes === 1,
+		'clean final sub-chunk tail remained stuck after visibility recovery');
+	app._resumeCpuBufferedPlayback = originalTailResume;
+	bufferedSession.bufferState = 'playing';
+	bufferedSession.producerEnded = false;
+	bufferedSession.videoProducerDrained = false;
+	bufferedAudio.producerEnded = false;
+	const drawsBeforeStaleDecode = bufferedCanvas.context.drawCalls.length;
+	bufferedSession.videoFrames = [ {
+		bytes: new Uint8Array([ 0xff, 0xd8, 0xff, 0xd9 ]),
+		sequence: 3,
+		mediaTime: 0.3
+	} ];
+	bufferedSession.videoFrameIndex = 0;
+	bufferedSession.videoBufferBytes = 4;
+	app._decodeCpuBufferedFrame(bufferedSession, 3);
+	const staleDecode = bufferedSession.videoDecodeInFlight;
+	const staleOnload = staleDecode.node.onload;
+	app._stopPlayback();
+	staleDecode.node.naturalWidth = 640;
+	staleDecode.node.naturalHeight = 360;
+	staleOnload();
+	check(bufferedCanvas.context.drawCalls.length === drawsBeforeStaleDecode &&
+		bufferedSession.videoFrames.length === 0 &&
+		bufferedSession.videoBufferBytes === 0 &&
+		bufferedSession.videoDecodeBytes === 0,
+		'cleanup retained bytes or allowed a stale JPEG to overwrite the canvas');
+	app._scheduleCpuBufferedPresentation = originalPresentationScheduler;
+	window.Blob = originalBlob;
+
+	/* If Web Audio closes during playback, capture its media clock before
+	 * disposing it. Browser-audio resolution may take seconds; the canvas clock
+	 * must remain paused at the captured position and the PCM ACK cursor must
+	 * continue through a discard drainer meanwhile. */
+	const closeContext = fakeContext();
+	closeContext.currentTime = 11;
+	const closingAudio = {
+		active: true,
+		context: closeContext,
+		gain: closeContext.createGain(),
+		url: '/cgi-bin/videoplayer-audio?token=' + '1'.repeat(32),
+		fetchSequence: 12,
+		batchMaxChunks: 8,
+		pollGeneration: 0,
+		timer: null,
+		inFlight: false,
+		inFlightGeneration: null,
+		bufferedChunks: Object.create(null),
+		bufferedBytes: 0,
+		bufferedUntil: 180,
+		producerEnded: false,
+		bufferPaused: false,
+		nextPlayTime: 11,
+		sources: []
+	};
+	const closingSession = {
+		active: true,
+		generation: 122,
+		token: '1'.repeat(32),
+		label: 'closing-audio.mp4',
+		relPath: 'closing-audio.mp4',
+		bufferedPlayback: true,
+		bufferState: 'playing',
+		producerEnded: false,
+		videoProducerDrained: false,
+		fps: 10,
+		durationSeconds: 600,
+		renderedSeconds: 180,
+		playedSeconds: 0,
+		playClockMediaBase: 0,
+		playClockContextAt: 1,
+		playClockWallAt: null,
+		audio: closingAudio,
+		pendingAudio: null,
+		audioDrainer: null,
+		browserAudio: null,
+		browserAudioFailed: false,
+		presentationTimer: null,
+		finishing: null
+	};
+	app._cpuSession = closingSession;
+	app._playGeneration = 122;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	const delayedBrowserAudio = deferred();
+	const originalBrowserFallback = app._startCpuBrowserAudioFallback;
+	const originalDrainScheduler = app._scheduleCpuAudioDrainPoll;
+	const originalBufferedScheduler = app._scheduleCpuBufferedPresentation;
+	let closeDrainPolls = 0;
+	app._scheduleCpuAudioDrainPoll = activeSession => {
+		check(activeSession === closingSession,
+			'PCM-close drainer scheduled the wrong session');
+		closeDrainPolls++;
+	};
+	app._scheduleCpuBufferedPresentation = () => {};
+	app._startCpuBrowserAudioFallback = activeSession => {
+		check(activeSession === closingSession,
+			'PCM-close browser fallback used the wrong session');
+		const fallback = {
+			active: true,
+			resolving: true,
+			playAttempt: 0,
+			element: null
+		};
+		activeSession.browserAudio = fallback;
+		return delayedBrowserAudio.promise.then(() => {
+			fallback.resolving = false;
+			return true;
+		});
+	};
+	const disablingAudio = app._disableCpuAudio(
+		closingSession, 'forced mid-play PCM close'
+	);
+	check(
+		closingSession.audio === null &&
+		closingSession.bufferState === 'rebuffering' &&
+		Math.abs(closingSession.playedSeconds - 10) < 0.001 &&
+		Math.abs(closingSession.playClockMediaBase - 10) < 0.001 &&
+		closingSession.playClockContextAt === null &&
+		closingSession.playClockWallAt === null,
+		'mid-play PCM close did not atomically freeze its media clock'
+	);
+	check(
+		closingSession.audioDrainer &&
+		closingSession.audioDrainer.fetchSequence === 12 &&
+		closeDrainPolls === 1,
+		'mid-play PCM close did not continue ACK draining at the next sequence'
+	);
+	closeContext.currentTime = 99;
+	app._maybeStartCpuBufferedPlayback(closingSession);
+	check(
+		closingSession.bufferState === 'rebuffering' &&
+		Math.abs(app._cpuBufferedPlaybackTime(closingSession) - 10) < 0.001,
+		'buffered playback resumed or jumped while browser audio was resolving'
+	);
+	delayedBrowserAudio.resolve();
+	await disablingAudio;
+	app._stopPlayback();
+	app._startCpuBrowserAudioFallback = originalBrowserFallback;
+	app._scheduleCpuAudioDrainPoll = originalDrainScheduler;
+	app._scheduleCpuBufferedPresentation = originalBufferedScheduler;
+
+	/* A resume requested while AudioContext.suspend() is still pending must be
+	 * serialized after that suspend; otherwise a late suspend leaves a session
+	 * marked playing with a stopped clock. */
+	const deferredSuspend = deferred();
+	const suspendContext = fakeContext();
+	suspendContext.currentTime = 11;
+	suspendContext.suspend = function () {
+		this.suspendCalls++;
+		return deferredSuspend.promise.then(() => {
+			this.state = 'suspended';
+		});
+	};
+	const suspendAudio = {
+		active: true,
+		context: suspendContext,
+		gain: suspendContext.createGain(),
+		bufferedChunks: Object.create(null),
+		bufferedBytes: 0,
+		bufferedUntil: 40,
+		producerEnded: false,
+		playSequence: 0,
+		nextPlayTime: 11,
+		bufferPaused: false,
+		suspendGeneration: 0,
+		suspendPromise: null,
+		resumeFailed: false,
+		sources: []
+	};
+	const suspendSession = {
+		active: true,
+		generation: 123,
+		label: 'deferred-suspend.mp4',
+		bufferedPlayback: true,
+		bufferState: 'playing',
+		producerEnded: false,
+		videoProducerDrained: false,
+		fps: 10,
+		durationSeconds: 600,
+		renderedSeconds: 40,
+		playedSeconds: 0,
+		playClockMediaBase: 0,
+		playClockContextAt: 1,
+		playClockWallAt: null,
+		bufferResumeGeneration: 0,
+		audio: suspendAudio,
+		browserAudio: null,
+		presentationTimer: null,
+		finishing: null
+	};
+	app._cpuSession = suspendSession;
+	app._playGeneration = 123;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._scheduleCpuBufferedPresentation = () => {};
+	app._enterCpuBufferedRebuffer(suspendSession, false);
+	app._maybeStartCpuBufferedPlayback(suspendSession);
+	check(suspendSession.bufferState === 'resuming' &&
+		suspendContext.resumeCalls === 0,
+		'buffered playback raced resume ahead of an unfinished suspend');
+	deferredSuspend.resolve();
+	await flushMicrotasks();
+	check(suspendSession.bufferState === 'playing' &&
+		suspendContext.resumeCalls === 1 &&
+		Math.abs(app._cpuBufferedPlaybackTime(suspendSession) - 10) < 0.001,
+		'deferred suspend/resume did not preserve the media clock');
+	app._stopPlayback();
+
+	/* Hiding/rebuffering while resume() itself is pending must queue a suspend
+	 * after it. Otherwise the late resume leaks audible PCM in a hidden tab. */
+	const lateResume = deferred();
+	const lateResumeContext = fakeContext({ state: 'suspended' });
+	lateResumeContext.currentTime = 11;
+	lateResumeContext.resume = function () {
+		this.resumeCalls++;
+		return lateResume.promise.then(() => {
+			this.state = 'running';
+		});
+	};
+	const lateResumeAudio = {
+		active: true,
+		context: lateResumeContext,
+		gain: lateResumeContext.createGain(),
+		bufferedChunks: Object.create(null),
+		bufferedBytes: 0,
+		bufferedUntil: 40,
+		producerEnded: false,
+		playSequence: 0,
+		nextPlayTime: 11,
+		bufferPaused: true,
+		suspendGeneration: 1,
+		suspendPromise: Promise.resolve(true),
+		resumePromise: null,
+		resumeFailed: false,
+		sources: []
+	};
+	const lateResumeSession = {
+		active: true,
+		generation: 132,
+		label: 'late-resume.mp4',
+		bufferedPlayback: true,
+		bufferState: 'rebuffering',
+		producerEnded: false,
+		videoProducerDrained: false,
+		fps: 10,
+		durationSeconds: 600,
+		durationSealed: false,
+		renderedSeconds: 40,
+		playedSeconds: 10,
+		playClockMediaBase: 10,
+		playClockContextAt: 11,
+		playClockWallAt: null,
+		bufferResumeGeneration: 0,
+		audio: lateResumeAudio,
+		browserAudio: null,
+		presentationTimer: null,
+		finishing: null
+	};
+	app._cpuSession = lateResumeSession;
+	app._playGeneration = 132;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._resumeCpuBufferedPlayback(lateResumeSession);
+	await flushMicrotasks(2);
+	check(lateResumeSession.bufferState === 'resuming' &&
+		lateResumeContext.resumeCalls === 1,
+		'late-resume race did not enter its pending resume operation');
+	app._enterCpuBufferedRebuffer(lateResumeSession, true);
+	check(lateResumeSession.bufferState === 'hidden' &&
+		lateResumeContext.suspendCalls === 0,
+		'hide raced an immediate suspend against a pending resume');
+	lateResume.resolve();
+	await flushMicrotasks();
+	check(lateResumeSession.bufferState === 'hidden' &&
+		lateResumeContext.suspendCalls === 1 &&
+		lateResumeContext.state === 'suspended',
+		'late resume left the synchronized audio clock running while hidden');
+	app._stopPlayback();
+	app._scheduleCpuBufferedPresentation = originalBufferedScheduler;
+
+	/* If hybrid browser audio itself fails mid-play, preserve its currentTime as
+	 * the media position and continue with a monotonic silent clock. */
+	const browserFailureClock = installFakeClock(1500000);
+	const failedBrowserElement = fakeMediaElement();
+	failedBrowserElement.currentTime = 73;
+	const failedBrowserAudio = {
+		active: true,
+		resolving: false,
+		playing: true,
+		playPending: false,
+		playAttempt: 0,
+		ended: false,
+		syncPaused: false,
+		syncPausePending: false,
+		syncPauseClearTimer: null,
+		element: failedBrowserElement
+	};
+	const browserFailureSession = {
+		active: true,
+		generation: 130,
+		label: 'browser-audio-failure.mp4',
+		bufferedPlayback: true,
+		bufferState: 'playing',
+		producerEnded: false,
+		videoProducerDrained: false,
+		fps: 10,
+		durationSeconds: 600,
+		durationSealed: false,
+		renderedSeconds: 180,
+		playedSeconds: 0,
+		playClockMediaBase: 0,
+		playClockContextAt: null,
+		playClockWallAt: null,
+		audio: null,
+		pendingAudio: null,
+		browserAudio: failedBrowserAudio,
+		browserAudioFailed: false,
+		presentationTimer: null,
+		finishing: null
+	};
+	app._cpuSession = browserFailureSession;
+	app._cpuBrowserAudioOwner = failedBrowserAudio;
+	app._playGeneration = 130;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._scheduleCpuBufferedPresentation = () => {};
+	app._failCpuBrowserAudio(
+		browserFailureSession,
+		failedBrowserAudio,
+		'forced browser audio failure'
+	);
+	check(browserFailureSession.browserAudio === null &&
+		Math.abs(app._cpuBufferedPlaybackTime(browserFailureSession) - 73) < 0.001,
+		'browser-audio failure reset the buffered media clock');
+	browserFailureClock.advance(1000);
+	check(Math.abs(app._cpuBufferedPlaybackTime(browserFailureSession) - 74) < 0.001,
+		'silent clock did not continue after browser-audio failure');
+	app._stopPlayback();
+	app._scheduleCpuBufferedPresentation = originalBufferedScheduler;
+	browserFailureClock.restore();
+
+	/* A closed AudioContext must be handled by its statechange callback even
+	 * after PCM EOF has stopped polling. */
+	const previousAudioContextClass = window.AudioContext;
+	const lifecycleContext = fakeContext();
+	window.AudioContext = function () { return lifecycleContext; };
+	const lifecycleAudio = app._createCpuAudio();
+	lifecycleAudio.url = '/cgi-bin/videoplayer-audio?token=' + '2'.repeat(32);
+	lifecycleAudio.fetchSequence = 16;
+	lifecycleAudio.batchMaxChunks = 8;
+	lifecycleAudio.bufferedChunks = Object.create(null);
+	lifecycleAudio.bufferedBytes = 0;
+	lifecycleAudio.bufferedUntil = 120;
+	lifecycleAudio.producerEnded = true;
+	lifecycleAudio.bufferPaused = false;
+	lifecycleContext.currentTime = 21;
+	const lifecycleSession = {
+		active: true,
+		generation: 131,
+		token: '2'.repeat(32),
+		label: 'closed-context.mp4',
+		relPath: 'closed-context.mp4',
+		bufferedPlayback: true,
+		bufferState: 'playing',
+		producerEnded: true,
+		videoProducerDrained: true,
+		fps: 10,
+		durationSeconds: 180,
+		durationSealed: true,
+		renderedSeconds: 180,
+		playedSeconds: 0,
+		playClockMediaBase: 0,
+		playClockContextAt: 1,
+		playClockWallAt: null,
+		audio: lifecycleAudio,
+		pendingAudio: null,
+		audioDrainer: null,
+		browserAudio: null,
+		browserAudioFailed: false,
+		presentationTimer: null,
+		finishing: null
+	};
+	app._cpuSession = lifecycleSession;
+	app._playGeneration = 131;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	let lifecycleFallbacks = 0;
+	app._scheduleCpuAudioDrainPoll = () => {};
+	app._startCpuBrowserAudioFallback = activeSession => {
+		lifecycleFallbacks++;
+		activeSession.browserAudio = {
+			active: true,
+			resolving: true,
+			playAttempt: 0,
+			element: null
+		};
+		return Promise.resolve(true);
+	};
+	lifecycleContext.state = 'closed';
+	lifecycleContext.onstatechange();
+	check(lifecycleSession.audio === null &&
+		lifecycleSession.audioDrainer &&
+		lifecycleSession.audioDrainer.fetchSequence === 16 &&
+		Math.abs(lifecycleSession.playedSeconds - 20) < 0.001 &&
+		lifecycleFallbacks === 1,
+		'closed post-EOF AudioContext remained a frozen playback master');
+	app._stopPlayback();
+	app._scheduleCpuAudioDrainPoll = originalDrainScheduler;
+	app._startCpuBrowserAudioFallback = originalBrowserFallback;
+	window.AudioContext = previousAudioContextClass;
+
+	/* A bounded multipart EOF is only a handoff. Even if renderer status arrives
+	 * in the no-successor gap, the browser must issue an explicit terminal drain
+	 * and wait for its authenticated 204 acknowledgement before sealing time. */
+	const originalEofMaybeStart = app._maybeStartCpuBufferedPlayback;
+	const originalEofPresentation = app._scheduleCpuBufferedPresentation;
+	const originalEofStatusScheduler = app._scheduleCpuStreamStatus;
+	const originalEofReconnectScheduler = app._scheduleCpuStreamReconnect;
+	const originalEofFailure = app._failCpuBufferedPlayback;
+	const originalEofFetch = window.fetch;
+	const originalEofAbortController = window.AbortController;
+	let eofStarts = 0;
+	let eofFailures = 0;
+	let eofReconnects = 0;
+	let eofStatusSchedules = 0;
+	app._maybeStartCpuBufferedPlayback = () => { eofStarts++; };
+	app._scheduleCpuBufferedPresentation = () => {};
+	app._scheduleCpuStreamStatus = () => { eofStatusSchedules++; };
+	app._scheduleCpuStreamReconnect = () => { eofReconnects++; };
+	app._failCpuBufferedPlayback = () => { eofFailures++; };
+	const makeEofSession = generation => ({
+		active: true,
+		generation,
+		token: String(generation % 10).repeat(32),
+		label: 'eof-order.mp4',
+		bufferedPlayback: true,
+		bufferState: 'buffering',
+		producerEnded: false,
+		videoProducerDrained: false,
+		videoTerminalDrainConfirmed: false,
+		videoTerminalDrainBodyClean: false,
+		fps: 10,
+		durationSeconds: null,
+		totalFrames: null,
+		renderedSeconds: 30,
+		playedSeconds: 0,
+		videoFrames: [],
+		videoFrameIndex: 0,
+		videoBufferBytes: 0,
+		videoDecodeBytes: 0,
+		audio: null,
+		browserAudio: null,
+		streamPending: null,
+		streamVisibleAttempt: null,
+		streamProbeTimer: null,
+		streamProbeAttempt: null,
+		streamRefreshTimer: null,
+		streamReconnectTimer: null,
+		streamNextHandoffAt: null,
+		streamOutageStartedAt: null,
+		streamErrors: 0,
+		streamFetchErrors: 0,
+		streamStatusInFlight: false,
+		streamStatusAgain: false,
+		streamStatusErrors: 0,
+		streamStatusWarned: false,
+		finishing: null
+	});
+	const pressureSession = makeEofSession(123);
+	const pressureAttempt = {
+		mode: 'fetch',
+		ready: false,
+		ended: false,
+		cancelled: false,
+		backpressured: true
+	};
+	pressureSession.streamSegmentMs = 45000;
+	pressureSession.streamPending = pressureAttempt;
+	app._cpuSession = pressureSession;
+	app._playGeneration = 123;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._markCpuBufferedAttemptReady(pressureSession, pressureAttempt);
+	check(pressureSession.streamVisibleAttempt === pressureAttempt &&
+		pressureSession.streamRefreshTimer === null &&
+		!pressureAttempt.cancelled,
+		'buffered fetch armed a destructive deadline abort under backpressure');
+	pressureAttempt.ended = true;
+	pressureSession.streamVisibleAttempt = null;
+	const statusFirstSession = makeEofSession(124);
+	const statusFirstAttempt = {
+		mode: 'fetch',
+		ready: true,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: true,
+		decodeInFlight: null,
+		queuedFrame: null
+	};
+	statusFirstSession.streamVisibleAttempt = statusFirstAttempt;
+	app._cpuSession = statusFirstSession;
+	app._playGeneration = 124;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	rpcHandlers.renderer_status = () => ({ state: 'ended' });
+	await app._pollCpuStreamStatus(statusFirstSession);
+	check(statusFirstSession.producerEnded &&
+		!statusFirstSession.videoProducerDrained && eofReconnects === 0,
+		'status-first EOF sealed before the open transport drained');
+	app._completeCpuFetchStream(statusFirstSession, statusFirstAttempt);
+	check(!statusFirstSession.videoProducerDrained && eofReconnects === 1,
+		'status-first bounded EOF did not request terminal drain confirmation');
+
+	const transportFirstSession = makeEofSession(125);
+	const transportFirstAttempt = {
+		mode: 'fetch',
+		ready: true,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: true,
+		decodeInFlight: null,
+		queuedFrame: null
+	};
+	transportFirstSession.streamVisibleAttempt = transportFirstAttempt;
+	app._cpuSession = transportFirstSession;
+	app._playGeneration = 125;
+	app._completeCpuFetchStream(transportFirstSession, transportFirstAttempt);
+	check(!transportFirstSession.videoProducerDrained && eofReconnects === 2,
+		'transport-first EOF was finalized before terminal renderer status');
+	await app._pollCpuStreamStatus(transportFirstSession);
+	check(transportFirstSession.producerEnded &&
+		!transportFirstSession.videoProducerDrained && eofReconnects === 3,
+		'no-successor terminal gap did not request the retained FIFO drain');
+
+	/* HTTP 410 is not proof that queued FIFO bytes were delivered. It may only
+	 * trigger another bounded retry while the worker owns its terminal anchor. */
+	const terminalGoneAttempt = {
+		mode: 'fetch',
+		ready: false,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		terminalDrain: true,
+		responseStatus: 410,
+		decodeInFlight: null,
+		queuedFrame: null,
+		reader: null,
+		controller: null
+	};
+	transportFirstSession.streamPending = terminalGoneAttempt;
+	app._handleCpuStreamFailure(transportFirstSession, terminalGoneAttempt);
+	check(!transportFirstSession.videoProducerDrained &&
+		!transportFirstSession.videoTerminalDrainConfirmed &&
+		eofReconnects === 4 && eofFailures === 0,
+		'terminal 410 was incorrectly accepted as a complete FIFO drain');
+
+	/* A terminal 200 must reach a clean Fetch body EOF before the backend-authored
+	 * 204 may seal playback. The marker alone only proves relay-to-CGI delivery;
+	 * it cannot prove that uhttpd flushed its buffered socket tail. */
+	window.AbortController = function () {
+		this.signal = {};
+		this.abort = () => {};
+	};
+	window.fetch = () => Promise.resolve({
+		status: 200,
+		ok: true,
+		headers: {
+			get: name => String(name).toLowerCase() === 'content-type'
+				? 'multipart/x-mixed-replace; boundary=videoplayer-' +
+					transportFirstSession.token
+				: null
+		},
+		body: {
+			getReader: () => ({
+				read: () => Promise.resolve({ done: true }),
+				cancel: () => Promise.resolve()
+			})
+		}
+	});
+	const cleanTerminalBodyAttempt = {
+		mode: 'fetch',
+		streamId: '125-4',
+		ready: false,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		terminalDrain: true,
+		bodyEndedClean: false,
+		decodeInFlight: null,
+		queuedFrame: null,
+		reader: null,
+		controller: null
+	};
+	transportFirstSession.streamPending = cleanTerminalBodyAttempt;
+	app._startCpuFetchStream(
+		transportFirstSession,
+		cleanTerminalBodyAttempt,
+		transportFirstSession.streamUrl + '&stream=125-4&drain=1'
+	);
+	await cleanTerminalBodyAttempt.fetchPromise;
+	check(transportFirstSession.videoTerminalDrainBodyClean &&
+		!transportFirstSession.videoProducerDrained,
+		'clean terminal 200 body was not retained for 204 confirmation');
+
+	/* A terminal socket failure followed by a valid server marker is not
+	 * recoverable: the FIFO was consumed, but its final bytes may never have
+	 * reached this browser. It must fall back instead of silently sealing. */
+	const truncatedTerminalSession = makeEofSession(126);
+	truncatedTerminalSession.producerEnded = true;
+	const reconnectsBeforeTruncated = eofReconnects;
+	app._cpuSession = truncatedTerminalSession;
+	app._playGeneration = 126;
+	window.fetch = () => Promise.resolve({
+		status: 200,
+		ok: true,
+		headers: {
+			get: name => String(name).toLowerCase() === 'content-type'
+				? 'multipart/x-mixed-replace; boundary=videoplayer-' +
+					truncatedTerminalSession.token
+				: null
+		},
+		body: {
+			getReader: () => ({
+				read: () => Promise.reject(new Error('terminal socket cut')),
+				cancel: () => Promise.resolve()
+			})
+		}
+	});
+	const truncatedTerminalAttempt = {
+		mode: 'fetch', ready: false, ended: false, cancelled: false,
+		streamId: '126-1',
+		completed: false, transportEnded: false, terminalDrain: true,
+		bodyEndedClean: false, decodeInFlight: null, queuedFrame: null,
+		reader: null, controller: null
+	};
+	truncatedTerminalSession.streamPending = truncatedTerminalAttempt;
+	app._startCpuFetchStream(
+		truncatedTerminalSession,
+		truncatedTerminalAttempt,
+		truncatedTerminalSession.streamUrl + '&stream=126-1&drain=1'
+	);
+	await truncatedTerminalAttempt.fetchPromise;
+	check(!truncatedTerminalSession.videoProducerDrained && eofFailures === 1 &&
+		eofReconnects === reconnectsBeforeTruncated,
+		'ambiguous terminal 200 failure was retried after consuming FIFO data');
+
+	/* A 204 without the exact nonce-bound acknowledgement headers is never
+	 * terminal proof, even after a prior request has populated local evidence. */
+	window.fetch = () => Promise.resolve({
+		status: 204,
+		ok: true,
+		headers: {
+			get: name => String(name).toLowerCase() ===
+				'x-videoplayer-video-drain'
+				? 'complete'
+				: null
+		}
+	});
+	const rejectedTerminalConfirmation = {
+		mode: 'fetch', ready: false, ended: false, cancelled: false,
+		completed: false, transportEnded: false, terminalDrain: true,
+		terminalCheck: true, streamId: '126-1',
+		bodyEndedClean: false, decodeInFlight: null, queuedFrame: null,
+		reader: null, controller: null
+	};
+	truncatedTerminalSession.streamPending = rejectedTerminalConfirmation;
+	app._startCpuFetchStream(
+		truncatedTerminalSession,
+		rejectedTerminalConfirmation,
+		truncatedTerminalSession.streamUrl + '&stream=126-1&drain=check'
+	);
+	await rejectedTerminalConfirmation.fetchPromise;
+	check(!truncatedTerminalSession.videoProducerDrained && eofFailures === 2,
+		'incomplete terminal 204 acknowledgement silently sealed missing frames');
+
+	app._cpuSession = transportFirstSession;
+	app._playGeneration = 125;
+	window.fetch = () => Promise.resolve({
+		status: 204,
+		ok: true,
+		headers: {
+			get: name => {
+				switch (String(name).toLowerCase()) {
+				case 'x-videoplayer-video-drain': return 'complete';
+				case 'x-videoplayer-video-drain-id': return '125-4';
+				default: return null;
+				}
+			}
+		}
+	});
+	const confirmedTerminalAttempt = {
+		mode: 'fetch',
+		streamId: '125-4',
+		ready: false,
+		ended: false,
+		cancelled: false,
+		completed: false,
+		transportEnded: false,
+		terminalDrain: true,
+		terminalCheck: true,
+		bodyEndedClean: false,
+		decodeInFlight: null,
+		queuedFrame: null,
+		reader: null,
+		controller: null
+	};
+	transportFirstSession.streamPending = confirmedTerminalAttempt;
+	app._startCpuFetchStream(
+		transportFirstSession,
+		confirmedTerminalAttempt,
+		transportFirstSession.streamUrl + '&stream=125-4&drain=check'
+	);
+	await confirmedTerminalAttempt.fetchPromise;
+	check(transportFirstSession.videoTerminalDrainConfirmed &&
+		transportFirstSession.videoProducerDrained &&
+		transportFirstSession.durationSeconds === 30 &&
+		eofFailures === 2 && eofStarts === 1,
+		'authenticated terminal drain did not seal the complete buffer');
+	check(eofStatusSchedules > 0,
+		'terminal handoff stopped authenticated renderer-status polling');
+
+	/* A successor B may receive 410 just before the ended status poll. Since B
+	 * has no body and consumes no FIFO data, it must not replace the preceding
+	 * clean candidate A which the worker can already have marked complete. */
+	const nonBodySuccessorSession = makeEofSession(139);
+	nonBodySuccessorSession.producerEnded = false;
+	nonBodySuccessorSession.videoTerminalDrainCandidateId = '139-7';
+	nonBodySuccessorSession.videoTerminalDrainBodyClean = true;
+	nonBodySuccessorSession.videoTerminalDrainRetryConsume = false;
+	nonBodySuccessorSession.streamUrl = '/cgi-bin/videoplayer-frame?token=' +
+		nonBodySuccessorSession.token;
+	nonBodySuccessorSession.streamAttempt = 8;
+	const nonBodySuccessor = {
+		mode: 'fetch', streamId: '139-8', responseStatus: 410,
+		ready: false, ended: false, cancelled: false, completed: false,
+		transportEnded: false, terminalDrain: false, terminalCheck: false,
+		bodyEndedClean: false, decodeInFlight: null, queuedFrame: null,
+		reader: null, controller: null
+	};
+	nonBodySuccessorSession.streamPending = nonBodySuccessor;
+	app._cpuSession = nonBodySuccessorSession;
+	app._playGeneration = 139;
+	rpcHandlers.renderer_status = () => ({ state: 'ended' });
+	await app._pollCpuStreamStatus(nonBodySuccessorSession);
+	check(nonBodySuccessor.terminalDrain &&
+		nonBodySuccessorSession.videoTerminalDrainCandidateId === '139-7' &&
+		nonBodySuccessorSession.videoTerminalDrainBodyClean,
+		'terminal status replaced clean candidate A with non-body successor B');
+	app._handleCpuStreamFailure(nonBodySuccessorSession, nonBodySuccessor);
+	const nonBodyFrame = fakeImageElement();
+	nonBodyFrame.id = 'videoplayer-cpu-frame';
+	fakeImageParent(nonBodyFrame);
+	nonBodySuccessorSession.visibleFrame = nonBodyFrame;
+	const originalNonBodyStart = app._startCpuFetchStream;
+	const originalNonBodyProbe = app._scheduleCpuStreamProbe;
+	const originalNonBodyCanFetch = app._canUseCpuFetchStream;
+	let nonBodyRetryUrl = '';
+	app._canUseCpuFetchStream = () => true;
+	app._startCpuFetchStream = (activeSession, attempt, url) => {
+		check(activeSession === nonBodySuccessorSession &&
+			attempt.streamId === '139-7' && attempt.terminalCheck,
+			'non-body successor retry did not preserve clean candidate A');
+		nonBodyRetryUrl = String(url);
+	};
+	app._scheduleCpuStreamProbe = () => {};
+	app._openCpuStream(nonBodySuccessorSession);
+	check(nonBodyRetryUrl.includes('stream=139-7&drain=check'),
+		'terminal retry used non-body successor B instead of clean candidate A');
+	nonBodySuccessorSession.streamPending = null;
+	app._startCpuFetchStream = originalNonBodyStart;
+	app._scheduleCpuStreamProbe = originalNonBodyProbe;
+	app._canUseCpuFetchStream = originalNonBodyCanFetch;
+
+	/* A relay can hit its segment cap immediately after the CGI publishes
+	 * ready(A), leaving the worker pinned to A but check(A) still at 202. The
+	 * browser must consume again with A, never invent B. If complete(A) appears
+	 * just before that consume is dispatched, its exact 204 may use the saved
+	 * clean A body even though dispatch conservatively cleared shared evidence. */
+	const nonceRaceSession = makeEofSession(136);
+	nonceRaceSession.producerEnded = true;
+	nonceRaceSession.videoTerminalDrainCandidateId = '136-7';
+	nonceRaceSession.videoTerminalDrainBodyClean = true;
+	nonceRaceSession.videoTerminalDrainRetryConsume = false;
+	nonceRaceSession.streamUrl = '/cgi-bin/videoplayer-frame?token=' +
+		nonceRaceSession.token;
+	nonceRaceSession.streamAttempt = 7;
+	nonceRaceSession.fetchDisabled = false;
+	const nonceRaceFrame = fakeImageElement();
+	nonceRaceFrame.id = 'videoplayer-cpu-frame';
+	fakeImageParent(nonceRaceFrame);
+	nonceRaceSession.visibleFrame = nonceRaceFrame;
+	app._cpuSession = nonceRaceSession;
+	app._playGeneration = 136;
+	const originalNonceRaceCanFetch = app._canUseCpuFetchStream;
+	app._canUseCpuFetchStream = () => true;
+	window.fetch = () => Promise.resolve({
+		status: 202,
+		ok: false,
+		headers: { get: () => null }
+	});
+	const pendingNonceCheck = {
+		mode: 'fetch', streamId: '136-7', ready: false, ended: false,
+		cancelled: false, completed: false, transportEnded: false,
+		terminalDrain: true, terminalCheck: true, bodyEndedClean: false,
+		decodeInFlight: null, queuedFrame: null, reader: null, controller: null
+	};
+	nonceRaceSession.streamPending = pendingNonceCheck;
+	app._startCpuFetchStream(nonceRaceSession, pendingNonceCheck, '/check-a');
+	await pendingNonceCheck.fetchPromise;
+	check(nonceRaceSession.videoTerminalDrainCandidateId === '136-7' &&
+		nonceRaceSession.videoTerminalDrainBodyClean &&
+		nonceRaceSession.videoTerminalDrainRetryConsume,
+		'terminal 202 abandoned the nonce already captured by the worker');
+	let nonceRaceUrl = '';
+	window.fetch = url => {
+		nonceRaceUrl = String(url);
+		return Promise.resolve({
+			status: 204,
+			ok: true,
+			headers: {
+				get: name => {
+					switch (String(name).toLowerCase()) {
+					case 'x-videoplayer-video-drain': return 'complete';
+					case 'x-videoplayer-video-drain-id': return '136-7';
+					default: return null;
+					}
+				}
+			}
+		});
+	};
+	app._openCpuStream(nonceRaceSession);
+	const lateCompleteAttempt = nonceRaceSession.streamPending;
+	check(lateCompleteAttempt && !lateCompleteAttempt.terminalCheck &&
+		lateCompleteAttempt.streamId === '136-7' &&
+		lateCompleteAttempt.priorTerminalBodyClean,
+		'same-nonce terminal retry did not preserve its prior clean body');
+	await lateCompleteAttempt.fetchPromise;
+	check(nonceRaceUrl.includes('stream=136-7&drain=1') &&
+		nonceRaceSession.videoTerminalDrainConfirmed &&
+		nonceRaceSession.videoProducerDrained,
+		'late complete(A) was not accepted by the idempotent drain(A) retry');
+	app._canUseCpuFetchStream = originalNonceRaceCanFetch;
+
+	/* Repeated authenticated `ended` status polls may release an ordinary
+	 * response that transitioned into the terminal drainer, but must never
+	 * rewrite an already explicit check(A) or erase its clean A evidence while
+	 * the 204 response is delayed. */
+	const repeatedEndedSession = makeEofSession(137);
+	repeatedEndedSession.producerEnded = true;
+	repeatedEndedSession.videoTerminalDrainStartedAt = Date.now();
+	repeatedEndedSession.videoTerminalDrainCandidateId = '137-2';
+	repeatedEndedSession.videoTerminalDrainBodyClean = true;
+	const delayedEndedCheck = deferred();
+	window.fetch = () => delayedEndedCheck.promise;
+	const repeatedEndedAttempt = {
+		mode: 'fetch', streamId: '137-2', ready: false, ended: false,
+		cancelled: false, completed: false, transportEnded: false,
+		terminalDrain: true, terminalCheck: true, bodyEndedClean: false,
+		decodeInFlight: null, queuedFrame: null, reader: null, controller: null
+	};
+	repeatedEndedSession.streamPending = repeatedEndedAttempt;
+	app._cpuSession = repeatedEndedSession;
+	app._playGeneration = 137;
+	app._startCpuFetchStream(
+		repeatedEndedSession, repeatedEndedAttempt, '/delayed-ended-check'
+	);
+	await app._pollCpuStreamStatus(repeatedEndedSession);
+	check(repeatedEndedAttempt.terminalDrain &&
+		repeatedEndedAttempt.terminalCheck &&
+		repeatedEndedSession.videoTerminalDrainBodyClean,
+		'repeated ended status rewrote an in-flight terminal confirmation');
+	delayedEndedCheck.resolve({
+		status: 204,
+		ok: true,
+		headers: {
+			get: name => {
+				switch (String(name).toLowerCase()) {
+				case 'x-videoplayer-video-drain': return 'complete';
+				case 'x-videoplayer-video-drain-id': return '137-2';
+				default: return null;
+				}
+			}
+		}
+	});
+	await repeatedEndedAttempt.fetchPromise;
+	check(repeatedEndedSession.videoTerminalDrainConfirmed &&
+		repeatedEndedSession.videoProducerDrained,
+		'delayed terminal 204 failed after a repeated ended status poll');
+
+	/* The last ordinary successor can consist solely of FFmpeg's closing
+	 * multipart boundary. It accepts no JPEG (`ready` stays false), but its clean
+	 * nonce-bound body must remain valid evidence when renderer status becomes
+	 * ended before the following drain check. */
+	const closeOnlySession = makeEofSession(131);
+	const closeOnlyNonce = '131-1';
+	const closeOnlyBytes = Uint8Array.from(Buffer.from(
+		'--videoplayer-' + closeOnlySession.token + '--\r\n', 'ascii'
+	));
+	let closeOnlyReads = 0;
+	const failuresBeforeCloseOnly = eofFailures;
+	app._cpuSession = closeOnlySession;
+	app._playGeneration = 131;
+	window.fetch = () => Promise.resolve({
+		status: 200,
+		ok: true,
+		headers: {
+			get: name => String(name).toLowerCase() === 'content-type'
+				? 'multipart/x-mixed-replace; boundary=videoplayer-' +
+					closeOnlySession.token
+				: null
+		},
+		body: {
+			getReader: () => ({
+				read: () => {
+					if (closeOnlyReads++ === 0)
+						return Promise.resolve({
+							done: false,
+							value: closeOnlyBytes
+						});
+					closeOnlySession.producerEnded = true;
+					return Promise.resolve({ done: true });
+				},
+				cancel: () => Promise.resolve()
+			})
+		}
+	});
+	const closeOnlyAttempt = {
+		mode: 'fetch', streamId: closeOnlyNonce, responseStatus: 0,
+		ready: false, ended: false, cancelled: false, completed: false,
+		transportEnded: false, terminalDrain: false, terminalCheck: false,
+		bodyEndedClean: false, decodeInFlight: null, queuedFrame: null,
+		reader: null, controller: null
+	};
+	closeOnlySession.streamPending = closeOnlyAttempt;
+	app._startCpuFetchStream(closeOnlySession, closeOnlyAttempt, '/close-only');
+	await closeOnlyAttempt.fetchPromise;
+	check(!closeOnlyAttempt.ready && closeOnlyAttempt.ended &&
+		closeOnlySession.videoTerminalDrainCandidateId === closeOnlyNonce &&
+		closeOnlySession.videoTerminalDrainBodyClean &&
+		eofFailures === failuresBeforeCloseOnly,
+		'clean close-only successor was rejected before terminal status confirmation');
+	window.fetch = () => Promise.resolve({
+		status: 204,
+		ok: true,
+		headers: {
+			get: name => {
+				switch (String(name).toLowerCase()) {
+				case 'x-videoplayer-video-drain': return 'complete';
+				case 'x-videoplayer-video-drain-id': return closeOnlyNonce;
+				default: return null;
+				}
+			}
+		}
+	});
+	const closeOnlyCheck = {
+		mode: 'fetch', streamId: closeOnlyNonce, ready: false, ended: false,
+		cancelled: false, completed: false, transportEnded: false,
+		terminalDrain: true, terminalCheck: true, bodyEndedClean: false,
+		decodeInFlight: null, queuedFrame: null, reader: null, controller: null
+	};
+	closeOnlySession.streamPending = closeOnlyCheck;
+	app._startCpuFetchStream(closeOnlySession, closeOnlyCheck, '/close-only-check');
+	await closeOnlyCheck.fetchPromise;
+	check(closeOnlySession.videoTerminalDrainConfirmed &&
+		closeOnlySession.videoProducerDrained && eofFailures === failuresBeforeCloseOnly,
+		'authenticated close-only successor did not seal terminal video');
+
+	/* Disposing a consuming terminal request must erase any older clean-body
+	 * observation for the same nonce. Otherwise a later 204 could authenticate
+	 * bytes consumed by this cancelled request but never delivered to JS. */
+	const cancelledTerminalSession = makeEofSession(127);
+	cancelledTerminalSession.producerEnded = true;
+	cancelledTerminalSession.videoTerminalDrainCandidateId = '127-1';
+	cancelledTerminalSession.videoTerminalDrainBodyClean = true;
+	const cancelledTerminalAttempt = {
+		mode: 'fetch', streamId: '127-1', terminalDrain: true,
+		terminalCheck: false, bodyEndedClean: false, ready: false,
+		ended: false, cancelled: false, completed: false, reader: null,
+		controller: { abort() {} }, decodeInFlight: null, queuedFrame: null
+	};
+	cancelledTerminalSession.streamPending = cancelledTerminalAttempt;
+	app._cpuSession = cancelledTerminalSession;
+	app._playGeneration = 127;
+	app._clearCpuStreamRequest(cancelledTerminalSession, false);
+	check(!cancelledTerminalSession.videoTerminalDrainBodyClean &&
+		cancelledTerminalAttempt.cancelled,
+		'cancelled terminal request retained stale clean-body evidence');
+
+	/* A terminal fetch may legitimately take more than the ordinary five-second
+	 * startup window. It still gets a 15-second first-frame bound, while the
+	 * entire status-driven handshake shares one 120-second safety deadline. */
+	const terminalClock = installFakeClock(2000000);
+	const delayedTerminalSession = makeEofSession(128);
+	delayedTerminalSession.producerEnded = true;
+	delayedTerminalSession.videoTerminalDrainStartedAt = Date.now();
+	const delayedTerminalAttempt = {
+		mode: 'fetch', streamId: '128-1', terminalDrain: true,
+		terminalCheck: false, bodyEndedClean: false, ready: false,
+		ended: false, cancelled: false, completed: false,
+		openedAt: Date.now(), lastProgressAt: Date.now(),
+		reader: null, controller: { abort() {} }, decodeInFlight: null,
+		queuedFrame: null
+	};
+	delayedTerminalSession.streamPending = delayedTerminalAttempt;
+	app._cpuSession = delayedTerminalSession;
+	app._playGeneration = 128;
+	const failuresBeforeFirstFrameTimeout = eofFailures;
+	app._scheduleCpuStreamProbe(delayedTerminalSession, delayedTerminalAttempt);
+	terminalClock.advance(6000);
+	check(delayedTerminalSession.streamPending === delayedTerminalAttempt &&
+		eofFailures === failuresBeforeFirstFrameTimeout,
+		'terminal drain incorrectly inherited the five-second startup timeout');
+	terminalClock.advance(9000);
+	check(delayedTerminalSession.streamPending === null &&
+		delayedTerminalAttempt.cancelled &&
+		eofFailures === failuresBeforeFirstFrameTimeout + 1,
+		'terminal first-frame wait exceeded its 15-second safety bound');
+
+	const deadlineSession = makeEofSession(129);
+	deadlineSession.producerEnded = true;
+	deadlineSession.videoTerminalDrainStartedAt = Date.now();
+	app._cpuSession = deadlineSession;
+	app._playGeneration = 129;
+	let deadlineStatusCalls = 0;
+	rpcHandlers.renderer_status = () => {
+		deadlineStatusCalls++;
+		return { state: 'ended' };
+	};
+	terminalClock.jump(119000);
+	const failuresBeforeDeadline = eofFailures;
+	await app._pollCpuStreamStatus(deadlineSession);
+	check(deadlineStatusCalls === 1 && eofFailures === failuresBeforeDeadline,
+		'terminal status polling stopped before the shared deadline');
+	terminalClock.jump(1000);
+	await app._pollCpuStreamStatus(deadlineSession);
+	check(deadlineStatusCalls === 1 && eofFailures === failuresBeforeDeadline + 1,
+		'terminal handshake exceeded its 120-second global deadline');
+
+	/* A confirmed terminal drain can leave minutes of queued playback. Keep
+	 * authenticated status-touch polling alive past the handshake deadline so
+	 * the ended worker can retain its validated browser-audio source descriptor;
+	 * detaching playback must cancel that lease timer immediately. */
+	const drainedLeaseSession = makeEofSession(138);
+	drainedLeaseSession.bufferState = 'playing';
+	drainedLeaseSession.producerEnded = true;
+	drainedLeaseSession.videoProducerDrained = true;
+	drainedLeaseSession.videoTerminalDrainConfirmed = true;
+	drainedLeaseSession.videoTerminalDrainStartedAt = Date.now();
+	app._cpuSession = drainedLeaseSession;
+	app._playGeneration = 138;
+	let drainedLeaseStatusCalls = 0;
+	rpcHandlers.renderer_status = () => {
+		drainedLeaseStatusCalls++;
+		return { state: 'ended' };
+	};
+	terminalClock.jump(121000);
+	const failuresBeforeDrainedLease = eofFailures;
+	app._scheduleCpuStreamStatus = originalEofStatusScheduler;
+	await app._pollCpuStreamStatus(drainedLeaseSession);
+	check(drainedLeaseStatusCalls === 1 &&
+		eofFailures === failuresBeforeDrainedLease &&
+		drainedLeaseSession.streamStatusTimer != null,
+		'confirmed terminal playback stopped renewing its source-holder lease');
+	const originalDrainedLeaseStop = app._stopRendererBestEffort;
+	let stoppedDrainedLease = null;
+	app._stopRendererBestEffort = stoppedSession => {
+		stoppedDrainedLease = stoppedSession;
+	};
+	await app._finishCpuPlayback(
+		drainedLeaseSession, 'source-holder playback finished', false, true
+	);
+	check(stoppedDrainedLease === drainedLeaseSession &&
+		drainedLeaseSession.streamStatusTimer === null && app._cpuSession === null,
+		'finishing confirmed terminal playback retained its source-holder lease');
+	app._stopRendererBestEffort = originalDrainedLeaseStop;
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	app._scheduleCpuStreamStatus = () => { eofStatusSchedules++; };
+	terminalClock.restore();
+
+	/* Any ambiguous failure after dispatching a buffered 200 stream is fatal,
+	 * even outside terminal drain: the relay may have consumed multiple frames
+	 * which never reached JavaScript, so a guessed reconnect would drift PCM. */
+	const interruptedBodySession = makeEofSession(130);
+	const interruptedBodyAttempt = {
+		mode: 'fetch', streamId: '130-1', responseStatus: 200,
+		bodyEndedClean: false, ready: true, ended: false, cancelled: false,
+		completed: false, terminalDrain: false, terminalCheck: false,
+		reader: null, controller: { abort() {} }, decodeInFlight: null,
+		queuedFrame: null
+	};
+	interruptedBodySession.streamVisibleAttempt = interruptedBodyAttempt;
+	app._cpuSession = interruptedBodySession;
+	app._playGeneration = 130;
+	const reconnectsBeforeInterruptedBody = eofReconnects;
+	const failuresBeforeInterruptedBody = eofFailures;
+	app._handleCpuStreamFailure(interruptedBodySession, interruptedBodyAttempt);
+	check(eofFailures === failuresBeforeInterruptedBody + 1 &&
+		eofReconnects === reconnectsBeforeInterruptedBody &&
+		interruptedBodyAttempt.cancelled,
+		'interrupted buffered 200 body was retried with an invented frame clock');
+
+	/* High-water applies only between bounded responses. An already-dispatched
+	 * body is always drained, then successors remain closed for arbitrarily long
+	 * hidden/playback holds and reopen as soon as capacity returns. During the
+	 * initial two-minute gate, reserving less than one maximum segment cannot
+	 * make progress, so the player falls back deterministically instead of
+	 * polling forever at 90% of the hard byte cap. */
+	const capacityClock = installFakeClock(3000000);
+	const originalCapacityOpen = app._openCpuStream;
+	let capacityOpens = 0;
+	app._scheduleCpuStreamReconnect = originalEofReconnectScheduler;
+	app._openCpuStream = activeSession => {
+		check(activeSession === app._cpuSession,
+			'capacity gate opened a stale CPU stream');
+		capacityOpens++;
+	};
+	const activeBodyAttempt = { backpressured: true };
+	await app._waitForCpuBufferedCapacity(interruptedBodySession, activeBodyAttempt);
+	check(!activeBodyAttempt.backpressured,
+		'active buffered HTTP 200 body remained paused at high-water');
+	const stalledResponseSession = makeEofSession(135);
+	stalledResponseSession.bufferState = 'playing';
+	stalledResponseSession.streamSegmentMs = 45000;
+	const stalledResponseAttempt = {
+		mode: 'fetch', streamId: '135-1', responseStatus: 200,
+		responseStartedAt: capacityClock.now(), openedAt: capacityClock.now(),
+		lastProgressAt: capacityClock.now(), ready: false, ended: false,
+		cancelled: false, completed: false, transportEnded: false,
+		terminalDrain: false, terminalCheck: false, bodyEndedClean: false,
+		backpressured: false, reader: null, controller: { abort() {} },
+		decodeInFlight: null, queuedFrame: null
+	};
+	stalledResponseSession.streamPending = stalledResponseAttempt;
+	stalledResponseSession.videoTerminalDrainCandidateId = '135-1';
+	app._cpuSession = stalledResponseSession;
+	app._playGeneration = 135;
+	const failuresBeforeStalledResponse = eofFailures;
+	app._scheduleCpuStreamProbe(stalledResponseSession, stalledResponseAttempt);
+	capacityClock.advance(16000);
+	check(eofFailures === failuresBeforeStalledResponse &&
+		stalledResponseSession.streamPending === stalledResponseAttempt,
+		'accepted buffered 200 was aborted during a valid pre-frame PCM stall');
+	stalledResponseAttempt.ready = true;
+	stalledResponseAttempt.lastProgressAt = capacityClock.now();
+	stalledResponseSession.streamPending = null;
+	stalledResponseSession.streamVisibleAttempt = stalledResponseAttempt;
+	capacityClock.advance(16000);
+	check(eofFailures === failuresBeforeStalledResponse &&
+		stalledResponseSession.streamVisibleAttempt === stalledResponseAttempt,
+		'accepted buffered 200 was aborted during a valid post-frame PCM stall');
+	stalledResponseAttempt.bodyEndedClean = true;
+	stalledResponseAttempt.transportEnded = true;
+	app._completeCpuFetchStream(stalledResponseSession, stalledResponseAttempt);
+	check(stalledResponseAttempt.ended &&
+		stalledResponseSession.videoTerminalDrainBodyClean &&
+		eofFailures === failuresBeforeStalledResponse,
+		'clean frame-aligned close was rejected after a long PCM stall');
+	if (stalledResponseSession.streamReconnectTimer != null)
+		window.clearTimeout(stalledResponseSession.streamReconnectTimer);
+	stalledResponseSession.streamReconnectTimer = null;
+	for (const withPcm of [ false, true ]) {
+		const heldSession = makeEofSession(withPcm ? 133 : 132);
+		heldSession.bufferState = 'playing';
+		heldSession.renderedSeconds = 190;
+		heldSession.playedSeconds = 0;
+		heldSession.videoBufferBytes = 1024 * 1024;
+		if (withPcm) {
+			heldSession.audio = {
+				active: true,
+				producerEnded: false,
+				bufferedBytes: 1024 * 1024
+			};
+		}
+		app._cpuSession = heldSession;
+		app._playGeneration = heldSession.generation;
+		const opensBeforeHold = capacityOpens;
+		app._scheduleCpuStreamReconnect(heldSession, 0);
+		capacityClock.advance(91000);
+		check(capacityOpens === opensBeforeHold &&
+			heldSession.streamReconnectTimer != null,
+			(withPcm ? 'PCM' : 'audio-less') +
+				' high-water hold opened a successor before capacity returned');
+		heldSession.playedSeconds = 20;
+		capacityClock.advance(100);
+		check(capacityOpens === opensBeforeHold + 1 &&
+			heldSession.streamReconnectTimer === null,
+			(withPcm ? 'PCM' : 'audio-less') +
+				' high-water hold did not reopen below the threshold');
+	}
+	const reserveSession = makeEofSession(134);
+	reserveSession.bufferState = 'buffering';
+	reserveSession.renderedSeconds = 119;
+	reserveSession.videoBufferBytes = 480 * 1024 * 1024;
+	reserveSession.audio = {
+		active: true,
+		producerEnded: false,
+		bufferedBytes: 12 * 1024 * 1024
+	};
+	app._cpuSession = reserveSession;
+	app._playGeneration = 134;
+	const failuresBeforeReserve = eofFailures;
+	const opensBeforeReserve = capacityOpens;
+	app._scheduleCpuStreamReconnect(reserveSession, 0);
+	capacityClock.advance(1000);
+	check(eofFailures === failuresBeforeReserve + 1 &&
+		capacityOpens === opensBeforeReserve &&
+		reserveSession.streamReconnectTimer === null,
+		'initial 492 MiB buffer deadlocked below the two-minute start gate');
+	app._openCpuStream = originalCapacityOpen;
+	capacityClock.restore();
+	app._stopPlayback();
+	app._maybeStartCpuBufferedPlayback = originalEofMaybeStart;
+	app._scheduleCpuBufferedPresentation = originalEofPresentation;
+	app._scheduleCpuStreamStatus = originalEofStatusScheduler;
+	app._scheduleCpuStreamReconnect = originalEofReconnectScheduler;
+	app._failCpuBufferedPlayback = originalEofFailure;
+	if (originalEofFetch === undefined)
+		delete window.fetch;
+	else
+		window.fetch = originalEofFetch;
+	if (originalEofAbortController === undefined)
+		delete window.AbortController;
+	else
+		window.AbortController = originalEofAbortController;
+
+	/* With no AudioContext, hybrid browser audio still needs to ACK every PCM
+	 * chunk so the shared FFmpeg process cannot block on its small router ring.
+	 * The discard cursor begins at zero, batches eight chunks, and advances by
+	 * the actual response count only. */
+	const drainCanvas = fakeCanvasElement();
+	elements['videoplayer-cpu-canvas'] = drainCanvas;
+	const originalCanFetchForDrain = app._canUseCpuFetchStream;
+	const originalOpenForDrain = app._openCpuStream;
+	const originalStatusForDrain = app._scheduleCpuStreamStatus;
+	const originalFallbackForDrain = app._startCpuBrowserAudioFallback;
+	const originalDrainPollScheduler = app._scheduleCpuAudioDrainPoll;
+	app._canUseCpuFetchStream = () => true;
+	app._openCpuStream = () => {};
+	app._scheduleCpuStreamStatus = () => {};
+	let hybridFallbacks = 0;
+	let drainSchedules = 0;
+	app._startCpuBrowserAudioFallback = activeSession => {
+		hybridFallbacks++;
+		activeSession.browserAudio = {
+			active: true,
+			resolving: true,
+			playAttempt: 0,
+			element: null
+		};
+		return Promise.resolve(true);
+	};
+	app._scheduleCpuAudioDrainPoll = (activeSession, delay) => {
+		check(activeSession === app._cpuSession && Number(delay) >= 0,
+			'discard drainer scheduled an invalid session or delay');
+		drainSchedules++;
+	};
+	app._playGeneration = 126;
+	await app._playCpuStream({
+		session_token: '6'.repeat(32),
+		stream_url: '/cgi-bin/videoplayer-frame?token=' + '6'.repeat(32),
+		render_mode: 'router',
+		stream_type: 'mjpeg-stream',
+		mime: 'multipart/x-mixed-replace',
+		stream_segment_seconds: 45,
+		has_audio: 1,
+		audio_url: '/cgi-bin/videoplayer-audio?token=' + '6'.repeat(32),
+		audio_type: 'pcm-s16le-chunks',
+		audio_sample_rate: 48000,
+		audio_channels: 2,
+		audio_frames_per_chunk: 12000,
+		audio_batch_max_chunks: 8,
+		router_fps: 60
+	}, 'hybrid-drain.mp4', 126, null, 'hybrid-drain.mp4');
+	const drainSession = app._cpuSession;
+	check(drainSession && drainSession.audio === null &&
+		drainSession.audioDrainer &&
+		drainSession.audioDrainer.fetchSequence === 0 &&
+		hybridFallbacks === 1 && drainSchedules === 1,
+		'no-AudioContext hybrid mode did not start the sequence-zero drainer');
+	const drainQueries = [];
+	let drainResponseIndex = 0;
+	request.get = (url, options) => {
+		drainQueries.push({ ...options.query });
+		if (drainResponseIndex++ === 1)
+			return Promise.resolve({
+				status: 202,
+				ok: false,
+				headers: { get: () => null }
+			});
+		const responseSequence = drainResponseIndex === 1 ? 0 : 8;
+		const responseCount = drainResponseIndex === 1 ? 8 : 2;
+		const responseBytes = responseCount * 48000;
+		const values = {
+			'content-type': 'application/octet-stream',
+			'content-length': String(responseBytes),
+			'x-videoplayer-audio-format': 's16le',
+			'x-videoplayer-audio-sequence': String(responseSequence),
+			'x-videoplayer-audio-chunk-count': String(responseCount),
+			'x-videoplayer-audio-frames-per-chunk': '12000',
+			'x-videoplayer-audio-total-frames': String(responseCount * 12000),
+			'x-videoplayer-audio-sample-rate': '48000',
+			'x-videoplayer-audio-channels': '2'
+		};
+		return Promise.resolve({
+			status: 200,
+			ok: true,
+			headers: { get: name => values[String(name).toLowerCase()] || null },
+			blob: () => new Blob([ new Uint8Array(responseBytes) ])
+		});
+	};
+	await app._pollCpuAudioDrainer(drainSession);
+	check(drainSession.audioDrainer.fetchSequence === 8,
+		'discard drainer did not consume its first full batch');
+	await app._pollCpuAudioDrainer(drainSession);
+	check(drainSession.audioDrainer.fetchSequence === 8,
+		'HTTP 202 incorrectly advanced the discard cursor');
+	await app._pollCpuAudioDrainer(drainSession);
+	check(
+		drainQueries.length === 3 &&
+		drainQueries[0].chunk === '0' && drainQueries[0].count === '8' &&
+		drainQueries[1].chunk === '8' && drainQueries[1].count === '8' &&
+		drainQueries[2].chunk === '8' && drainQueries[2].count === '8' &&
+		drainSession.audioDrainer.fetchSequence === 10,
+		'discard drainer did not retry/advance its strict sequential batch cursor'
+	);
+	const drainBusyClock = installFakeClock(4000000);
+	let overlapBusyResponse = 0;
+	request.get = () => Promise.resolve({
+		status: overlapBusyResponse++ < 2 ? 409 : 204,
+		ok: false,
+		headers: { get: () => null }
+	});
+	await app._pollCpuAudioDrainer(drainSession);
+	check(drainSession.audioDrainer.active &&
+		drainSession.audioDrainer.errors === 0,
+		'first overlapping PCM lock 409 consumed the fatal retry budget');
+	drainBusyClock.advance(800);
+	await app._pollCpuAudioDrainer(drainSession);
+	check(drainSession.audioDrainer.active &&
+		drainSession.audioDrainer.errors === 0,
+		'700 ms in-flight PCM request overlap killed the discard drainer');
+	await app._pollCpuAudioDrainer(drainSession);
+	check(drainSession.audioDrainer.producerEnded &&
+		!drainSession.audioDrainer.active,
+		'discard drainer did not recover after the old PCM lock was released');
+
+	/* The overlap allowance is bounded: an endpoint which remains at generic
+	 * 409 beyond the old request timeout still fails closed. */
+	app._startCpuAudioDrainer(
+		drainSession,
+		'/cgi-bin/videoplayer-audio?token=' + '6'.repeat(32),
+		10,
+		8
+	);
+	request.get = () => Promise.resolve({
+		status: 409,
+		ok: false,
+		headers: { get: () => null }
+	});
+	const originalPersistentBusyFailure = app._failCpuBufferedPlayback;
+	let persistentBusyFailures = 0;
+	app._failCpuBufferedPlayback = activeSession => {
+		check(activeSession === drainSession,
+			'persistent PCM busy failure targeted the wrong session');
+		persistentBusyFailures++;
+	};
+	await app._pollCpuAudioDrainer(drainSession);
+	drainBusyClock.advance(3000);
+	await app._pollCpuAudioDrainer(drainSession);
+	await app._pollCpuAudioDrainer(drainSession);
+	await app._pollCpuAudioDrainer(drainSession);
+	check(persistentBusyFailures === 1,
+		'persistent generic PCM 409 was treated as an unlimited busy retry');
+	app._failCpuBufferedPlayback = originalPersistentBusyFailure;
+	drainBusyClock.restore();
+	app._stopPlayback();
+	app._canUseCpuFetchStream = originalCanFetchForDrain;
+	app._openCpuStream = originalOpenForDrain;
+	app._scheduleCpuStreamStatus = originalStatusForDrain;
+	app._startCpuBrowserAudioFallback = originalFallbackForDrain;
+	app._scheduleCpuAudioDrainPoll = originalDrainPollScheduler;
+
+	/* Canvas acquisition is part of accepting a renderer session. A throwing
+	 * context or bad PCM metadata must stop that renderer and use whole-player
+	 * browser decoding; neither case may leave an unacknowledged PCM producer. */
+	const originalCanFetchForFallback = app._canUseCpuFetchStream;
+	const originalPlayInVideo = app._playInVideo;
+	const originalStartDrainer = app._startCpuAudioDrainer;
+	let browserFallbackPlays = 0;
+	let unexpectedDrainers = 0;
+	app._canUseCpuFetchStream = () => true;
+	app._playInVideo = (url, label, generation) => {
+		check(url === '/fallback-browser-stream' && generation === app._playGeneration,
+			'whole-player fallback used an invalid stream or generation');
+		browserFallbackPlays++;
+		return Promise.resolve();
+	};
+	app._startCpuAudioDrainer = () => {
+		unexpectedDrainers++;
+		return true;
+	};
+	rpcHandlers.resolve = () => ({ stream_url: '/fallback-browser-stream' });
+	const throwingCanvas = fakeCanvasElement();
+	let throwingContextCalls = 0;
+	throwingCanvas.getContext = () => {
+		throwingContextCalls++;
+		throw new Error('canvas disabled');
+	};
+	elements['videoplayer-cpu-canvas'] = throwingCanvas;
+	rpcCalls.length = 0;
+	app._playGeneration = 127;
+	await app._playCpuStream({
+		session_token: '7'.repeat(32),
+		stream_url: '/cgi-bin/videoplayer-frame?token=' + '7'.repeat(32),
+		render_mode: 'router',
+		stream_type: 'mjpeg-stream',
+		mime: 'multipart/x-mixed-replace',
+		stream_segment_seconds: 45,
+		has_audio: 0,
+		router_fps: 60
+	}, 'canvas-fallback.mp4', 127, null, 'canvas-fallback.mp4');
+	check(
+		throwingContextCalls === 1 && browserFallbackPlays === 1 &&
+		unexpectedDrainers === 0 && app._cpuSession === null &&
+		rpcCalls.some(call => call.method === 'stop_renderer' &&
+			call.args[0] === '7'.repeat(32)),
+		'throwing canvas context leaked or retained a router renderer session'
+	);
+	const metadataCanvas = fakeCanvasElement();
+	let metadataContextCalls = 0;
+	const metadataGetContext = metadataCanvas.getContext;
+	metadataCanvas.getContext = function (type) {
+		metadataContextCalls++;
+		return metadataGetContext.call(this, type);
+	};
+	elements['videoplayer-cpu-canvas'] = metadataCanvas;
+	rpcCalls.length = 0;
+	app._playGeneration = 128;
+	await app._playCpuStream({
+		session_token: '8'.repeat(32),
+		stream_url: '/cgi-bin/videoplayer-frame?token=' + '8'.repeat(32),
+		render_mode: 'router',
+		stream_type: 'mjpeg-stream',
+		mime: 'multipart/x-mixed-replace',
+		stream_segment_seconds: 45,
+		has_audio: 1,
+		audio_url: '/cgi-bin/videoplayer-audio?token=' + '8'.repeat(32),
+		audio_type: 'pcm-s16le-chunks',
+		audio_sample_rate: 44100,
+		audio_channels: 2,
+		audio_frames_per_chunk: 12000,
+		router_fps: 60
+	}, 'bad-pcm-metadata.mp4', 128, null, 'bad-pcm-metadata.mp4');
+	check(
+		metadataContextCalls === 0 && browserFallbackPlays === 2 &&
+		unexpectedDrainers === 0 && app._cpuSession === null &&
+		rpcCalls.some(call => call.method === 'stop_renderer' &&
+			call.args[0] === '8'.repeat(32)),
+		'invalid PCM metadata left a shared FFmpeg producer running'
+	);
+	app._canUseCpuFetchStream = originalCanFetchForFallback;
+	app._playInVideo = originalPlayInVideo;
+	app._startCpuAudioDrainer = originalStartDrainer;
 
 	process.stdout.write('web-audio-test: ok\n');
 }

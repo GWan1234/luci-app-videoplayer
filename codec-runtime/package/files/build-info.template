@@ -9,6 +9,7 @@ packages_feed_commit=@PACKAGES_FEED_COMMIT@
 ffmpeg_version=6.1.4
 package_format=@PACKAGE_FORMAT@
 validation_mode=@VALIDATION_MODE@
+renderer_profile=buffered-tee-v1
 build_patented=y
 network_enabled=n
 avdevice_enabled=n

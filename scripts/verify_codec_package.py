@@ -17,6 +17,7 @@ import verify_packages
 PACKAGE_NAME = "luci-videoplayer-codec-runtime"
 PACKAGE_VERSION = "6.1.4-r3"
 FFMPEG_PATH = "usr/libexec/videoplayer-ffmpeg/ffmpeg"
+RELAY_PATH = "usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay"
 BUILD_INFO_PATH = "usr/share/luci-videoplayer-codec-runtime/build-info"
 APK_LIST_PATH = f"lib/apk/packages/{PACKAGE_NAME}.list"
 
@@ -27,6 +28,8 @@ MAX_BUILD_INFO_BYTES = 16 * 1024
 MAX_CODEC_PAYLOAD_BYTES = 128 * 1024 * 1024
 MAX_CODEC_PAYLOAD_FILES = 16
 MIN_FFMPEG_BYTES = 1024 * 1024
+MIN_RELAY_BYTES = 4 * 1024
+MAX_RELAY_BYTES = 1024 * 1024
 MAX_SCRIPT_BYTES = 32 * 1024
 BUILD_INFO_KEY = re.compile(r"^[a-z][a-z0-9_]*$")
 EXPECTED_BUILD_INFO_KEYS = {
@@ -41,6 +44,7 @@ EXPECTED_BUILD_INFO_KEYS = {
     "ffmpeg_version",
     "package_format",
     "validation_mode",
+    "renderer_profile",
     "build_patented",
     "network_enabled",
     "avdevice_enabled",
@@ -266,6 +270,7 @@ def validate_build_info(
         "ffmpeg_version": "6.1.4",
         "package_format": package_format,
         "validation_mode": entry["validation_mode"],
+        "renderer_profile": "buffered-tee-v1",
         "build_patented": "y",
         "network_enabled": "n",
         "avdevice_enabled": "n",
@@ -282,7 +287,23 @@ def validate_build_info(
     return entry
 
 
-def verify_elf(data: bytes, architecture: str) -> None:
+def verify_elf(
+    data: bytes,
+    architecture: str,
+    *,
+    label: str = "Private FFmpeg",
+    minimum_bytes: int = MIN_FFMPEG_BYTES,
+    maximum_bytes: int = MAX_CODEC_PAYLOAD_BYTES,
+    required_markers: tuple[bytes, ...] = (
+        b"configuration:",
+        b"libavcodec",
+        b"libavformat",
+        b"h264",
+        b"hevc",
+        b"mjpeg",
+        b"pcm_s16le",
+    ),
+) -> None:
     require(
         set(ELF_IDENTITIES) == codec_matrix.EXPECTED_ARCHITECTURES,
         "ELF identity table does not cover the complete architecture matrix",
@@ -293,10 +314,10 @@ def verify_elf(data: bytes, architecture: str) -> None:
     identity = ELF_IDENTITIES[architecture]
 
     require(
-        MIN_FFMPEG_BYTES <= len(data) <= MAX_CODEC_PAYLOAD_BYTES,
-        "Private FFmpeg ELF size is outside the expected safety range",
+        minimum_bytes <= len(data) <= maximum_bytes,
+        f"{label} ELF size is outside the expected safety range",
     )
-    require(data[:4] == b"\x7fELF", "Private FFmpeg payload is not an ELF executable")
+    require(data[:4] == b"\x7fELF", f"{label} payload is not an ELF executable")
     require(data[4] == identity.elf_class, f"Wrong ELF class for {architecture}")
     require(data[5] == identity.byte_order, f"Wrong ELF byte order for {architecture}")
     require(data[6] == 1, "Unsupported ELF identification version")
@@ -304,7 +325,7 @@ def verify_elf(data: bytes, architecture: str) -> None:
 
     endian = "<" if identity.byte_order == 1 else ">"
     elf_type, machine, version = struct.unpack_from(f"{endian}HHI", data, 16)
-    require(elf_type in {2, 3}, "Private FFmpeg ELF is not executable or PIE")
+    require(elf_type in {2, 3}, f"{label} ELF is not executable or PIE")
     require(machine == identity.machine, f"Wrong ELF machine for {architecture}")
     require(version == 1, "Unsupported ELF header version")
 
@@ -321,19 +342,19 @@ def verify_elf(data: bytes, architecture: str) -> None:
         require(header_size == 64, "Wrong ELF64 header size")
         minimum_program_entry_size = 56
 
-    require(entry_point != 0, "Private FFmpeg ELF has no entry point")
+    require(entry_point != 0, f"{label} ELF has no entry point")
     require(
         program_entry_size >= minimum_program_entry_size,
-        "Private FFmpeg ELF program-header entries are too small",
+        f"{label} ELF program-header entries are too small",
     )
     require(
         1 <= program_count <= 128,
-        "Private FFmpeg ELF program-header count is invalid",
+        f"{label} ELF program-header count is invalid",
     )
     require(
         program_offset >= header_size
         and program_offset + program_entry_size * program_count <= len(data),
-        "Private FFmpeg ELF program-header table is outside the file",
+        f"{label} ELF program-header table is outside the file",
     )
 
     executable_load = False
@@ -365,12 +386,12 @@ def verify_elf(data: bytes, architecture: str) -> None:
             ) = struct.unpack_from(f"{endian}QQQQQ", data, offset + 8)
         require(
             segment_offset <= len(data) and file_size <= len(data) - segment_offset,
-            "Private FFmpeg ELF segment exceeds the file",
+            f"{label} ELF segment exceeds the file",
         )
         if segment_type in {1, 7}:
             require(
                 file_size <= memory_size,
-                "Private FFmpeg ELF load/TLS file size exceeds memory size",
+                f"{label} ELF load/TLS file size exceeds memory size",
             )
         if segment_type == 1:
             load_count += 1
@@ -385,38 +406,30 @@ def verify_elf(data: bytes, architecture: str) -> None:
         elif segment_type == 2:
             dynamic_count += 1
         elif segment_type == 3:
-            require(not interpreter, "Private FFmpeg ELF has duplicate interpreters")
+            require(not interpreter, f"{label} ELF has duplicate interpreters")
             interpreter = data[segment_offset : segment_offset + file_size]
 
-    require(executable_load, "Private FFmpeg ELF has no executable PT_LOAD segment")
+    require(executable_load, f"{label} ELF has no executable PT_LOAD segment")
     require(
         entry_in_executable_load,
-        "Private FFmpeg ELF entry point is outside its executable segments",
+        f"{label} ELF entry point is outside its executable segments",
     )
-    require(load_count >= 2, "Private FFmpeg ELF has too few PT_LOAD segments")
-    require(dynamic_count == 1, "Private FFmpeg ELF must have one PT_DYNAMIC segment")
+    require(load_count >= 2, f"{label} ELF has too few PT_LOAD segments")
+    require(dynamic_count == 1, f"{label} ELF must have one PT_DYNAMIC segment")
     require(
         interpreter.startswith(b"/lib/ld-musl-")
         and interpreter.endswith(b".so.1\x00")
         and b"\x00" not in interpreter[:-1],
-        "Private FFmpeg ELF has an unexpected dynamic interpreter",
+        f"{label} ELF has an unexpected dynamic interpreter",
     )
     require(
         len(set(executable_payload)) >= 128
         and sum(byte != 0 for byte in executable_payload)
         >= len(executable_payload) // 4,
-        "Private FFmpeg executable segment has implausible byte content",
+        f"{label} executable segment has implausible byte content",
     )
-    for marker in (
-        b"configuration:",
-        b"libavcodec",
-        b"libavformat",
-        b"h264",
-        b"hevc",
-        b"mjpeg",
-        b"pcm_s16le",
-    ):
-        require(marker in data, f"Private FFmpeg ELF is missing marker {marker!r}")
+    for marker in required_markers:
+        require(marker in data, f"{label} ELF is missing marker {marker!r}")
 
 
 def normalize_script(data: bytes, label: str) -> list[str]:
@@ -506,8 +519,8 @@ def verify_payload(
     architecture: str,
     external_build_info: bytes,
     expected_binary: bytes | None,
-) -> bytes:
-    expected_paths = {FFMPEG_PATH, BUILD_INFO_PATH}
+) -> tuple[bytes, bytes]:
+    expected_paths = {FFMPEG_PATH, RELAY_PATH, BUILD_INFO_PATH}
     if package_format == "apk":
         expected_paths.add(APK_LIST_PATH)
     require(
@@ -516,8 +529,10 @@ def verify_payload(
     )
 
     ffmpeg, ffmpeg_mode = payload[FFMPEG_PATH]
+    relay, relay_mode = payload[RELAY_PATH]
     internal_info, info_mode = payload[BUILD_INFO_PATH]
     require(ffmpeg_mode == MODE_EXEC, "Private FFmpeg mode must be 0755")
+    require(relay_mode == MODE_EXEC, "MJPEG relay mode must be 0755")
     require(info_mode == MODE_FILE, "Internal build-info mode must be 0644")
     require(
         internal_info == external_build_info,
@@ -529,13 +544,23 @@ def verify_payload(
             "Packaged FFmpeg differs from the already validated build binary",
         )
     verify_elf(ffmpeg, architecture)
+    verify_elf(
+        relay,
+        architecture,
+        label="MJPEG relay",
+        minimum_bytes=MIN_RELAY_BYTES,
+        maximum_bytes=MAX_RELAY_BYTES,
+        required_markers=(b"videoplayer-", b"Content-Length", b"image/jpeg"),
+    )
 
     if package_format == "apk":
         package_list, list_mode = payload[APK_LIST_PATH]
-        expected_list = f"/{FFMPEG_PATH}\n/{BUILD_INFO_PATH}\n".encode()
+        expected_list = (
+            f"/{FFMPEG_PATH}\n/{RELAY_PATH}\n/{BUILD_INFO_PATH}\n"
+        ).encode()
         require(list_mode == MODE_FILE, "APK package-list mode must be 0644")
         require(package_list == expected_list, "APK package-list content is incorrect")
-    return ffmpeg
+    return ffmpeg, relay
 
 
 def verify_ipk(
@@ -545,7 +570,7 @@ def verify_ipk(
     external_build_info: bytes,
     build_info_values: dict[str, str],
     expected_binary: bytes | None,
-) -> bytes:
+) -> tuple[bytes, bytes]:
     outer, outer_directories, _ = verify_packages.parse_tar_gz(
         verify_packages.read_limited_file(
             package_path, MAX_CODEC_PACKAGE_BYTES, "codec IPK"
@@ -758,7 +783,7 @@ def verify_apk(
     external_build_info: bytes,
     build_info_values: dict[str, str],
     expected_binary: bytes | None,
-) -> bytes:
+) -> tuple[bytes, bytes]:
     adb_data, data_blocks = verify_packages.parse_apk_blocks(
         verify_packages.read_limited_file(
             package_path, MAX_CODEC_PACKAGE_BYTES, "codec APK"
@@ -842,7 +867,7 @@ def verify_codec_package(
     architecture: str,
     build_info_path: Path,
     expected_binary_path: Path | None = None,
-) -> bytes:
+) -> tuple[bytes, bytes]:
     require(package_format in {"apk", "ipk"}, "Package format must be apk or ipk")
     require(
         architecture in codec_matrix.EXPECTED_ARCHITECTURES,
@@ -880,7 +905,7 @@ def verify_codec_package(
         verify_elf(expected_binary, architecture)
     try:
         if package_format == "ipk":
-            packaged_binary = verify_ipk(
+            packaged_payloads = verify_ipk(
                 package_path,
                 architecture=architecture,
                 external_build_info=external_build_info,
@@ -888,7 +913,7 @@ def verify_codec_package(
                 expected_binary=expected_binary,
             )
         else:
-            packaged_binary = verify_apk(
+            packaged_payloads = verify_apk(
                 package_path,
                 architecture=architecture,
                 external_build_info=external_build_info,
@@ -897,7 +922,7 @@ def verify_codec_package(
             )
     except verify_packages.PackageVerificationError as exc:
         raise CodecPackageVerificationError(str(exc)) from exc
-    return packaged_binary
+    return packaged_payloads
 
 
 def write_verified_binary(destination: Path, packaged_binary: bytes) -> None:
@@ -936,12 +961,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="write the verified FFmpeg ELF from the package to a new file",
     )
+    parser.add_argument(
+        "--extract-relay",
+        type=Path,
+        help="write the verified MJPEG relay ELF from the package to a new file",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    packaged_binary = verify_codec_package(
+    packaged_binary, packaged_relay = verify_codec_package(
         args.package,
         package_format=args.format,
         architecture=args.architecture,
@@ -950,6 +980,8 @@ def main() -> None:
     )
     if args.extract_binary is not None:
         write_verified_binary(args.extract_binary, packaged_binary)
+    if args.extract_relay is not None:
+        write_verified_binary(args.extract_relay, packaged_relay)
     print(
         f"Codec package verified: {args.format.upper()} "
         f"{PACKAGE_VERSION} for {args.architecture}"

@@ -12,7 +12,7 @@ APP_VERSION="1.1.0"
 SNAPSHOT_APK="luci-app-videoplayer-$APP_VERSION.apk"
 SNAPSHOT_INDEX="INDEX.tsv"
 CODEC_INSTALLER_OBJECT="scripts/install-codec-runtime.sh"
-CODEC_INSTALLER_SHA256="6d8dc7f27760d92d1617650b888fc612c0fe8259c85991405aa5ff934bf140b3"
+CODEC_INSTALLER_SHA256="4bfc8ca42f5cb9bc17ace33f2e639bbecb0bdc291f7118ee2904ada0c6d6b059"
 API_BASE_URL="https://api.github.com/repos/$REPOSITORY"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 

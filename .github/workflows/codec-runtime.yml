@@ -227,6 +227,7 @@ jobs:
           ffmpeg_version=$FFMPEG_VERSION
           package_format=$PACKAGE_FORMAT
           validation_mode=$VALIDATION_MODE
+          renderer_profile=buffered-tee-v1
           build_patented=y
           network_enabled=n
           avdevice_enabled=n
@@ -301,6 +302,7 @@ jobs:
             -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/package-files.txt"
           printf '%s\n' \
             'usr/libexec/videoplayer-ffmpeg/ffmpeg' \
+            'usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay' \
             'usr/share/luci-videoplayer-codec-runtime/build-info' \
             > "$RUNNER_TEMP/expected-package-files.txt"
           diff -u \
@@ -317,6 +319,9 @@ jobs:
           grep -Fx "sdk_sha256=$SDK_SHA256" "$build_info"
           grep -Fx "packages_feed_commit=$PACKAGES_FEED_COMMIT" "$build_info"
           grep -Fx "package_format=$PACKAGE_FORMAT" "$build_info"
+          grep -Fx 'renderer_profile=buffered-tee-v1' "$build_info"
+          relay="$package_root/usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay"
+          [ -f "$relay" ] && [ ! -L "$relay" ] && [ -x "$relay" ]
 
           mapfile -t target_staging_candidates < <(
             find staging_dir -mindepth 1 -maxdepth 1 \
@@ -354,19 +359,21 @@ jobs:
           [ -s "$package" ]
           file "$package"
           packaged_binary="$RUNNER_TEMP/packaged-videoplayer-ffmpeg"
+          packaged_relay="$RUNNER_TEMP/packaged-videoplayer-mjpeg-relay"
           python "$GITHUB_WORKSPACE/scripts/verify_codec_package.py" \
             "$package" \
             --format "$PACKAGE_FORMAT" \
             --architecture "$OPENWRT_ARCH" \
             --build-info "$build_info" \
-            --extract-binary "$packaged_binary"
+            --extract-binary "$packaged_binary" \
+            --extract-relay "$packaged_relay"
 
           chmod +x "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh"
           VALIDATION_TIMEOUT=300 \
             "$GITHUB_WORKSPACE/codec-runtime/validate-runtime.sh" \
             "$packaged_binary" "$sysroot" "$RUNNER_TEMP/codec-validation" \
             "$QEMU_EXECUTABLE" "$VALIDATION_MODE" \
-            "$config_h" "$component_config"
+            "$config_h" "$component_config" "$packaged_relay"
 
           artifact_root="$RUNNER_TEMP/codec-runtime-artifact"
           artifact_target="$artifact_root/$ARTIFACT_DIR"

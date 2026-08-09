@@ -150,6 +150,7 @@ def verify_build_info(
         "ffmpeg_version": matrix["codec"]["version"],
         "package_format": entry["format"],
         "validation_mode": entry["validation_mode"],
+        "renderer_profile": "buffered-tee-v1",
         "build_patented": "y",
         "network_enabled": "n",
         "avdevice_enabled": "n",

@@ -27,12 +27,16 @@ const CPU_STREAM_PROBE_INTERVAL_MS = 100;
 const CPU_STREAM_HANDOFF_GRACE_MS = 250;
 const CPU_STREAM_OUTAGE_TIMEOUT_MS = 15000;
 const CPU_STREAM_MAX_RECONNECT_MS = 3000;
+const CPU_BUFFERED_RESPONSE_TIMEOUT_MS = 60000;
+const CPU_TERMINAL_DRAIN_TIMEOUT_MS = 120000;
+const CPU_TERMINAL_FIRST_FRAME_TIMEOUT_MS = 15000;
 const CPU_AUDIO_SAMPLE_RATE = 48000;
 const CPU_AUDIO_CHANNELS = 2;
 const CPU_AUDIO_FRAMES_PER_CHUNK = 12000;
 const CPU_AUDIO_CHUNK_BYTES = 48000;
 const CPU_AUDIO_CHUNK_MS = 250;
 const CPU_AUDIO_REQUEST_TIMEOUT_MS = 2500;
+const CPU_AUDIO_BUSY_RETRY_MS = CPU_AUDIO_REQUEST_TIMEOUT_MS + 500;
 const CPU_AUDIO_START_TIMEOUT_MS = 10000;
 const CPU_AUDIO_DRAIN_TIMEOUT_MS = 5000;
 const CPU_AUDIO_INITIAL_LEAD_SECONDS = 0.12;
@@ -44,11 +48,15 @@ const CPU_AV_SYNC_INTERVAL_MS = 100;
 const CPU_AV_STALL_MIN_MS = 350;
 const CPU_AV_RATE_WINDOW_MS = 500;
 const CPU_AV_HARD_DRIFT_SECONDS = 0.10;
-const CPU_AV_SOFT_DRIFT_SECONDS = 0.03;
 const CPU_AV_MIN_ESTIMATED_RATE = 0.001;
-const CPU_AV_MIN_PLAYBACK_RATE = 0.25;
-const CPU_AV_MAX_PLAYBACK_RATE = 1.05;
-const CPU_PCM_MIN_PLAYBACK_RATE = 0.001;
+const CPU_BUFFER_INITIAL_SECONDS = 120;
+const CPU_BUFFER_HIGH_WATER_SECONDS = 180;
+const CPU_BUFFER_REBUFFER_SECONDS = 30;
+const CPU_BUFFER_HARD_LIMIT_BYTES = 512 * 1024 * 1024;
+const CPU_BUFFER_SEGMENT_RESERVE_BYTES = 20 * 1024 * 1024;
+const CPU_BUFFER_POLL_MS = 100;
+const CPU_BUFFER_COUNTER_INTERVAL_MS = 250;
+const CPU_BUFFER_UNDERRUN_GUARD_SECONDS = 0.25;
 
 function cpuMonotonicNow() {
 	if (window.performance && typeof window.performance.now === 'function')
@@ -145,6 +153,23 @@ function blobToArrayBuffer(blob) {
 		};
 		reader.readAsArrayBuffer(blob);
 	});
+}
+
+function formatCpuDuration(seconds) {
+	seconds = Number(seconds);
+	if (!Number.isFinite(seconds) || seconds < 0)
+		return '?';
+	seconds = Math.floor(seconds);
+	const hours = Math.floor(seconds / 3600);
+	const minutes = Math.floor(seconds % 3600 / 60);
+	const remainder = seconds % 60;
+	const pair = function (value) {
+		return value < 10 ? '0' + value : String(value);
+	};
+
+	return hours > 0
+		? hours + ':' + pair(minutes) + ':' + pair(remainder)
+		: pair(minutes) + ':' + pair(remainder);
 }
 
 /*
@@ -297,7 +322,8 @@ return view.extend({
 					margin-bottom: 10px;
 				}
 				#videoplayer-root video#videoplayer-video,
-				#videoplayer-root img.videoplayer-cpu-frame {
+				#videoplayer-root img.videoplayer-cpu-frame,
+				#videoplayer-root canvas.videoplayer-cpu-canvas {
 					width: 100%;
 					max-height: 70vh;
 					background: #000;
@@ -308,8 +334,10 @@ return view.extend({
 				#videoplayer-root [hidden] { display: none !important; }
 				#videoplayer-root video#videoplayer-video:fullscreen,
 				#videoplayer-root img#videoplayer-cpu-frame:fullscreen,
+				#videoplayer-root canvas#videoplayer-cpu-canvas:fullscreen,
 				#videoplayer-root video#videoplayer-video:-webkit-full-screen,
-				#videoplayer-root img#videoplayer-cpu-frame:-webkit-full-screen {
+				#videoplayer-root img#videoplayer-cpu-frame:-webkit-full-screen,
+				#videoplayer-root canvas#videoplayer-cpu-canvas:-webkit-full-screen {
 					width: 100vw;
 					height: 100vh;
 					max-height: none;
@@ -326,7 +354,9 @@ return view.extend({
 					background: #000;
 				}
 				#videoplayer-root .vp-player-wrap:fullscreen img.videoplayer-cpu-frame,
-				#videoplayer-root .vp-player-wrap:-webkit-full-screen img.videoplayer-cpu-frame {
+				#videoplayer-root .vp-player-wrap:-webkit-full-screen img.videoplayer-cpu-frame,
+				#videoplayer-root .vp-player-wrap:fullscreen canvas.videoplayer-cpu-canvas,
+				#videoplayer-root .vp-player-wrap:-webkit-full-screen canvas.videoplayer-cpu-canvas {
 					width: 100vw;
 					height: 100vh;
 					max-height: none;
@@ -338,6 +368,13 @@ return view.extend({
 					gap: 8px;
 					margin: 8px 0;
 					align-items: center;
+				}
+				#videoplayer-root .vp-cpu-progress {
+					display: flex;
+					flex-wrap: wrap;
+					gap: 8px 24px;
+					margin: 6px 0;
+					font-variant-numeric: tabular-nums;
 				}
 				#videoplayer-root .vp-path {
 					font-family: monospace;
@@ -416,7 +453,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-render-mode-desc',
 								class: 'cbi-value-description'
-							}, _('Local files only. After a bounded audio probe, router mode uses one long-lived FFmpeg process to produce synchronized MJPEG video and PCM audio from the same input clock. Fetch-capable browsers play that PCM with the measured video clock, including speeds below the HTML media minimum; native MJPEG fallback uses the protected original audio track. This mode has no pause, seeking, or timeline and may heavily load the router. Codec support depends on the installed FFmpeg build and browser. If video decoding cannot start, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
+							}, _('Local files only. The router renders synchronized MJPEG video and PCM audio as quickly as it can. The browser waits for a two-minute buffer (or the whole file when shorter), then draws frames on one persistent canvas while normal-pitch audio provides the playback clock. Rendering continues ahead during playback and pauses for a 30-second refill if the buffer runs dry. This mode has no pause or seeking and may heavily load the router. If synchronized buffering is unavailable, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
 							E('div', {
 								id: 'vp-render-mode-status',
 								class: rendererAvailable === false
@@ -568,6 +605,15 @@ return view.extend({
 							class: 'videoplayer-cpu-frame',
 							hidden: 'hidden',
 							'alt': _('Continuous router-rendered video stream')
+						}),
+						E('canvas', {
+							id: 'videoplayer-cpu-canvas',
+							class: 'videoplayer-cpu-canvas',
+							hidden: 'hidden',
+							width: '640',
+							height: '360',
+							role: 'img',
+							'aria-label': _('Buffered router-rendered video')
 						})
 					]),
 					E('div', {
@@ -577,6 +623,20 @@ return view.extend({
 						'aria-live': 'polite',
 						'aria-atomic': 'true'
 					}, _('Nothing playing. Choose a local file or enter a remote URL.')),
+					E('div', {
+						id: 'vp-cpu-progress',
+						class: 'vp-cpu-progress cbi-value-description',
+						hidden: 'hidden'
+					}, [
+						E('span', {}, [
+							E('strong', {}, _('Rendered time:')), ' ',
+							E('span', { id: 'vp-cpu-rendered-time' }, '00:00 / ?')
+						]),
+						E('span', {}, [
+							E('strong', {}, _('Played time:')), ' ',
+							E('span', { id: 'vp-cpu-played-time' }, '00:00 / ?')
+						])
+					]),
 					E('div', { class: 'vp-toolbar' }, [
 						E('button', {
 							type: 'button',
@@ -600,7 +660,7 @@ return view.extend({
 						id: 'vp-cpu-player-note',
 						class: 'cbi-value-description',
 						hidden: 'hidden'
-					}, _('Router CPU mode has no pause, seeking, or timeline. One long-lived FFmpeg process renders video and decodes PCM audio on the router from the same input clock. Browser-decoded original audio is used for native MJPEG or PCM failure fallback.'))
+					}, _('Router CPU mode has no pause or seeking. It renders at least two minutes ahead, keeps video and audio on one normal-speed clock, and shows separate rendered and played time counters.'))
 				])
 			]),
 
@@ -989,7 +1049,7 @@ return view.extend({
 			const browserAudio = session && session.browserAudio;
 			if (audio && audio.active && audio.gain) {
 				const suspended = audio.resumeFailed ||
-					(audio.context && audio.context.state &&
+					(!audio.bufferPaused && audio.context && audio.context.state &&
 					 audio.context.state !== 'running');
 				if (!audio.muted && !suspended) {
 					audio.muted = true;
@@ -1005,6 +1065,18 @@ return view.extend({
 					self._syncCpuMuteControl();
 					notify(null, _('Muted'), 2000);
 					return Promise.resolve();
+				}
+				if (session.bufferedPlayback && audio.bufferPaused && audio.muted) {
+					audio.muted = false;
+					try {
+						audio.gain.gain.setValueAtTime(
+							1, audio.context.currentTime
+						);
+					}
+					catch (err) { audio.gain.gain.value = 1; }
+					self._syncCpuMuteControl();
+					notify(null, _('Unmuted'), 2000);
+					return Promise.resolve(true);
 				}
 
 				const resumeAttempt = (Number(audio.resumeAttempt) || 0) + 1;
@@ -1031,7 +1103,8 @@ return view.extend({
 						throw new Error(_('Audio output is still suspended.'));
 					audio.resumeFailed = false;
 					audio.muted = false;
-					if (suspended && audio.resumeRebasePending) {
+					if (suspended && audio.resumeRebasePending &&
+					    !session.bufferedPlayback) {
 						audio.resumeRebasePending = false;
 						self._rebaseCpuAudio(session, audio);
 					}
@@ -1045,6 +1118,10 @@ return view.extend({
 						audio.gain.gain.value = 1;
 					}
 					self._syncCpuMuteControl();
+					if (session.bufferedPlayback) {
+						self._maybeStartCpuBufferedPlayback(session);
+						self._scheduleCpuBufferedPresentation(session, 0);
+					}
 					notify(null, _('Unmuted'), 2000);
 					return true;
 				}).catch(function (err) {
@@ -1079,7 +1156,14 @@ return view.extend({
 					return Promise.resolve();
 				}
 				if (browserAudio.waitingForVideo) {
-					notify(null, _('Browser audio will start with the first video frame.'), 2000, 'info');
+					notify(
+						null,
+						session.bufferedPlayback
+							? _('Browser audio will start when buffered playback is ready.')
+							: _('Browser audio will start with the first video frame.'),
+						2000,
+						'info'
+					);
 					return Promise.resolve();
 				}
 				browserAudio.muted = false;
@@ -1633,6 +1717,10 @@ return view.extend({
 				resumeAttempt: 0,
 				resumeRebasePending: !!context.state &&
 					context.state !== 'running',
+				bufferPaused: false,
+				suspendGeneration: 0,
+				suspendPromise: null,
+				resumePromise: null,
 				pollGeneration: 0,
 				timer: null,
 				inFlight: false,
@@ -1656,6 +1744,24 @@ return view.extend({
 
 				if (!audio.active)
 					return;
+				if (session && session.bufferedPlayback) {
+					if (context.state === 'closed') {
+						self._disableCpuAudio(
+							session,
+							_('The browser closed the router-decoded PCM output.')
+						);
+						return;
+					}
+					audio.resumeFailed = !audio.bufferPaused && !!context.state &&
+						context.state !== 'running';
+					if (context.state === 'running') {
+						audio.resumeRebasePending = false;
+						self._maybeStartCpuBufferedPlayback(session);
+						self._scheduleCpuBufferedPresentation(session, 0);
+					}
+					self._updateCpuAudioPresentation(session);
+					return;
+				}
 				audio.resumeFailed = !!context.state &&
 					context.state !== 'running';
 				if (audio.resumeFailed) {
@@ -1794,6 +1900,32 @@ return view.extend({
 			: null;
 
 		this._syncCpuMuteControl();
+		if (session && session.bufferedPlayback) {
+			if (note) {
+				if (session.bufferState === 'buffering') {
+					note.textContent = pcm
+						? _('The router is rendering video and PCM audio into a browser buffer. Playback starts after two minutes are ready, or after the whole file is rendered when it is shorter.')
+						: (browserAudio
+							? _('The router is rendering a two-minute video buffer while the browser prepares the original audio track. Playback starts when the video buffer is ready, or after the whole file is rendered when it is shorter.')
+							: _('The router is rendering a two-minute video buffer. Playback starts when it is ready, or after the whole file is rendered when it is shorter.'));
+				}
+				else if (session.bufferState === 'rebuffering' ||
+				         session.bufferState === 'hidden' ||
+				         session.bufferState === 'resuming') {
+					note.textContent = _('Playback is paused on the last complete canvas frame while the router refills the synchronized buffer. Audio always resumes at normal pitch.');
+				}
+				else if (pcm) {
+					note.textContent = _('Video is drawn on a persistent canvas from router-rendered JPEG frames. Router-decoded PCM audio is the master clock and always plays at normal speed and pitch.');
+				}
+				else if (browserAudio) {
+					note.textContent = _('Video is rendered by the router and drawn on a persistent canvas. The original audio track is played by the browser at normal speed as the master clock.');
+				}
+				else {
+					note.textContent = _('Video is rendered ahead by the router and drawn on a persistent canvas. This file has no usable audio track.');
+				}
+			}
+			return;
+		}
 		if (note && session) {
 			if (pcm) {
 				note.textContent = pcmSuspended
@@ -1945,10 +2077,24 @@ return view.extend({
 		const mediaOffsetMs = browserAudio &&
 			browserAudio.mediaOffsetMs;
 		const videoTarget = this._cpuVideoTarget(session);
-		let target, drift, rate;
+		let target, drift;
 
 		if (!element)
 			return;
+		if (session && session.bufferedPlayback) {
+			try {
+				element.defaultPlaybackRate = 1;
+				element.playbackRate = 1;
+				if ('preservesPitch' in element)
+					element.preservesPitch = true;
+				if (force)
+					element.currentTime = Math.max(
+						0, Number(session.playedSeconds) || 0
+					);
+			}
+			catch (err) {}
+			return;
+		}
 		if (Number.isFinite(videoTarget)) {
 			target = videoTarget;
 		}
@@ -1988,20 +2134,13 @@ return view.extend({
 				element.currentTime = target;
 				drift = 0;
 			}
-			if (Number.isFinite(videoTarget)) {
-				rate = Number.isFinite(session.videoPlaybackRate)
-					? session.videoPlaybackRate
-					: 0;
-				if (Math.abs(drift) > CPU_AV_SOFT_DRIFT_SECONDS)
-					rate -= drift * 0.35;
-				rate = Math.min(
-					CPU_AV_MAX_PLAYBACK_RATE,
-					Math.max(CPU_AV_MIN_PLAYBACK_RATE, rate)
-				);
-				if (!Number.isFinite(element.playbackRate) ||
-				    Math.abs(element.playbackRate - rate) > 0.01)
-					element.playbackRate = rate;
-			}
+			/* Never correct synchronization by resampling sound. Pausing or a
+			 * bounded hard seek may be noticeable, but it preserves pitch and is
+			 * preferable to changing voices on every transport jitter sample. */
+			element.defaultPlaybackRate = 1;
+			element.playbackRate = 1;
+			if ('preservesPitch' in element)
+				element.preservesPitch = true;
 		}
 		catch (err) {
 			/* loadedmetadata retries this for browsers that reject early seeks. */
@@ -2044,7 +2183,8 @@ return view.extend({
 		const now = cpuMonotonicNow();
 		const stallMs = this._cpuVideoStallMs(session);
 
-		if (!this._isCurrentCpuSession(session) || session.finishing)
+		if (!this._isCurrentCpuSession(session) || session.finishing ||
+		    session.bufferedPlayback)
 			return;
 		const videoStalled = Number.isFinite(session.videoFrameAt) &&
 			now - session.videoFrameAt >= stallMs;
@@ -2104,13 +2244,36 @@ return view.extend({
 		if (!this._isCurrentCpuSession(session) || session.finishing ||
 		    document.hidden || !audio || !audio.active || session.audio)
 			return false;
-		if (session.streamTransportMode === 'fetch' &&
+		if (!session.bufferedPlayback && session.streamTransportMode === 'fetch' &&
 		    (!Number.isFinite(session.videoMediaTime) ||
 		     !Number.isFinite(session.videoPlaybackRate)))
 			return false;
 		session.pendingAudio = null;
 		session.audio = audio;
 		audio.startedAt = Date.now();
+		if (session.bufferedPlayback) {
+			audio.sequence = 0;
+			audio.fetchSequence = 0;
+			audio.playSequence = null;
+			audio.bufferedChunks = Object.create(null);
+			audio.bufferedBytes = 0;
+			audio.bufferedUntil = 0;
+			audio.batchMaxChunks = Math.max(
+				1,
+				Math.min(8, Number(session.audioBatchMaxChunks) || 1)
+			);
+			audio.producerEnded = false;
+			audio.bufferPaused = false;
+			audio.errors = 0;
+			audio.ended = false;
+			audio.inFlight = false;
+			audio.inFlightGeneration = null;
+			audio.nextPlayTime = 0;
+			audio.sources = [];
+			this._scheduleCpuAudioPoll(session, 0);
+			this._updateCpuAudioPresentation(session);
+			return true;
+		}
 		position = this._cpuAudioPositionForVideo(session);
 		audio.sequence = position ? position.sequence : null;
 		audio.startOffsetSequence = audio.sequence;
@@ -2128,10 +2291,25 @@ return view.extend({
 
 	_failCpuBrowserAudio: function (session, browserAudio, message) {
 		let pcmActivated = false;
+		let bufferedPosition;
 
 		if (!session || !browserAudio ||
 		    session.browserAudio !== browserAudio)
 			return;
+		if (session.bufferedPlayback &&
+		    (session.bufferState === 'playing' ||
+		     session.bufferState === 'resuming')) {
+			bufferedPosition = this._cpuBufferedPlaybackTime(session);
+			session.playedSeconds = bufferedPosition;
+			session.playClockMediaBase = bufferedPosition;
+			session.playClockContextAt = null;
+			if (session.bufferState === 'playing')
+				session.playClockWallAt = cpuMonotonicNow();
+			else {
+				session.playClockWallAt = null;
+				session.bufferState = 'rebuffering';
+			}
+		}
 		session.browserAudio = null;
 		session.browserAudioFailed = true;
 		session.audioFailureReason = String(
@@ -2150,7 +2328,23 @@ return view.extend({
 				session, finishing.message, finishing.isError, true);
 			return;
 		}
-		pcmActivated = this._activatePendingCpuAudio(session);
+		if (session.bufferedPlayback && session.pendingAudio) {
+			/* A buffered session cannot join fresh sequence-zero PCM to a media
+			 * clock that is already in progress. Continue silently instead. */
+			const pending = session.pendingAudio;
+
+			session.pendingAudio = null;
+			this._disposeCpuAudio(pending);
+			this._startCpuAudioDrainer(
+				session,
+				pending.url,
+				Math.max(0, Number(pending.fetchSequence) || 0),
+				pending.batchMaxChunks
+			);
+		}
+		else {
+			pcmActivated = this._activatePendingCpuAudio(session);
+		}
 		if (!session.browserAudioWarned) {
 			session.browserAudioWarned = true;
 			notify(null, E('p', {},
@@ -2161,6 +2355,10 @@ return view.extend({
 			7000, pcmActivated ? 'info' : 'warning');
 		}
 		this._updateCpuAudioPresentation(session);
+		if (session.bufferedPlayback) {
+			this._maybeStartCpuBufferedPlayback(session);
+			this._scheduleCpuBufferedPresentation(session, 0);
+		}
 	},
 
 	_playCpuBrowserAudio: function (session, browserAudio, fromGesture) {
@@ -2386,8 +2584,22 @@ return view.extend({
 					return;
 				browserAudio.ended = true;
 				browserAudio.playing = false;
+				if (session.bufferedPlayback &&
+				    session.bufferState === 'playing') {
+					session.playedSeconds = Math.max(
+						Number(session.playedSeconds) || 0,
+						Number(element.currentTime) || 0
+					);
+					session.playClockMediaBase = session.playedSeconds;
+					session.playClockWallAt = cpuMonotonicNow();
+				}
 				session.browserAudio = null;
 				self._disposeCpuBrowserAudio(browserAudio);
+				if (session.bufferedPlayback) {
+					self._updateCpuAudioPresentation(session);
+					self._scheduleCpuBufferedPresentation(session, 0);
+					return;
+				}
 				if (session.finishing) {
 					const finishing = session.finishing;
 					session.finishing = null;
@@ -2412,12 +2624,18 @@ return view.extend({
 			try { element.load(); }
 			catch (err) {}
 			self._positionCpuBrowserAudio(session, browserAudio);
-			browserAudio.waitingForVideo = document.hidden ||
-				!session.firstFrameSeen ||
-				(session.streamTransportMode === 'fetch' &&
-				 !Number.isFinite(session.videoPlaybackRate));
+			browserAudio.waitingForVideo = session.bufferedPlayback
+				? (document.hidden || session.bufferState === 'buffering' ||
+				   session.bufferState === 'rebuffering' ||
+				   session.bufferState === 'hidden')
+				: (document.hidden || !session.firstFrameSeen ||
+				   (session.streamTransportMode === 'fetch' &&
+				    !Number.isFinite(session.videoPlaybackRate)));
 			self._updateCpuAudioPresentation(session);
-			if (!browserAudio.waitingForVideo)
+			if (session.bufferedPlayback)
+				self._maybeStartCpuBufferedPlayback(session);
+			if (!browserAudio.waitingForVideo && !browserAudio.playPending &&
+			    !browserAudio.playing)
 				browserAudio.playPromise = self._playCpuBrowserAudio(
 					session, browserAudio, false
 				);
@@ -2445,7 +2663,7 @@ return view.extend({
 			return;
 		if (audio && audio.active) {
 			const suspended = audio.resumeFailed ||
-				(audio.context && audio.context.state &&
+				(!audio.bufferPaused && audio.context && audio.context.state &&
 				 audio.context.state !== 'running');
 			button.textContent = audio.muted || suspended ? _('Unmute') : _('Mute');
 			button.setAttribute(
@@ -2467,7 +2685,9 @@ return view.extend({
 			button.title = browserAudio.resolving
 				? _('Preparing browser audio…')
 				: (browserAudio.waitingForVideo
-					? _('Browser audio will start with the first video frame.')
+					? (session && session.bufferedPlayback
+						? _('Browser audio will start when buffered playback is ready.')
+						: _('Browser audio will start with the first video frame.'))
 					: (muted ? _('Press Unmute to enable browser audio.') : ''));
 			return;
 		}
@@ -2479,14 +2699,222 @@ return view.extend({
 		}
 	},
 
-	_disableCpuAudio: function (session, message) {
+	_disposeCpuAudioDrainer: function (drainer) {
+		if (!drainer)
+			return;
+		drainer.active = false;
+		drainer.generation = (Number(drainer.generation) || 0) + 1;
+		if (drainer.timer != null)
+			window.clearTimeout(drainer.timer);
+		drainer.timer = null;
+		drainer.inFlight = false;
+	},
+
+	_scheduleCpuAudioDrainPoll: function (session, delay) {
+		const self = this;
+		const drainer = session && session.audioDrainer;
+
+		if (!self._isCurrentCpuSession(session) || !drainer ||
+		    !drainer.active || drainer.producerEnded)
+			return;
+		if (drainer.timer != null)
+			window.clearTimeout(drainer.timer);
+		drainer.timer = window.setTimeout(function () {
+			drainer.timer = null;
+			self._pollCpuAudioDrainer(session);
+		}, Math.max(0, Number(delay) || 0));
+	},
+
+	_startCpuAudioDrainer: function (session, url, sequence, batchMaxChunks) {
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    !url)
+			return false;
+		if (session.audioDrainer && session.audioDrainer.active)
+			return true;
+		const drainer = {
+			active: true,
+			url: url,
+			fetchSequence: Math.max(0, Number(sequence) || 0),
+			batchMaxChunks: Math.max(
+				1, Math.min(8, Number(batchMaxChunks) || 1)
+			),
+			generation: 0,
+			timer: null,
+			inFlight: false,
+			producerEnded: false,
+			errors: 0,
+			busyStartedAt: null
+		};
+		session.audioDrainer = drainer;
+		this._scheduleCpuAudioDrainPoll(session, 0);
+		return true;
+	},
+
+	_pollCpuAudioDrainer: function (session) {
+		const self = this;
+		const drainer = session && session.audioDrainer;
+		const generation = drainer ? Number(drainer.generation) || 0 : 0;
+		const sequence = drainer && Number(drainer.fetchSequence);
+		const count = drainer
+			? Math.max(1, Math.min(8, Number(drainer.batchMaxChunks) || 1))
+			: 1;
+
+		if (!self._isCurrentCpuSession(session) || !drainer ||
+		    !drainer.active || drainer.producerEnded || drainer.inFlight)
+			return Promise.resolve();
+		if (!Number.isSafeInteger(sequence) || sequence < 0) {
+			self._failCpuBufferedPlayback(
+				session, _('The router PCM acknowledgement cursor is invalid.')
+			);
+			return Promise.resolve();
+		}
+		drainer.inFlight = true;
+		return request.get(drainer.url, {
+			responseType: 'blob',
+			timeout: CPU_AUDIO_REQUEST_TIMEOUT_MS,
+			cache: true,
+			query: { chunk: String(sequence), count: String(count) }
+		}).then(function (res) {
+			if (!self._isCurrentCpuSession(session) ||
+			    session.audioDrainer !== drainer || !drainer.active ||
+			    drainer.generation !== generation)
+				return { done: true };
+			if (res.status === 202) {
+				drainer.busyStartedAt = null;
+				return { retry: true, delay: 50 };
+			}
+			if (res.status === 204) {
+				drainer.producerEnded = true;
+				drainer.active = false;
+				return { done: true };
+			}
+			if (res.status === 409 && String(
+				res.headers && res.headers.get('X-Videoplayer-Audio-State') || ''
+			).toLowerCase() === 'unavailable') {
+				/* This authenticated state is emitted only after the worker has
+				 * replaced the failed PCM chunker with its own direct FIFO sink. */
+				drainer.producerEnded = true;
+				drainer.active = false;
+				return { done: true };
+			}
+			if (res.status === 409) {
+				const now = Date.now();
+
+				if (!Number.isFinite(drainer.busyStartedAt))
+					drainer.busyStartedAt = now;
+				/* A disposed Web Audio request cannot always be aborted. Its
+				 * download may still own audio.lock when the discard drainer
+				 * starts, so generic lock-busy 409s remain retryable for longer
+				 * than that request's complete timeout. Persistent 409 still
+				 * fails closed after this bounded overlap window. */
+				if (now - drainer.busyStartedAt < CPU_AUDIO_BUSY_RETRY_MS)
+					return { retry: true, delay: 100 };
+				throw new Error(_('The router PCM acknowledgement stream remained busy.'));
+			}
+			if (res.status === 404 || res.status === 410)
+				throw new Error(_('The router PCM acknowledgement stream lost its next chunk.'));
+			if (!res.ok || res.status !== 200)
+				throw new Error(
+					_('Audio drain request failed with HTTP %d').format(res.status)
+				);
+			drainer.busyStartedAt = null;
+
+			const get = function (name) {
+				return String(res.headers.get(name) || '');
+			};
+			const responseSequenceText = get('X-Videoplayer-Audio-Sequence');
+			const responseCountText = get('X-Videoplayer-Audio-Chunk-Count') || '1';
+			const framesText = get('X-Videoplayer-Audio-Frames-Per-Chunk') ||
+				get('X-Videoplayer-Audio-Frames');
+			const totalFramesText = get('X-Videoplayer-Audio-Total-Frames');
+			const responseSequence = Number(responseSequenceText);
+			const responseCount = Number(responseCountText);
+			const contentLength = Number(get('Content-Length'));
+			if (get('Content-Type').split(';', 1)[0].trim().toLowerCase() !==
+					'application/octet-stream' ||
+			    get('X-Videoplayer-Audio-Format').toLowerCase() !== 's16le' ||
+			    !/^(0|[1-9][0-9]{0,7})$/.test(responseSequenceText) ||
+			    responseSequence !== sequence ||
+			    !/^[1-8]$/.test(responseCountText) || responseCount > count ||
+			    Number(get('X-Videoplayer-Audio-Sample-Rate')) !==
+				CPU_AUDIO_SAMPLE_RATE ||
+			    Number(get('X-Videoplayer-Audio-Channels')) !==
+				CPU_AUDIO_CHANNELS ||
+			    Number(framesText) !== CPU_AUDIO_FRAMES_PER_CHUNK ||
+			    Number(totalFramesText) !==
+				responseCount * CPU_AUDIO_FRAMES_PER_CHUNK ||
+			    contentLength !== responseCount * CPU_AUDIO_CHUNK_BYTES)
+				throw new Error(_('The router returned invalid PCM drain metadata.'));
+			const blob = res.blob();
+			if (!blob || blob.size !== contentLength)
+				throw new Error(_('The router returned an invalid PCM drain batch.'));
+			return blobToArrayBuffer(blob).then(function (arrayBuffer) {
+				if (!(arrayBuffer instanceof ArrayBuffer) ||
+				    arrayBuffer.byteLength !== contentLength)
+					throw new Error(_('The router returned an invalid PCM drain batch.'));
+				if (!self._isCurrentCpuSession(session) ||
+				    session.audioDrainer !== drainer || !drainer.active ||
+				    drainer.generation !== generation)
+					return { done: true };
+				drainer.fetchSequence += responseCount;
+				drainer.errors = 0;
+				return { retry: true, delay: 0 };
+			});
+		}).then(function (result) {
+			if (!result || result.done ||
+			    !self._isCurrentCpuSession(session) ||
+			    session.audioDrainer !== drainer || !drainer.active ||
+			    drainer.generation !== generation)
+				return;
+			self._scheduleCpuAudioDrainPoll(session, result.delay || 0);
+		}).catch(function (err) {
+			if (!self._isCurrentCpuSession(session) ||
+			    session.audioDrainer !== drainer || !drainer.active ||
+			    drainer.generation !== generation)
+				return;
+			drainer.errors++;
+			if (drainer.errors < 3) {
+				self._scheduleCpuAudioDrainPoll(
+					session, Math.min(1000, 100 * Math.pow(2, drainer.errors))
+				);
+				return;
+			}
+			self._failCpuBufferedPlayback(
+				session,
+				_('Unable to acknowledge router PCM while browser audio is active: %s')
+					.format(errorText(err))
+			);
+		}).finally(function () {
+			drainer.inFlight = false;
+		});
+	},
+
+	_disableCpuAudio: function (session, message, backendDraining) {
 		const audio = session && session.audio;
 		const finishing = session && session.finishing;
+		let bufferedPosition;
 
 		if (!audio)
 			return Promise.resolve(false);
+		if (session.bufferedPlayback) {
+			bufferedPosition = this._cpuBufferedPlaybackTime(session);
+			session.playedSeconds = bufferedPosition;
+			session.playClockMediaBase = bufferedPosition;
+			session.playClockContextAt = null;
+			session.playClockWallAt = null;
+			if (session.bufferState === 'playing' ||
+			    session.bufferState === 'resuming')
+				session.bufferState = 'rebuffering';
+		}
 		session.audio = null;
 		this._disposeCpuAudio(audio);
+		if (session.bufferedPlayback && !backendDraining)
+			this._startCpuAudioDrainer(
+				session,
+				audio.url,
+				Math.max(0, Number(audio.fetchSequence) || 0),
+				audio.batchMaxChunks
+			);
 		session.audioFailureReason = String(
 			message || _('Router-decoded PCM audio is unavailable.')
 		);
@@ -2556,6 +2984,30 @@ return view.extend({
 
 		if (!this._isCurrentCpuSession(session) || session.finishing)
 			return;
+		if (session.bufferedPlayback) {
+			if (document.hidden) {
+				session.streamHiddenAt = now;
+				session.bufferHidden = true;
+				if (session.bufferState === 'playing' ||
+				    session.bufferState === 'resuming')
+					this._enterCpuBufferedRebuffer(session, true);
+				return;
+			}
+			session.streamHiddenAt = null;
+			session.bufferHidden = false;
+			if (session.pendingAudio && !session.audio)
+				this._activatePendingCpuAudio(session);
+			if (session.bufferState === 'hidden')
+				session.bufferState = 'rebuffering';
+			this._maybeStartCpuBufferedPlayback(session);
+			this._scheduleCpuBufferedPresentation(session, 0);
+			this._scheduleCpuStreamStatus(session, 0);
+			if (!session.producerEnded && !session.streamPending &&
+			    (!session.streamVisibleAttempt ||
+			     session.streamVisibleAttempt.ended))
+				this._scheduleCpuStreamReconnect(session, 0);
+			return;
+		}
 		if (document.hidden) {
 			session.streamHiddenAt = now;
 			if (session.audio && session.audio.active &&
@@ -2635,10 +3087,13 @@ return view.extend({
 	_setPlayerSurface: function (surface) {
 		const video = document.getElementById('videoplayer-video');
 		const frame = document.getElementById('videoplayer-cpu-frame');
+		const canvas = document.getElementById('videoplayer-cpu-canvas');
+		const progress = document.getElementById('vp-cpu-progress');
 		const note = document.getElementById('vp-cpu-player-note');
 		const mute = document.getElementById('vp-mute-btn');
 		const showVideo = surface === 'video';
 		const showCpu = surface === 'cpu';
+		const showBufferedCpu = surface === 'cpu-buffered';
 
 		if (video) {
 			video.hidden = !showVideo;
@@ -2648,10 +3103,18 @@ return view.extend({
 			frame.hidden = !showCpu;
 			frame.setAttribute('aria-hidden', showCpu ? 'false' : 'true');
 		}
+		if (canvas) {
+			canvas.hidden = !showBufferedCpu;
+			canvas.setAttribute(
+				'aria-hidden', showBufferedCpu ? 'false' : 'true'
+			);
+		}
+		if (progress)
+			progress.hidden = !showBufferedCpu;
 		if (note)
-			note.hidden = !showCpu;
+			note.hidden = !(showCpu || showBufferedCpu);
 		if (mute) {
-			if (showCpu)
+			if (showCpu || showBufferedCpu)
 				this._syncCpuMuteControl();
 			else {
 				mute.disabled = !showVideo;
@@ -2669,9 +3132,207 @@ return view.extend({
 			typeof window.URL.revokeObjectURL === 'function';
 	},
 
-	_disposeCpuFetchAttempt: function (attempt) {
+	_canUseCpuBufferedPlayback: function () {
+		const canvas = document.getElementById('videoplayer-cpu-canvas');
+
+		if (!this._canUseCpuFetchStream() || !canvas ||
+		    typeof canvas.getContext !== 'function')
+			return false;
+		try { return !!canvas.getContext('2d'); }
+		catch (err) { return false; }
+	},
+
+	_updateCpuBufferedMetadata: function (session, source) {
+		const durationMs = Number(source && source.duration_ms);
+		const totalFrames = Number(source && source.total_frames);
+
+		if (!session || !session.bufferedPlayback)
+			return;
+		if (!session.durationSealed &&
+		    Number.isSafeInteger(durationMs) && durationMs > 0)
+			session.durationSeconds = durationMs / 1000;
+		if (Number.isSafeInteger(totalFrames) && totalFrames > 0)
+			session.totalFrames = totalFrames;
+		this._updateCpuBufferedCounters(session, true);
+	},
+
+	_sealCpuBufferedDuration: function (session) {
+		const rendered = Number(session && session.renderedSeconds);
+
+		if (!session || !session.bufferedPlayback ||
+		    !session.producerEnded || session.videoProducerDrained !== true ||
+		    !Number.isFinite(rendered) || rendered <= 0)
+			return;
+		/* Probe metadata is advisory: malformed media can print FFmpeg-like lines
+		 * to stderr. Only a clean, fully drained video transport can establish the
+		 * playback end used for gating and completion. */
+		session.durationSeconds = rendered;
+		session.durationSealed = true;
+		this._updateCpuBufferedCounters(session, true);
+	},
+
+	_updateCpuBufferedCounters: function (session, force) {
+		const now = Date.now();
+		const rendered = document.getElementById('vp-cpu-rendered-time');
+		const played = document.getElementById('vp-cpu-played-time');
+		const total = Number.isFinite(session && session.durationSeconds)
+			? formatCpuDuration(session.durationSeconds)
+			: '?';
+		let renderedSeconds, playedSeconds;
+
+		if (!session || !session.bufferedPlayback)
+			return;
+		if (!force && Number.isFinite(session.counterUpdatedAt) &&
+		    now - session.counterUpdatedAt < CPU_BUFFER_COUNTER_INTERVAL_MS)
+			return;
+		session.counterUpdatedAt = now;
+		renderedSeconds = Math.max(0, Number(session.renderedSeconds) || 0);
+		playedSeconds = Math.max(0, Number(session.playedSeconds) || 0);
+		if (session.durationSealed && Number.isFinite(session.durationSeconds)) {
+			renderedSeconds = Math.min(renderedSeconds, session.durationSeconds);
+			playedSeconds = Math.min(playedSeconds, session.durationSeconds);
+		}
+		if (rendered)
+			rendered.textContent = formatCpuDuration(renderedSeconds) + ' / ' + total;
+		if (played)
+			played.textContent = formatCpuDuration(playedSeconds) + ' / ' + total;
+	},
+
+	_cpuBufferedAvailableUntil: function (session) {
+		let available = Math.max(0, Number(session && session.renderedSeconds) || 0);
+		const audio = session && session.audio;
+
+		if (audio && audio.active && !audio.producerEnded)
+			available = Math.min(
+				available,
+				Math.max(0, Number(audio.bufferedUntil) || 0)
+			);
+		return available;
+	},
+
+	_cpuBufferedAhead: function (session) {
+		return Math.max(
+			0,
+			this._cpuBufferedAvailableUntil(session) -
+				Math.max(0, Number(session && session.playedSeconds) || 0)
+		);
+	},
+
+	_cpuBufferedBytes: function (session) {
+		const audio = session && session.audio;
+
+		return Math.max(0, Number(session && session.videoBufferBytes) || 0) +
+			Math.max(0, Number(session && session.videoDecodeBytes) || 0) +
+			Math.max(0, Number(audio && audio.bufferedBytes) || 0);
+	},
+
+	_waitForCpuBufferedCapacity: function (session, attempt) {
+		/* Never leave an already-dispatched CGI body unread: uhttpd has its own
+		 * absolute script timeout, and killing a relay behind buffered socket data
+		 * loses the exact frame clock. Capacity is enforced between clean bounded
+		 * responses by _openCpuStream(); this promise remains for the parser pump's
+		 * single control path. */
+		if (attempt)
+			attempt.backpressured = false;
+		return Promise.resolve();
+	},
+
+	_cpuBufferedTransportHasCapacity: function (session) {
+		const bytes = this._cpuBufferedBytes(session);
+		const byteLimit = session && session.bufferState === 'buffering'
+			? CPU_BUFFER_HARD_LIMIT_BYTES - CPU_BUFFER_SEGMENT_RESERVE_BYTES
+			: CPU_BUFFER_HARD_LIMIT_BYTES * 0.9;
+
+		if (!session || !session.bufferedPlayback || session.producerEnded)
+			return true;
+		return Math.max(
+			0,
+			Number(session.renderedSeconds) - Number(session.playedSeconds)
+		) < CPU_BUFFER_HIGH_WATER_SECONDS &&
+			bytes < byteLimit;
+	},
+
+	_cpuInitialBufferCannotProgress: function (session) {
+		return !!(session && session.bufferedPlayback &&
+			session.bufferState === 'buffering' && !session.producerEnded &&
+			Number(session.renderedSeconds) < CPU_BUFFER_INITIAL_SECONDS &&
+			this._cpuBufferedBytes(session) >=
+				CPU_BUFFER_HARD_LIMIT_BYTES -
+				CPU_BUFFER_SEGMENT_RESERVE_BYTES);
+	},
+
+	_markCpuBufferedAttemptReady: function (session, attempt) {
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    attempt.cancelled || attempt.ready)
+			return;
+		if (session.streamPending !== attempt)
+			return;
+		attempt.ready = true;
+		session.streamPending = null;
+		session.streamVisibleAttempt = attempt;
+		session.streamOutageStartedAt = null;
+		session.streamErrors = 0;
+		session.streamWarned = false;
+		session.streamFetchErrors = 0;
+		session.streamNextHandoffAt =
+			attempt.openedAt + session.streamSegmentMs +
+			CPU_STREAM_HANDOFF_GRACE_MS;
+		if (session.streamRefreshTimer != null)
+			window.clearTimeout(session.streamRefreshTimer);
+		session.streamRefreshTimer = null;
+		/* The frame-aligned CGI relay closes itself between complete JPEG parts.
+		 * Never abort or pause a dispatched response at a local watermark: every
+		 * active body is drained to its bounded clean close, and capacity gates only
+		 * the next request. */
+	},
+
+	_acceptCpuBufferedFrame: function (session, attempt, bytes, sequence) {
+		const frameBytes = Number(bytes && bytes.byteLength) || 0;
+		const frameDuration = 1 / Math.max(1, Number(session && session.fps) || 1);
+
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    attempt.cancelled || !frameBytes)
+			return;
+		if (this._cpuBufferedBytes(session) + frameBytes >
+		    CPU_BUFFER_HARD_LIMIT_BYTES) {
+			this._failCpuBufferedPlayback(
+				session,
+				_('The two-minute router render buffer exceeded the 512 MiB browser memory safety limit.')
+			);
+			return;
+		}
+		this._markCpuBufferedAttemptReady(session, attempt);
+		session.videoFrames.push({
+			bytes: bytes,
+			sequence: sequence,
+			mediaTime: sequence * frameDuration
+		});
+		session.lastBufferedFrameSequence = Math.max(
+			Number(session.lastBufferedFrameSequence) || 0,
+			sequence
+		);
+		session.videoBufferBytes += frameBytes;
+		session.renderedSeconds = Math.max(
+			Number(session.renderedSeconds) || 0,
+			(sequence + 1) * frameDuration
+		);
+		session.streamLastFrameAt = Date.now();
+		this._updateCpuBufferedCounters(session, false);
+		this._maybeStartCpuBufferedPlayback(session);
+	},
+
+	_invalidateCpuTerminalDrainEvidence: function (session, attempt) {
+		if (!session || !attempt || !attempt.terminalDrain ||
+		    attempt.terminalCheck || attempt.bodyEndedClean === true)
+			return;
+		if (session.videoTerminalDrainCandidateId === attempt.streamId)
+			session.videoTerminalDrainBodyClean = false;
+	},
+
+	_disposeCpuFetchAttempt: function (attempt, session) {
 		if (!attempt || attempt.mode !== 'fetch')
 			return;
+		this._invalidateCpuTerminalDrainEvidence(session, attempt);
 		attempt.cancelled = true;
 		if (attempt.reader && typeof attempt.reader.cancel === 'function') {
 			try {
@@ -2687,6 +3348,12 @@ return view.extend({
 			catch (err) {}
 		}
 		attempt.controller = null;
+		if (attempt.backpressureTimer != null)
+			window.clearTimeout(attempt.backpressureTimer);
+		attempt.backpressureTimer = null;
+		if (attempt.backpressureResolve)
+			attempt.backpressureResolve();
+		attempt.backpressureResolve = null;
 		if (attempt.decodeInFlight) {
 			const decoding = attempt.decodeInFlight;
 			decoding.node.onload = null;
@@ -2788,6 +3455,10 @@ return view.extend({
 		    (session.streamPending !== attempt &&
 		     session.streamVisibleAttempt !== attempt))
 			return;
+		if (session.bufferedPlayback) {
+			this._acceptCpuBufferedFrame(session, attempt, bytes, sequence);
+			return;
+		}
 		attempt.queuedFrame = { bytes: bytes, sequence: sequence };
 		if (!attempt.decodeInFlight)
 			this._decodeCpuMjpegFrame(session, attempt);
@@ -2800,6 +3471,8 @@ return view.extend({
 			buffer instanceof Uint8Array && closing instanceof Uint8Array &&
 			buffer.length === closing.length &&
 			findBytes(buffer, closing, 0) === 0;
+		const cleanEof = attempt && attempt.multipartState === 'boundary' &&
+			buffer instanceof Uint8Array && (buffer.length === 0 || cleanClose);
 		const partialFrame = attempt && (
 			attempt.multipartState === 'headers' ||
 			attempt.multipartState === 'body' ||
@@ -2807,13 +3480,15 @@ return view.extend({
 			 buffer instanceof Uint8Array && buffer.length > 0 && !cleanClose)
 		);
 
-		if (!this._isCurrentCpuSession(session) || !partialFrame ||
-		    attempt.truncationAccounted)
-			return;
+		if (!this._isCurrentCpuSession(session))
+			return false;
+		if (!partialFrame || attempt.truncationAccounted)
+			return !!cleanEof;
 		/* The next CGI segment scans to the following multipart boundary, so
 		 * exactly one partially consumed frame is discarded on the server too. */
 		attempt.truncationAccounted = true;
 		session.streamFrameSequence++;
+		return false;
 	},
 
 	_decodeCpuMjpegFrame: function (session, attempt) {
@@ -3004,12 +3679,844 @@ return view.extend({
 			this._completeCpuFetchStream(session, attempt);
 	},
 
+	_cpuBufferedPlaybackTime: function (session) {
+		const audio = session && session.audio;
+		const browserAudio = session && session.browserAudio;
+		let elapsed = 0;
+
+		if (!session || !session.bufferedPlayback)
+			return 0;
+		if (session.bufferState !== 'playing')
+			return Math.max(0, Number(session.playedSeconds) || 0);
+		if (audio && audio.active && Number.isFinite(session.playClockContextAt)) {
+			elapsed = Math.max(
+				0,
+				Number(audio.context.currentTime) - session.playClockContextAt
+			);
+		}
+		else if (browserAudio && browserAudio.active && browserAudio.element &&
+		         Number.isFinite(Number(browserAudio.element.currentTime))) {
+			return Math.max(0, Number(browserAudio.element.currentTime));
+		}
+		else if (Number.isFinite(session.playClockWallAt)) {
+			elapsed = Math.max(
+				0,
+				(cpuMonotonicNow() - session.playClockWallAt) / 1000
+			);
+		}
+		return Math.max(
+			0,
+			(Number(session.playClockMediaBase) || 0) + elapsed
+		);
+	},
+
+	_takeCpuBufferedFrame: function (session, targetSequence) {
+		let candidate = null;
+
+		while (session.videoFrameIndex < session.videoFrames.length) {
+			const index = session.videoFrameIndex;
+			const frame = session.videoFrames[index];
+
+			if (!frame || frame.sequence <= targetSequence) {
+				session.videoFrames[index] = null;
+				session.videoFrameIndex++;
+				if (frame) {
+					if (candidate)
+						session.videoBufferBytes -= candidate.bytes.byteLength;
+					candidate = frame;
+				}
+				continue;
+			}
+			break;
+		}
+		if (session.videoFrameIndex >= 1024 &&
+		    session.videoFrameIndex * 2 >= session.videoFrames.length) {
+			session.videoFrames.splice(0, session.videoFrameIndex);
+			session.videoFrameIndex = 0;
+		}
+		if (candidate) {
+			session.videoBufferBytes = Math.max(
+				0,
+				session.videoBufferBytes - candidate.bytes.byteLength
+			);
+			session.videoDecodeBytes += candidate.bytes.byteLength;
+		}
+		return candidate;
+	},
+
+	_decodeCpuBufferedFrame: function (session, targetSequence) {
+		const self = this;
+		let frame;
+		let node, url, generation;
+		let settled = false;
+
+		if (session.videoDecodeInFlight || !this._isCurrentCpuSession(session))
+			return;
+		frame = this._takeCpuBufferedFrame(session, targetSequence);
+		if (!frame)
+			return;
+		try {
+			node = document.createElement('img');
+			url = window.URL.createObjectURL(new window.Blob(
+				[ frame.bytes ], { type: 'image/jpeg' }
+			));
+		}
+		catch (err) {
+			session.videoDecodeBytes = Math.max(
+				0,
+				(Number(session.videoDecodeBytes) || 0) -
+					frame.bytes.byteLength
+			);
+			this._failCpuBufferedPlayback(
+				session,
+				_('The browser could not prepare a router-rendered frame: %s')
+					.format(errorText(err))
+			);
+			return;
+		}
+		generation = Number(session.videoDecodeGeneration) || 0;
+		session.videoDecodeInFlight = {
+			node: node,
+			url: url,
+			frame: frame,
+			generation: generation
+		};
+		const finish = function (decoded) {
+			if (settled)
+				return;
+			settled = true;
+			const inFlight = session.videoDecodeInFlight;
+			const byteLength = frame.bytes.byteLength;
+
+			node.onload = null;
+			node.onerror = null;
+			try { window.URL.revokeObjectURL(url); }
+			catch (err) {}
+			if (inFlight && inFlight.node === node)
+				session.videoDecodeInFlight = null;
+			session.videoDecodeBytes = Math.max(
+				0,
+				(Number(session.videoDecodeBytes) || 0) - byteLength
+			);
+			if (!decoded || !self._isCurrentCpuSession(session) ||
+			    generation !== session.videoDecodeGeneration ||
+			    !session.canvasContext || !session.canvas ||
+			    Number(node.naturalWidth) <= 0) {
+				if (self._isCurrentCpuSession(session)) {
+					session.lastDecodeFailureSequence = Math.max(
+						Number(session.lastDecodeFailureSequence) || -1,
+						frame.sequence
+					);
+					self._scheduleCpuBufferedPresentation(session, 0);
+				}
+				return;
+			}
+			const width = Number(node.naturalWidth) || 640;
+			const height = Number(node.naturalHeight) ||
+				Math.max(1, Math.round(width * 9 / 16));
+
+			if (session.canvas.width !== width)
+				session.canvas.width = width;
+			if (session.canvas.height !== height)
+				session.canvas.height = height;
+			try {
+				session.canvasContext.drawImage(
+					node, 0, 0, session.canvas.width, session.canvas.height
+				);
+			}
+			catch (err) {
+				self._failCpuBufferedPlayback(
+					session,
+					_('The browser could not draw a router-rendered frame: %s')
+						.format(errorText(err))
+				);
+				return;
+			}
+			session.displayedSequence = frame.sequence;
+			session.videoMediaTime = frame.mediaTime;
+			session.videoFrameAt = cpuMonotonicNow();
+			if (!session.firstFrameSeen) {
+				session.firstFrameSeen = true;
+				session.firstFrameAt = Date.now();
+				self._updateCpuAudioPresentation(session);
+			}
+			self._scheduleCpuBufferedPresentation(session, 0);
+		};
+		try {
+			node.onload = function () { finish(true); };
+			node.onerror = function () { finish(false); };
+			node.src = url;
+		}
+		catch (err) {
+			node.onload = null;
+			node.onerror = null;
+			if (session.videoDecodeInFlight &&
+			    session.videoDecodeInFlight.node === node)
+				session.videoDecodeInFlight = null;
+			session.videoDecodeBytes = Math.max(
+				0,
+				(Number(session.videoDecodeBytes) || 0) -
+					frame.bytes.byteLength
+			);
+			try { window.URL.revokeObjectURL(url); }
+			catch (revokeError) {}
+			this._failCpuBufferedPlayback(
+				session,
+				_('The browser could not prepare a router-rendered frame: %s')
+					.format(errorText(err))
+			);
+		}
+	},
+
+	_scheduleCpuBufferedAudioChunk: function (session, audio, arrayBuffer, sequence) {
+		const self = this;
+		const context = audio && audio.context;
+		let source = null;
+
+		try {
+			const data = new DataView(arrayBuffer);
+			const buffer = context.createBuffer(
+				CPU_AUDIO_CHANNELS,
+				CPU_AUDIO_FRAMES_PER_CHUNK,
+				CPU_AUDIO_SAMPLE_RATE
+			);
+			const left = buffer.getChannelData(0);
+			const right = buffer.getChannelData(1);
+
+			for (let i = 0; i < CPU_AUDIO_FRAMES_PER_CHUNK; i++) {
+				left[i] = data.getInt16(i * 4, true) / 32768;
+				right[i] = data.getInt16(i * 4 + 2, true) / 32768;
+			}
+			source = context.createBufferSource();
+			const startAt = audio.nextPlayTime;
+			source.buffer = buffer;
+			if (source.playbackRate) {
+				try {
+					if (typeof source.playbackRate.setValueAtTime === 'function')
+						source.playbackRate.setValueAtTime(1, startAt);
+					else
+						source.playbackRate.value = 1;
+				}
+				catch (err) {}
+			}
+			source.videoplayerStartAt = startAt;
+			source.videoplayerEndAt = startAt + CPU_AUDIO_CHUNK_MS / 1000;
+			source.videoplayerMediaStart =
+				sequence * CPU_AUDIO_CHUNK_MS / 1000;
+			source.videoplayerPlaybackRate = 1;
+			source.connect(audio.gain);
+			audio.sources.push(source);
+			source.onended = function () {
+				const index = audio.sources.indexOf(source);
+				if (index !== -1)
+					audio.sources.splice(index, 1);
+				try { source.disconnect(); }
+				catch (err) {}
+				if (self._isCurrentCpuSession(session))
+					self._scheduleCpuBufferedPresentation(session, 0);
+			};
+			source.start(startAt, 0);
+			audio.nextPlayTime = source.videoplayerEndAt;
+		}
+		catch (err) {
+			if (source) {
+				const index = audio.sources.indexOf(source);
+
+				source.onended = null;
+				if (index !== -1)
+					audio.sources.splice(index, 1);
+				try { source.stop(); }
+				catch (stopError) {}
+				try { source.disconnect(); }
+				catch (disconnectError) {}
+			}
+			throw err;
+		}
+	},
+
+	_fillCpuBufferedAudioQueue: function (session) {
+		const audio = session && session.audio;
+		const context = audio && audio.context;
+
+		if (!audio || !audio.active || !context ||
+		    !Number.isInteger(audio.playSequence))
+			return true;
+		while (audio.nextPlayTime - Number(context.currentTime) <
+		       CPU_AUDIO_MAX_LEAD_SECONDS) {
+			const sequence = audio.playSequence;
+			const chunk = audio.bufferedChunks[sequence];
+
+			if (!(chunk instanceof ArrayBuffer))
+				break;
+			try {
+				this._scheduleCpuBufferedAudioChunk(
+					session, audio, chunk, sequence
+				);
+			}
+			catch (err) {
+				this._disableCpuAudio(
+					session,
+					_('The browser could not schedule router PCM audio: %s')
+						.format(errorText(err)),
+					false
+				);
+				return false;
+			}
+			delete audio.bufferedChunks[sequence];
+			audio.bufferedBytes = Math.max(
+				0,
+				(Number(audio.bufferedBytes) || 0) - chunk.byteLength
+			);
+			audio.playSequence++;
+		}
+		return true;
+	},
+
+	_pauseCpuBufferedClock: function (session) {
+		const self = this;
+		const audio = session && session.audio;
+		const browserAudio = session && session.browserAudio;
+		let suspendGeneration;
+
+		if (audio && audio.active && audio.context) {
+			audio.bufferPaused = true;
+			suspendGeneration =
+				(Number(audio.suspendGeneration) || 0) + 1;
+			audio.suspendGeneration = suspendGeneration;
+			const suspendNow = function () {
+				let result;
+
+				if (!self._isCurrentCpuSession(session) ||
+				    session.audio !== audio || !audio.active ||
+				    audio.suspendGeneration !== suspendGeneration ||
+				    !audio.bufferPaused)
+					return false;
+				if (audio.context.state !== 'running')
+					return true;
+				try {
+					if (typeof audio.context.suspend !== 'function')
+						throw new Error(_('This browser cannot suspend Web Audio safely.'));
+					result = audio.context.suspend();
+				}
+				catch (err) { return Promise.reject(err); }
+				return Promise.resolve(result).then(function () { return true; });
+			};
+			const pendingResume = audio.resumePromise;
+			const operation = pendingResume
+				? Promise.resolve(pendingResume).then(suspendNow, suspendNow)
+				: suspendNow();
+
+			audio.suspendPromise = Promise.resolve(operation).then(function (suspended) {
+				return suspended !== false;
+			}, function (err) {
+				if (self._isCurrentCpuSession(session) &&
+				    session.audio === audio && audio.active &&
+				    audio.suspendGeneration === suspendGeneration) {
+					self._failCpuBufferedPlayback(
+						session,
+						_('The browser could not pause the synchronized audio clock: %s')
+							.format(errorText(err))
+					);
+				}
+				return false;
+			});
+		}
+		if (browserAudio && browserAudio.active && browserAudio.element) {
+			browserAudio.syncPaused = true;
+			this._pauseCpuBrowserAudioForSync(session, browserAudio);
+		}
+	},
+
+	_enterCpuBufferedRebuffer: function (session, hidden) {
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    (session.bufferState !== 'playing' &&
+		     session.bufferState !== 'resuming'))
+			return;
+		session.playedSeconds = this._cpuBufferedPlaybackTime(session);
+		session.playClockMediaBase = session.playedSeconds;
+		if (session.audio && session.audio.active)
+			session.playClockContextAt = Number(
+				session.audio.context.currentTime
+			);
+		session.playClockWallAt = null;
+		session.bufferState = hidden ? 'hidden' : 'rebuffering';
+		this._pauseCpuBufferedClock(session);
+		this._setNowPlaying(
+			hidden
+				? _('Router CPU playback paused while this tab is hidden: %s')
+					.format(session.label)
+				: _('Buffering more router-rendered video: %s')
+					.format(session.label)
+		);
+		this._updateCpuBufferedCounters(session, true);
+		this._scheduleCpuBufferedPresentation(session, CPU_BUFFER_POLL_MS);
+	},
+
+	_resumeCpuBufferedPlayback: function (session) {
+		const self = this;
+		const audio = session && session.audio;
+		const browserAudio = session && session.browserAudio;
+		let resumeGeneration;
+
+		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    document.hidden ||
+		    (session.bufferState !== 'rebuffering' &&
+		     session.bufferState !== 'hidden'))
+			return;
+		session.bufferState = 'resuming';
+		if (audio && audio.active) {
+			resumeGeneration =
+				(Number(session.bufferResumeGeneration) || 0) + 1;
+			session.bufferResumeGeneration = resumeGeneration;
+			const resumePromise = Promise.resolve(audio.suspendPromise).then(function (suspended) {
+				let resumeResult;
+
+				if (suspended === false ||
+				    !self._isCurrentCpuSession(session) ||
+				    session.audio !== audio || !audio.active ||
+				    session.bufferState !== 'resuming' ||
+				    session.bufferResumeGeneration !== resumeGeneration)
+					return false;
+				if (!self._fillCpuBufferedAudioQueue(session))
+					return false;
+				audio.bufferPaused = false;
+				try {
+					resumeResult = audio.context &&
+						typeof audio.context.resume === 'function'
+						? audio.context.resume()
+						: undefined;
+				}
+				catch (err) {
+					resumeResult = Promise.reject(err);
+				}
+				return Promise.resolve(resumeResult).then(function () {
+					return true;
+				});
+			});
+			audio.resumePromise = resumePromise;
+			resumePromise.then(function (resumed) {
+				if (!resumed || !self._isCurrentCpuSession(session) ||
+				    session.audio !== audio || !audio.active ||
+				    session.bufferState !== 'resuming' ||
+				    session.bufferResumeGeneration !== resumeGeneration)
+					return;
+				audio.resumeFailed = !!audio.context.state &&
+					audio.context.state !== 'running';
+				if (audio.resumeFailed) {
+					session.bufferState = 'rebuffering';
+					self._scheduleCpuBufferedPresentation(
+						session, CPU_BUFFER_POLL_MS
+					);
+					return;
+				}
+				session.bufferState = 'playing';
+				self._updateCpuAudioPresentation(session);
+				self._scheduleCpuBufferedPresentation(session, 0);
+			}).catch(function () {
+				if (!self._isCurrentCpuSession(session) ||
+				    session.audio !== audio || !audio.active ||
+				    session.bufferResumeGeneration !== resumeGeneration)
+					return;
+				audio.resumeFailed = true;
+				audio.bufferPaused = false;
+				session.bufferState = 'rebuffering';
+				self._syncCpuMuteControl();
+				self._scheduleCpuBufferedPresentation(
+					session, CPU_BUFFER_POLL_MS
+				);
+			}).finally(function () {
+				if (audio.resumePromise === resumePromise)
+					audio.resumePromise = null;
+			});
+			return;
+		}
+		if (browserAudio && browserAudio.active && browserAudio.element) {
+			browserAudio.syncPaused = false;
+			browserAudio.waitingForVideo = false;
+			try {
+				browserAudio.element.playbackRate = 1;
+				browserAudio.element.currentTime = session.playedSeconds;
+			}
+			catch (err) {}
+			browserAudio.playPromise = self._playCpuBrowserAudio(
+				session, browserAudio, false
+			);
+		}
+		else {
+			session.playClockWallAt = cpuMonotonicNow();
+		}
+		session.bufferState = 'playing';
+		self._updateCpuAudioPresentation(session);
+		self._scheduleCpuBufferedPresentation(session, 0);
+	},
+
+	_startCpuBufferedPlayback: function (session) {
+		const self = this;
+		const audio = session && session.audio;
+		const browserAudio = session && session.browserAudio;
+
+		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    session.bufferState !== 'buffering' || document.hidden)
+			return;
+		if (audio && audio.active && audio.context && audio.context.state &&
+		    audio.context.state !== 'running') {
+			audio.resumeFailed = true;
+			self._syncCpuMuteControl();
+			return;
+		}
+		if (!audio && browserAudio && browserAudio.resolving)
+			return;
+		session.playedSeconds = 0;
+		session.playClockMediaBase = 0;
+		session.videoPlaybackRate = 1;
+		session.bufferState = 'playing';
+		if (audio && audio.active) {
+			audio.playSequence = 0;
+			audio.nextPlayTime = Number(audio.context.currentTime) +
+				CPU_AUDIO_INITIAL_LEAD_SECONDS;
+			session.playClockContextAt = audio.nextPlayTime;
+			if (!self._fillCpuBufferedAudioQueue(session))
+				return;
+		}
+		else if (browserAudio && browserAudio.active && browserAudio.element) {
+			browserAudio.waitingForVideo = false;
+			browserAudio.syncPaused = false;
+			try {
+				browserAudio.element.currentTime = 0;
+				browserAudio.element.playbackRate = 1;
+			}
+			catch (err) {}
+			browserAudio.playPromise = self._playCpuBrowserAudio(
+				session, browserAudio, false
+			);
+		}
+		else {
+			session.playClockWallAt = cpuMonotonicNow();
+		}
+		self._setPlayerSurface('cpu-buffered');
+		self._setNowPlaying(
+			_('Playing buffered router CPU render: %s').format(session.label)
+		);
+		self._decodeCpuBufferedFrame(session, 0);
+		self._updateCpuAudioPresentation(session);
+		self._updateCpuBufferedCounters(session, true);
+		self._scheduleCpuBufferedPresentation(session, 0);
+	},
+
+	_maybeStartCpuBufferedPlayback: function (session) {
+		const available = this._cpuBufferedAvailableUntil(session);
+		const audio = session && session.audio;
+		const browserAudio = session && session.browserAudio;
+		const tolerance = Math.max(
+			1 / Math.max(1, Number(session && session.fps) || 1),
+			CPU_AUDIO_CHUNK_MS / 1000
+		);
+		const cleanEof = !!(session && session.producerEnded &&
+			session.videoProducerDrained === true &&
+			(!audio || audio.producerEnded));
+		const terminalPresentationPending = !!(cleanEof && session && (
+			session.videoDecodeInFlight ||
+			Number(session.videoFrameIndex) <
+				Number(session.videoFrames && session.videoFrames.length) ||
+			Number(session.displayedSequence) <
+				Number(session.lastBufferedFrameSequence)
+		));
+		let target, gateTolerance;
+
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback)
+			return;
+		if (session.pendingAudio && !session.audio)
+			return;
+		if (!audio && browserAudio && browserAudio.resolving)
+			return;
+		if (audio && audio.active && audio.resumeFailed)
+			return;
+		if (session.bufferState === 'buffering') {
+			/* Never let advisory probe duration shorten the initial gate. A short
+			 * file is recognized only after video and audio reach clean EOF. */
+			target = cleanEof ? available : CPU_BUFFER_INITIAL_SECONDS;
+			gateTolerance = cleanEof ? tolerance : 0;
+			if (available > 0 && available + gateTolerance >= target)
+				this._startCpuBufferedPlayback(session);
+			return;
+		}
+		if (session.bufferState === 'rebuffering' ||
+		    session.bufferState === 'hidden') {
+			if (!document.hidden && this._cpuBufferedPlaybackFinished(session)) {
+				this._finishCpuPlayback(
+					session,
+					_('Router CPU playback ended: %s').format(session.label),
+					false,
+					true
+				);
+				return;
+			}
+			if (!document.hidden &&
+			    (this._cpuBufferedAhead(session) >=
+				CPU_BUFFER_REBUFFER_SECONDS ||
+			     (cleanEof &&
+			      (terminalPresentationPending ||
+			       available > session.playedSeconds + 0.001))))
+				this._resumeCpuBufferedPlayback(session);
+		}
+	},
+
+	_cpuBufferedPlaybackFinished: function (session) {
+		const tolerance = Math.min(
+			0.001,
+			0.1 / Math.max(1, Number(session && session.fps) || 1)
+		);
+		const renderedEnd = Number(session && session.renderedSeconds);
+		const end = renderedEnd;
+		const audio = session && session.audio;
+		const lastSequence = Number(session && session.lastBufferedFrameSequence);
+		const queueExhausted = !!(session &&
+			Number(session.videoFrameIndex) >=
+				Number(session.videoFrames && session.videoFrames.length));
+
+		return !!(session && session.producerEnded &&
+			session.videoProducerDrained === true &&
+			(!audio || audio.producerEnded) &&
+			Number.isFinite(end) && end > 0 &&
+			Number(session.playedSeconds) + tolerance >= end &&
+			Number.isSafeInteger(lastSequence) && lastSequence >= 0 &&
+			Number(session.displayedSequence) >= lastSequence &&
+			!session.videoDecodeInFlight && queueExhausted);
+	},
+
+	_pollCpuBufferedPresentation: function (session) {
+		const audio = session && session.audio;
+		let targetSequence, audioLead, missingAudio;
+
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback)
+			return;
+		if (session.bufferState === 'playing') {
+			session.playedSeconds = this._cpuBufferedPlaybackTime(session);
+			if (session.durationSealed &&
+			    Number.isFinite(session.durationSeconds))
+				session.playedSeconds = Math.min(
+					session.playedSeconds, session.durationSeconds
+				);
+			if (audio && audio.active) {
+				if (!this._fillCpuBufferedAudioQueue(session))
+					return;
+				audioLead = Number(audio.nextPlayTime) -
+					Number(audio.context.currentTime);
+				missingAudio = !(
+					audio.bufferedChunks[audio.playSequence] instanceof
+					ArrayBuffer
+				);
+				if (!audio.producerEnded && missingAudio &&
+				    audioLead < CPU_BUFFER_UNDERRUN_GUARD_SECONDS) {
+					this._enterCpuBufferedRebuffer(session, false);
+					return;
+				}
+			}
+			if (session.videoProducerDrained !== true &&
+			    Number(session.renderedSeconds) - session.playedSeconds <
+				Math.max(
+					CPU_BUFFER_UNDERRUN_GUARD_SECONDS,
+					2 / Math.max(1, session.fps)
+				)) {
+				this._enterCpuBufferedRebuffer(session, false);
+				return;
+			}
+			targetSequence = Math.max(
+				0,
+				Math.floor(session.playedSeconds * session.fps)
+			);
+			if (!session.videoDecodeInFlight &&
+			    targetSequence > Number(session.displayedSequence))
+				this._decodeCpuBufferedFrame(session, targetSequence);
+			this._updateCpuBufferedCounters(session, false);
+			if (session.producerEnded &&
+			    session.videoProducerDrained === true &&
+			    (!audio || audio.producerEnded) &&
+			    !session.videoDecodeInFlight &&
+			    Number(session.videoFrameIndex) >=
+				Number(session.videoFrames && session.videoFrames.length) &&
+			    Number(session.lastDecodeFailureSequence) >=
+				Number(session.lastBufferedFrameSequence) &&
+			    Number(session.displayedSequence) <
+				Number(session.lastBufferedFrameSequence)) {
+				this._failCpuBufferedPlayback(
+					session,
+					_('The browser could not decode the final router-rendered frame.')
+				);
+				return;
+			}
+			if (this._cpuBufferedPlaybackFinished(session)) {
+				this._finishCpuPlayback(
+					session,
+					_('Router CPU playback ended: %s').format(session.label),
+					false,
+					true
+				);
+				return;
+			}
+		}
+		else {
+			this._maybeStartCpuBufferedPlayback(session);
+			this._updateCpuBufferedCounters(session, false);
+		}
+		this._scheduleCpuBufferedPresentation(
+			session,
+			session.bufferState === 'playing' ? 0 : CPU_BUFFER_POLL_MS
+		);
+	},
+
+	_scheduleCpuBufferedPresentation: function (session, delay) {
+		const self = this;
+		const callback = function () {
+			session.presentationTimer = null;
+			session.presentationTimerType = null;
+			self._pollCpuBufferedPresentation(session);
+		};
+
+		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    session.presentationTimer != null)
+			return;
+		if ((!delay || delay <= 0) && session.bufferState === 'playing' &&
+		    typeof window.requestAnimationFrame === 'function') {
+			session.presentationTimerType = 'animation';
+			session.presentationTimer = window.requestAnimationFrame(callback);
+		}
+		else {
+			session.presentationTimerType = 'timeout';
+			session.presentationTimer = window.setTimeout(
+				callback,
+				Math.max(0, Number(delay) || 0)
+			);
+		}
+	},
+
+	_disposeCpuBufferedPlayback: function (session) {
+		const decoding = session && session.videoDecodeInFlight;
+
+		if (!session || !session.bufferedPlayback)
+			return;
+		if (session.presentationTimer != null) {
+			if (session.presentationTimerType === 'animation' &&
+			    typeof window.cancelAnimationFrame === 'function')
+				window.cancelAnimationFrame(session.presentationTimer);
+			else
+				window.clearTimeout(session.presentationTimer);
+		}
+		session.presentationTimer = null;
+		session.presentationTimerType = null;
+		session.videoDecodeGeneration =
+			(Number(session.videoDecodeGeneration) || 0) + 1;
+		if (decoding) {
+			decoding.node.onload = null;
+			decoding.node.onerror = null;
+			try { decoding.node.removeAttribute('src'); }
+			catch (err) {}
+			try { window.URL.revokeObjectURL(decoding.url); }
+			catch (err) {}
+		}
+		session.videoDecodeInFlight = null;
+		session.videoFrames = [];
+		session.videoFrameIndex = 0;
+		session.videoBufferBytes = 0;
+		session.videoDecodeBytes = 0;
+		if (session.audio) {
+			session.audio.bufferedChunks = Object.create(null);
+			session.audio.bufferedBytes = 0;
+		}
+	},
+
+	_failCpuBufferedPlayback: function (session, message) {
+		const self = this;
+
+		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    session.bufferFallbackPending)
+			return;
+		session.bufferFallbackPending = true;
+		const relPath = session.relPath;
+		const label = session.label;
+		const generation = session.generation;
+		const stopped = self._detachCpuSession(true);
+		self._stopRendererBestEffort(stopped);
+		self._setPlayerSurface('none');
+		if (!relPath) {
+			self._setNowPlaying(message);
+			notify(null, E('p', {}, message), 8000, 'error');
+			return;
+		}
+		notify(null, E('p', {},
+			_('%s Using browser decoding instead; fallback starts muted.')
+				.format(message)), 9000, 'warning');
+		callResolve(relPath).then(function (res) {
+			if (generation !== self._playGeneration || !res || res.error ||
+			    !res.stream_url)
+				throw new Error(String(res && res.error ||
+					_('The streamer did not return a playback URL.')));
+			return self._playInVideo(
+				res.stream_url, label, generation, 'local', true
+			);
+		}).catch(function (err) {
+			if (generation !== self._playGeneration)
+				return;
+			self._currentKind = null;
+			self._currentRenderMode = null;
+			self._currentSrc = null;
+			self._setPlayerSurface('none');
+			self._setNowPlaying(
+				_('Unable to play %s: %s').format(label, errorText(err))
+			);
+			notify(null, E('p', {},
+				_('Browser fallback failed: %s').format(errorText(err))),
+			8000, 'error');
+		});
+	},
+
+	_finalizeCpuBufferedVideoDrain: function (session) {
+		const pending = session && session.streamPending;
+		const visible = session && session.streamVisibleAttempt;
+		const pendingActive = pending && !pending.cancelled && !pending.ended;
+		const visibleActive = visible && !visible.cancelled && !visible.ended;
+
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    !session.producerEnded || session.videoProducerDrained)
+			return false;
+		/* An ordinary clean HTTP EOF only marks a bounded 45-second handoff. The
+		 * backend confirms terminal EOF separately, after retaining its FIFO until
+		 * one drain request has consumed every queued byte. */
+		if (pendingActive || visibleActive)
+			return true;
+		if (!session.videoTerminalDrainConfirmed)
+			return false;
+		session.videoProducerDrained = true;
+		this._sealCpuBufferedDuration(session);
+		this._maybeStartCpuBufferedPlayback(session);
+		this._scheduleCpuBufferedPresentation(session, 0);
+		return true;
+	},
+
 	_completeCpuFetchStream: function (session, attempt) {
 		if (!this._isCurrentCpuSession(session) || attempt.cancelled ||
 		    attempt.completed)
 			return;
+		if (session.bufferedPlayback && attempt.responseStatus === 200 &&
+		    attempt.bodyEndedClean !== true) {
+			attempt.failureReason = _(
+				'The buffered router video response ended before a complete handoff.'
+			);
+			this._handleCpuStreamFailure(session, attempt);
+			return;
+		}
 		attempt.completed = true;
-		if (!attempt.ready) {
+		/* Every bounded response can become the server-side terminal drainer
+		 * before the slower status RPC observes `ended`. Keep the latest 200
+		 * body's delivery result as the candidate for a following terminal 204.
+		 * Persist this before checking `ready`: a final successor can contain only
+		 * FFmpeg's closing multipart boundary, so it has no JPEG to mark ready even
+		 * though its exact nonce-bound body reached a clean EOF. */
+		if (session.videoTerminalDrainCandidateId === attempt.streamId)
+			session.videoTerminalDrainBodyClean = attempt.bodyEndedClean === true;
+		if (!attempt.ready && !(session.bufferedPlayback &&
+		    attempt.responseStatus === 200 &&
+		    attempt.bodyEndedClean === true)) {
 			this._handleCpuStreamFailure(session, attempt);
 			return;
 		}
@@ -3020,18 +4527,48 @@ return view.extend({
 			session.streamProbeAttempt = null;
 		}
 		attempt.ended = true;
+		if (session.streamVisibleAttempt === attempt)
+			session.streamVisibleAttempt = null;
+		if (session.streamPending === attempt)
+			session.streamPending = null;
 		if (session.streamRefreshTimer != null)
 			window.clearTimeout(session.streamRefreshTimer);
 		session.streamRefreshTimer = null;
 		session.streamNextHandoffAt = Date.now() + CPU_STREAM_HANDOFF_GRACE_MS;
+		this._disposeCpuFetchAttempt(attempt, session);
 		this._scheduleCpuStreamStatus(session, 0);
-		this._scheduleCpuStreamReconnect(session, CPU_STREAM_HANDOFF_GRACE_MS);
+		/* Even a drain request which reached a clean body EOF is followed by a
+		 * cheap confirmation request. Only its authenticated 204 marker proves
+		 * that the relay reached FIFO EOF rather than its ordinary segment limit. */
+		this._scheduleCpuStreamReconnect(
+			session,
+			session.bufferedPlayback && session.producerEnded
+				? 0
+				: CPU_STREAM_HANDOFF_GRACE_MS
+		);
 	},
 
 	_startCpuFetchStream: function (session, attempt, requestUrl) {
 		const self = this;
 		const expectedBoundary = 'videoplayer-' + session.token;
 
+		attempt.streamId = String(attempt.streamId || '');
+		if (!/^[0-9]{1,16}(?:-[0-9]{1,16})?$/.test(attempt.streamId)) {
+			attempt.failureReason = _('The router video request nonce is invalid.');
+			self._handleCpuStreamFailure(session, attempt);
+			return;
+		}
+		if (attempt.terminalDrain && !attempt.terminalCheck) {
+			/* Invalidate any preceding bounded-body candidate before the request
+			 * can consume terminal FIFO bytes. This also covers a timeout before
+			 * Fetch exposes response headers. */
+			attempt.priorTerminalBodyClean =
+				session.videoTerminalDrainCandidateId === attempt.streamId &&
+				session.videoTerminalDrainBodyClean === true;
+			session.videoTerminalDrainRetryConsume = false;
+			session.videoTerminalDrainCandidateId = attempt.streamId;
+			session.videoTerminalDrainBodyClean = false;
+		}
 		attempt.controller = new window.AbortController();
 		attempt.fetchPromise = window.fetch(requestUrl, {
 			method: 'GET',
@@ -3047,10 +4584,89 @@ return view.extend({
 				/^multipart\/x-mixed-replace\s*;[^\r\n]*\bboundary=(?:"([^"]+)"|([^;\s]+))/i
 			);
 
+			attempt.responseStatus = Number(response && response.status) || 0;
+			if (attempt.responseStatus === 200)
+				attempt.responseStartedAt = Date.now();
+			if (response && response.status === 202 && attempt.terminalCheck &&
+			    session.producerEnded) {
+				attempt.completed = true;
+				attempt.ended = true;
+				if (session.streamPending === attempt)
+					session.streamPending = null;
+				if (session.streamVisibleAttempt === attempt)
+					session.streamVisibleAttempt = null;
+				/* Keep the same nonce and its previous clean-body evidence. The
+				 * worker may already be pinned to ready(A) while the first relay
+				 * ended at a segment cap. Reissuing drain=1 with A is idempotent;
+				 * inventing B would strand that worker until its safety timeout. */
+				if (session.videoTerminalDrainCandidateId === attempt.streamId)
+					session.videoTerminalDrainRetryConsume = true;
+				self._disposeCpuFetchAttempt(attempt, session);
+				self._scheduleCpuStreamReconnect(session, 0);
+				return;
+			}
+			if (response && response.status === 204 && attempt.terminalDrain) {
+				const drainState = String(response.headers && response.headers.get(
+					'X-Videoplayer-Video-Drain'
+				) || '').toLowerCase();
+				const drainId = String(response.headers && response.headers.get(
+					'X-Videoplayer-Video-Drain-ID'
+				) || '');
+
+				if (!session.producerEnded || drainState !== 'complete' ||
+				    !attempt.streamId || drainId !== attempt.streamId ||
+				    drainId !== session.videoTerminalDrainCandidateId) {
+					attempt.failureReason = _(
+						'The router returned an invalid terminal video drain acknowledgement.'
+					);
+					self._failCpuBufferedPlayback(session, attempt.failureReason);
+					return;
+				}
+				/* The server marker proves that its relay consumed FIFO EOF, but
+				 * not that uhttpd delivered the relay's buffered tail to this
+				 * browser. Seal only after this client observed a clean terminal
+				 * 200 body first; an errored/truncated body is unreplayable once
+				 * the server-side marker exists. */
+				const hasCleanTerminalBody =
+					session.videoTerminalDrainBodyClean === true ||
+					(!attempt.terminalCheck &&
+					 attempt.priorTerminalBodyClean === true);
+
+				if (!hasCleanTerminalBody) {
+					attempt.failureReason = _(
+						'The terminal router video response was interrupted before every frame reached the browser.'
+					);
+					self._failCpuBufferedPlayback(
+						session, attempt.failureReason
+					);
+					return;
+				}
+				session.videoTerminalDrainBodyClean = true;
+				attempt.ready = true;
+				attempt.ended = true;
+				attempt.completed = true;
+				attempt.transportEnded = true;
+				attempt.reader = null;
+				if (session.streamPending === attempt)
+					session.streamPending = null;
+				if (session.streamVisibleAttempt === attempt)
+					session.streamVisibleAttempt = null;
+				session.videoTerminalDrainConfirmed = true;
+				self._disposeCpuFetchAttempt(attempt, session);
+				self._finalizeCpuBufferedVideoDrain(session);
+				return;
+			}
 			if (!response || response.status !== 200 || !response.ok)
 				throw new Error(_('The router video stream returned HTTP %d.').format(
 					Number(response && response.status) || 0
 				));
+			if (attempt.terminalCheck) {
+				attempt.failureReason = _(
+					'The router returned a video body for a read-only drain confirmation.'
+				);
+				self._failCpuBufferedPlayback(session, attempt.failureReason);
+				return;
+			}
 			if (!boundaryMatch ||
 			    String(boundaryMatch[1] || boundaryMatch[2] || '') !== expectedBoundary)
 				throw new Error(_('The router returned an invalid MJPEG content type.'));
@@ -3058,6 +4674,8 @@ return view.extend({
 				attempt.fetchUnsupported = true;
 				throw new Error(_('This browser cannot read a continuous MJPEG stream.'));
 			}
+			session.videoTerminalDrainCandidateId = String(attempt.streamId || '');
+			session.videoTerminalDrainBodyClean = false;
 
 			attempt.boundaryMarker = asciiBytes('--' + expectedBoundary + '\r\n');
 			attempt.boundaryCloseMarker = asciiBytes(
@@ -3077,7 +4695,8 @@ return view.extend({
 						return;
 					if (part.done) {
 						attempt.reader = null;
-						self._accountCpuMjpegTruncation(session, attempt);
+						attempt.bodyEndedClean =
+							self._accountCpuMjpegTruncation(session, attempt);
 						attempt.transportEnded = true;
 						if (!attempt.decodeInFlight && !attempt.queuedFrame)
 							self._completeCpuFetchStream(session, attempt);
@@ -3087,15 +4706,19 @@ return view.extend({
 						throw new Error(_('The browser returned invalid MJPEG stream data.'));
 					attempt.lastProgressAt = Date.now();
 					self._consumeCpuMjpegChunk(session, attempt, part.value);
-					return pump();
+					return self._waitForCpuBufferedCapacity(
+						session, attempt
+					).then(pump);
 				});
 			};
 			return pump();
 		}).catch(function (err) {
-			if (!self._isCurrentCpuSession(session) || attempt.cancelled ||
-			    (err && err.name === 'AbortError'))
+			if (!self._isCurrentCpuSession(session) || attempt.cancelled)
 				return;
 			self._accountCpuMjpegTruncation(session, attempt);
+			attempt.bodyEndedClean = false;
+			if (session.videoTerminalDrainCandidateId === attempt.streamId)
+				session.videoTerminalDrainBodyClean = false;
 			attempt.failureReason = errorText(err);
 			self._handleCpuStreamFailure(session, attempt);
 		});
@@ -3134,14 +4757,16 @@ return view.extend({
 		session.streamReconnectTimer = null;
 		if (session.streamPending) {
 			if (session.streamPending.mode === 'fetch')
-				this._disposeCpuFetchAttempt(session.streamPending);
+				this._disposeCpuFetchAttempt(session.streamPending, session);
 			else
 				this._disposeCpuStreamNode(session.streamPending.node, true);
 			session.streamPending = null;
 		}
 		if (session.streamVisibleAttempt) {
 			if (session.streamVisibleAttempt.mode === 'fetch') {
-				this._disposeCpuFetchAttempt(session.streamVisibleAttempt);
+				this._disposeCpuFetchAttempt(
+					session.streamVisibleAttempt, session
+				);
 			}
 			else if (session.streamVisibleAttempt.node) {
 				session.streamVisibleAttempt.node.onload = null;
@@ -3167,6 +4792,7 @@ return view.extend({
 		if (!session)
 			return;
 		session.active = false;
+		this._disposeCpuBufferedPlayback(session);
 		this._stopCpuStreamTransport(session, clearFrame);
 		if (session.finishTimer != null)
 			window.clearTimeout(session.finishTimer);
@@ -3186,6 +4812,10 @@ return view.extend({
 		if (session.browserAudio) {
 			this._disposeCpuBrowserAudio(session.browserAudio);
 			session.browserAudio = null;
+		}
+		if (session.audioDrainer) {
+			this._disposeCpuAudioDrainer(session.audioDrainer);
+			session.audioDrainer = null;
 		}
 	},
 
@@ -3380,6 +5010,8 @@ return view.extend({
 		session.streamProbeAttempt = attempt;
 		session.streamProbeTimer = window.setTimeout(function () {
 			const frame = attempt.node;
+			const now = Date.now();
+			let timeout, timeoutStartedAt;
 
 			session.streamProbeTimer = null;
 			if (session.streamProbeAttempt === attempt)
@@ -3395,12 +5027,53 @@ return view.extend({
 				self._markCpuStreamStarted(session, attempt);
 				return;
 			}
-			if (Date.now() - (isFetch && attempt.ready
+			if (session.bufferedPlayback && session.producerEnded &&
+			    Number.isFinite(session.videoTerminalDrainStartedAt) &&
+			    now - session.videoTerminalDrainStartedAt >=
+				CPU_TERMINAL_DRAIN_TIMEOUT_MS) {
+				self._handleCpuStreamFailure(session, attempt);
+				return;
+			}
+			if (isFetch && attempt.backpressured) {
+				self._scheduleCpuStreamProbe(session, attempt);
+				return;
+			}
+			if (session.bufferedPlayback && isFetch &&
+			    attempt.responseStatus === 200 && !attempt.terminalDrain) {
+				/* A full PCM ring may legitimately stop FFmpeg between JPEGs.
+				 * Once a buffered 200 has started, aborting at the ordinary 5/15
+				 * second probe would consume an unknown number of relay frames.
+				 * The server closes every nonterminal response at a frame-aligned
+				 * 45-second bound; keep a fixed 60-second transport guard rather
+				 * than resetting an idle timer on individual frames. */
+				if (session.producerEnded && Number.isFinite(
+					Number(session.videoTerminalDrainStartedAt)
+				)) {
+					timeout = CPU_TERMINAL_DRAIN_TIMEOUT_MS;
+					timeoutStartedAt = Number(
+						session.videoTerminalDrainStartedAt
+					);
+				}
+				else {
+					timeout = CPU_BUFFERED_RESPONSE_TIMEOUT_MS;
+					timeoutStartedAt = Number(
+						attempt.responseStartedAt
+					) || attempt.openedAt;
+				}
+			}
+			else {
+				timeout = attempt.terminalDrain
+					? (isFetch && !attempt.ready
+						? CPU_TERMINAL_FIRST_FRAME_TIMEOUT_MS
+						: CPU_STREAM_IDLE_TIMEOUT_MS)
+					: (isFetch && attempt.ready
+						? CPU_STREAM_IDLE_TIMEOUT_MS
+						: CPU_STREAM_ATTEMPT_TIMEOUT_MS);
+				timeoutStartedAt = isFetch && attempt.ready
 					? Number(attempt.lastProgressAt) || attempt.openedAt
-					: attempt.openedAt) >=
-			    (isFetch && attempt.ready
-					? CPU_STREAM_IDLE_TIMEOUT_MS
-					: CPU_STREAM_ATTEMPT_TIMEOUT_MS)) {
+					: attempt.openedAt;
+			}
+			if (now - timeoutStartedAt >= timeout) {
 				self._handleCpuStreamFailure(session, attempt);
 				return;
 			}
@@ -3410,22 +5083,49 @@ return view.extend({
 
 	_scheduleCpuStreamReconnect: function (session, delay) {
 		const self = this;
+		let reconnectDelay = Math.max(0, Number(delay) || 0);
 
 		if (!self._isCurrentCpuSession(session) || session.finishing ||
+		    (session.bufferedPlayback && session.videoProducerDrained) ||
 		    session.streamPending)
 			return;
+		if (self._cpuInitialBufferCannotProgress(session)) {
+			self._failCpuBufferedPlayback(
+				session,
+				_('The router could not reach the two-minute start gate within the 512 MiB browser memory safety limit.')
+			);
+			return;
+		}
+		if (session.bufferedPlayback &&
+		    !self._cpuBufferedTransportHasCapacity(session))
+			reconnectDelay = Math.max(reconnectDelay, CPU_BUFFER_POLL_MS);
 		if (session.streamReconnectTimer != null)
 			window.clearTimeout(session.streamReconnectTimer);
 		session.streamReconnectTimer = window.setTimeout(function () {
 			session.streamReconnectTimer = null;
+			if (session.bufferedPlayback &&
+			    !self._cpuBufferedTransportHasCapacity(session)) {
+				self._scheduleCpuStreamReconnect(
+					session, CPU_BUFFER_POLL_MS
+				);
+				return;
+			}
 			self._openCpuStream(session);
-		}, Math.max(0, Number(delay) || 0));
+		}, reconnectDelay);
 	},
 
 	_handleCpuStreamFailure: function (session, attempt) {
 		const now = Date.now();
 		const fetchStartupFailure = attempt && attempt.mode === 'fetch' &&
 			!attempt.ready;
+		const ambiguousBufferedResponse = !!(
+			session && session.bufferedPlayback && attempt &&
+			attempt.mode === 'fetch' && !attempt.terminalCheck &&
+			attempt.bodyEndedClean !== true &&
+			(!Number.isFinite(Number(attempt.responseStatus)) ||
+			 Number(attempt.responseStatus) === 0 ||
+			 Number(attempt.responseStatus) === 200)
+		);
 		let delay;
 
 		if (!this._isCurrentCpuSession(session) || session.finishing ||
@@ -3442,7 +5142,8 @@ return view.extend({
 		if (fetchStartupFailure) {
 			session.streamFetchErrors =
 				(Number(session.streamFetchErrors) || 0) + 1;
-			if (attempt.fetchUnsupported || session.streamFetchErrors >= 2) {
+			if (!session.bufferedPlayback &&
+			    (attempt.fetchUnsupported || session.streamFetchErrors >= 2)) {
 				session.fetchDisabled = true;
 				if (!session.fetchFallbackWarned) {
 					session.fetchFallbackWarned = true;
@@ -3455,14 +5156,14 @@ return view.extend({
 		if (session.streamPending === attempt) {
 			session.streamPending = null;
 			if (attempt.mode === 'fetch')
-				this._disposeCpuFetchAttempt(attempt);
+				this._disposeCpuFetchAttempt(attempt, session);
 			else
 				this._disposeCpuStreamNode(attempt.node, true);
 		}
 		if (session.streamVisibleAttempt === attempt) {
 			attempt.ended = true;
 			if (attempt.mode === 'fetch')
-				this._disposeCpuFetchAttempt(attempt);
+				this._disposeCpuFetchAttempt(attempt, session);
 			else if (attempt.node) {
 				attempt.node.onload = null;
 				attempt.node.onerror = null;
@@ -3472,12 +5173,70 @@ return view.extend({
 			session.streamRefreshTimer = null;
 			session.streamNextHandoffAt = null;
 		}
+		if (ambiguousBufferedResponse) {
+			/* Once a 200 response has started, the FIFO relay may already have
+			 * consumed several complete frames which a broken HTTP connection did
+			 * not deliver. A fetch rejection before headers is equally ambiguous:
+			 * CGI may already be draining behind uhttpd. Without a server-authored
+			 * sequence there is no lossless retry point, so never guess or skip. */
+			this._failCpuBufferedPlayback(
+				session,
+				attempt.failureReason
+					? _('The buffered router video response was interrupted: %s')
+						.format(attempt.failureReason)
+					: _('The buffered router video response ended before a complete handoff.')
+			);
+			return;
+		}
+		if (session.bufferedPlayback && session.producerEnded) {
+			/* Terminal EOF is an explicit backend acknowledgement, never an
+			 * inference from 410 or from a preceding bounded response. Retry the
+			 * drain endpoint while its worker performs the bounded final handshake. */
+			session.videoTerminalDrainErrors =
+				(Number(session.videoTerminalDrainErrors) || 0) + 1;
+			if (!Number.isFinite(session.videoTerminalDrainStartedAt))
+				session.videoTerminalDrainStartedAt = now;
+			if (now - session.videoTerminalDrainStartedAt >=
+			    CPU_TERMINAL_DRAIN_TIMEOUT_MS) {
+				this._failCpuBufferedPlayback(
+					session,
+					_('The router terminal video drain could not be confirmed before its safety deadline.')
+				);
+				return;
+			}
+			this._scheduleCpuStreamStatus(session, 0);
+			if (!this._finalizeCpuBufferedVideoDrain(session))
+				this._scheduleCpuStreamReconnect(
+					session,
+					Math.min(CPU_STREAM_MAX_RECONNECT_MS, 500)
+				);
+			return;
+		}
 		if (!Number.isFinite(session.streamOutageStartedAt))
 			session.streamOutageStartedAt = now;
 		session.streamErrors++;
+		if (session.bufferedPlayback &&
+		    (attempt.fetchUnsupported || session.streamFetchErrors >= 3)) {
+			this._failCpuBufferedPlayback(
+				session,
+				attempt.failureReason
+					? _('The browser could not read the buffered router stream: %s')
+						.format(attempt.failureReason)
+					: _('The browser could not read the buffered router stream.')
+			);
+			return;
+		}
 		if (session.streamErrors >= 3 &&
 		    now - session.streamOutageStartedAt >=
 		    CPU_STREAM_OUTAGE_TIMEOUT_MS) {
+			if (session.bufferedPlayback) {
+				this._failCpuBufferedPlayback(
+					session,
+					_('The buffered router video stream for %s remained unavailable.')
+						.format(session.label)
+				);
+				return;
+			}
 			this._finishCpuPlayback(
 				session,
 				_('The continuous router MJPEG stream for %s remained unavailable. Use browser rendering or try another browser.')
@@ -3509,14 +5268,34 @@ return view.extend({
 			document.getElementById('videoplayer-cpu-frame')
 		);
 		const parent = visible && visible.parentNode;
-		let attempt, frame, requestUrl, previousTransport, nativeBase;
+		let attempt, frame, requestUrl, previousTransport, nativeBase, streamId;
 
 		if (!self._isCurrentCpuSession(session) || session.finishing ||
+		    (session.bufferedPlayback && session.videoProducerDrained) ||
 		    session.streamPending)
 			return;
+		if (self._cpuInitialBufferCannotProgress(session)) {
+			self._failCpuBufferedPlayback(
+				session,
+				_('The router could not reach the two-minute start gate within the 512 MiB browser memory safety limit.')
+			);
+			return;
+		}
+		if (session.bufferedPlayback &&
+		    !self._cpuBufferedTransportHasCapacity(session)) {
+			self._scheduleCpuStreamReconnect(session, CPU_BUFFER_POLL_MS);
+			return;
+		}
 		if (!visible || !parent ||
 		    typeof document.createElement !== 'function' ||
 		    typeof parent.insertBefore !== 'function') {
+			if (session.bufferedPlayback) {
+				self._failCpuBufferedPlayback(
+					session,
+					_('This browser cannot create the canvas stream surface required for buffered playback.')
+				);
+				return;
+			}
 			self._finishCpuPlayback(
 				session,
 				_('This browser cannot create the router video stream surface.'),
@@ -3525,9 +5304,21 @@ return view.extend({
 			return;
 		}
 		session.visibleFrame = visible;
-		session.streamAttempt = (Number(session.streamAttempt) || 0) + 1;
-		requestUrl = session.streamUrl + '&stream=' +
-			String(session.generation) + '-' + String(session.streamAttempt);
+		const reuseTerminalNonce = !!(session.bufferedPlayback &&
+			session.producerEnded && session.videoTerminalDrainCandidateId);
+		const terminalRetryConsume = !!(reuseTerminalNonce &&
+			session.videoTerminalDrainRetryConsume);
+		const terminalCheck = !!(reuseTerminalNonce && !terminalRetryConsume);
+		if (reuseTerminalNonce)
+			streamId = String(session.videoTerminalDrainCandidateId);
+		else {
+			session.streamAttempt = (Number(session.streamAttempt) || 0) + 1;
+			streamId = String(session.generation) + '-' +
+				String(session.streamAttempt);
+		}
+		requestUrl = session.streamUrl + '&stream=' + streamId;
+		if (session.bufferedPlayback && session.producerEnded)
+			requestUrl += terminalCheck ? '&drain=check' : '&drain=1';
 		if (!session.fetchDisabled && self._canUseCpuFetchStream()) {
 			session.streamTransportMode = 'fetch';
 			attempt = {
@@ -3540,6 +5331,10 @@ return view.extend({
 				cancelled: false,
 				completed: false,
 				transportEnded: false,
+				terminalDrain: !!(session.bufferedPlayback && session.producerEnded),
+				terminalCheck: terminalCheck,
+				streamId: streamId,
+				bodyEndedClean: false,
 				decodeInFlight: null,
 				queuedFrame: null,
 				reader: null,
@@ -3548,6 +5343,13 @@ return view.extend({
 			session.streamPending = attempt;
 			self._startCpuFetchStream(session, attempt, requestUrl);
 			self._scheduleCpuStreamProbe(session, attempt);
+			return;
+		}
+		if (session.bufferedPlayback) {
+			self._failCpuBufferedPlayback(
+				session,
+				_('This browser cannot read the continuous router stream required for synchronized buffered playback.')
+			);
 			return;
 		}
 
@@ -3576,7 +5378,7 @@ return view.extend({
 			    session.streamVisibleAttempt.mode === 'fetch') {
 				const oldFetchAttempt = session.streamVisibleAttempt;
 
-				self._disposeCpuFetchAttempt(oldFetchAttempt);
+				self._disposeCpuFetchAttempt(oldFetchAttempt, session);
 				session.streamVisibleAttempt = null;
 				if (session.streamProbeAttempt === oldFetchAttempt) {
 					if (session.streamProbeTimer != null)
@@ -3685,6 +5487,17 @@ return view.extend({
 
 		if (!self._isCurrentCpuSession(session) || session.finishing)
 			return Promise.resolve();
+		if (session.bufferedPlayback && session.producerEnded &&
+		    !session.videoProducerDrained &&
+		    Number.isFinite(session.videoTerminalDrainStartedAt) &&
+		    Date.now() - session.videoTerminalDrainStartedAt >=
+			CPU_TERMINAL_DRAIN_TIMEOUT_MS) {
+			self._failCpuBufferedPlayback(
+				session,
+				_('The router terminal video drain could not be confirmed before its safety deadline.')
+			);
+			return Promise.resolve();
+		}
 		if (session.streamStatusInFlight) {
 			session.streamStatusAgain = true;
 			return Promise.resolve();
@@ -3698,8 +5511,63 @@ return view.extend({
 				return;
 			session.streamStatusErrors = 0;
 			session.streamStatusWarned = false;
+			if (session.bufferedPlayback)
+				self._updateCpuBufferedMetadata(session, res);
+			if (session.bufferedPlayback && state === 'ended') {
+				const releaseTerminalBackpressure = function (attempt) {
+					if (!attempt || attempt.mode !== 'fetch' || attempt.ended ||
+					    attempt.terminalDrain)
+						return;
+					attempt.terminalDrain = true;
+					attempt.terminalCheck = false;
+					/* A successor dispatched just before EOF can already hold a
+					 * non-body 409/410 response. It consumed no FIFO bytes and must
+					 * not replace the preceding clean nonce which the worker may
+					 * already have completed. A genuine 200 body claims its own nonce
+					 * in _startCpuFetchStream() as soon as headers are accepted. */
+					if (attempt.streamId && attempt.responseStatus === 200) {
+						session.videoTerminalDrainCandidateId = attempt.streamId;
+						session.videoTerminalDrainBodyClean = false;
+					}
+					attempt.backpressured = false;
+					if (attempt.backpressureTimer != null)
+						window.clearTimeout(attempt.backpressureTimer);
+					attempt.backpressureTimer = null;
+					if (attempt.backpressureResolve) {
+						const resolve = attempt.backpressureResolve;
+						attempt.backpressureResolve = null;
+						resolve();
+					}
+				};
+
+				session.producerEnded = true;
+				if (!Number.isFinite(session.videoTerminalDrainStartedAt))
+					session.videoTerminalDrainStartedAt = Date.now();
+				/* A response opened while the producer was running can become the
+				 * retained terminal FIFO drainer before this poll observes `ended`.
+				 * Mark that exact response so only its clean body EOF can authorize
+				 * the subsequent server-side 204 confirmation. */
+				releaseTerminalBackpressure(session.streamPending);
+				releaseTerminalBackpressure(session.streamVisibleAttempt);
+				/* Keep an already-open response alive: the backend turns it into
+				 * the terminal FIFO drainer. If the bounded response ended just
+				 * before this status arrived, open the explicit drain immediately. */
+				if (!self._finalizeCpuBufferedVideoDrain(session) &&
+				    !session.streamPending &&
+				    !(session.streamVisibleAttempt &&
+				      !session.streamVisibleAttempt.ended))
+					self._scheduleCpuStreamReconnect(session, 0);
+				return;
+			}
 			if (state === 'ended' || state === 'stopped' ||
 			    state === 'expired' || state === 'inactive') {
+				if (session.bufferedPlayback) {
+					self._failCpuBufferedPlayback(
+						session,
+						_('The router renderer stopped before its buffered output was complete.')
+					);
+					return;
+				}
 				return self._finishCpuPlayback(
 					session,
 					_('Router CPU playback ended: %s').format(session.label),
@@ -3708,6 +5576,17 @@ return view.extend({
 			}
 			if (state === 'error') {
 				const reason = String(res && res.reason || '').trim();
+				if (session.bufferedPlayback) {
+					self._failCpuBufferedPlayback(
+						session,
+						reason
+							? _('Router CPU renderer failed for %s: %s')
+								.format(session.label, reason)
+							: _('Router CPU renderer failed for %s.')
+								.format(session.label)
+					);
+					return;
+				}
 				return self._finishCpuPlayback(
 					session,
 					reason
@@ -3719,6 +5598,14 @@ return view.extend({
 				);
 			}
 			if (state !== 'running' && state !== 'starting') {
+				if (session.bufferedPlayback) {
+					self._failCpuBufferedPlayback(
+						session,
+						_('Router CPU renderer returned an invalid state for %s.')
+							.format(session.label)
+					);
+					return;
+				}
 				return self._finishCpuPlayback(
 					session,
 					_('Router CPU renderer returned an invalid state for %s.')
@@ -3743,6 +5630,10 @@ return view.extend({
 
 			session.streamStatusInFlight = false;
 			session.streamStatusAgain = false;
+			/* Keep authenticated status-touch polling alive throughout buffered
+			 * playback, even after the producer drain is complete. The ended worker
+			 * then retains only its validated source fd for protected browser-audio
+			 * Range requests and releases it on finish/Stop or lease expiry. */
 			if (self._isCurrentCpuSession(session) && !session.finishing)
 				self._scheduleCpuStreamStatus(
 					session,
@@ -3758,8 +5649,8 @@ return view.extend({
 		    Number.isFinite(session.videoMediaTime) &&
 		    !Number.isFinite(session.videoPlaybackRate)) {
 			/* A one-frame or sub-window clip has no second presentation timestamp
-			 * from which to estimate speed. The producer is -re paced, so normal
-			 * speed is the least surprising terminal clock for either audio path. */
+			 * from which to estimate speed. Normal speed is the only useful terminal
+			 * clock for either audio path. */
 			session.videoPlaybackRate = 1;
 		}
 		if (!isError && !force && session.pendingAudio &&
@@ -3820,7 +5711,8 @@ return view.extend({
 		const audio = session && session.audio;
 
 		if (!self._isCurrentCpuSession(session) || !audio || !audio.active ||
-		    audio.ended || audio.videoHeld)
+		    audio.ended || audio.producerEnded ||
+		    (!session.bufferedPlayback && audio.videoHeld))
 			return;
 		if (audio.timer != null)
 			window.clearTimeout(audio.timer);
@@ -3898,15 +5790,7 @@ return view.extend({
 				Math.max(0, Number(audio.startOffsetSeconds) || 0)
 			)
 			: 0;
-		const playbackRate = session.streamTransportMode === 'fetch'
-			? Math.min(
-				1,
-				Math.max(
-					CPU_PCM_MIN_PLAYBACK_RATE,
-					Number(session.videoPlaybackRate) || 1
-				)
-			)
-			: 1;
+		const playbackRate = 1;
 		source.buffer = buffer;
 		if (source.playbackRate) {
 			try {
@@ -3944,6 +5828,204 @@ return view.extend({
 		audio.errors = 0;
 	},
 
+	_pollCpuBufferedAudio: function (session) {
+		const self = this;
+		const audio = session && session.audio;
+		const pollGeneration = audio
+			? Number(audio.pollGeneration) || 0
+			: 0;
+		const sequence = audio && Number(audio.fetchSequence);
+		const count = audio
+			? Math.max(1, Math.min(8, Number(audio.batchMaxChunks) || 1))
+			: 1;
+
+		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    !audio || !audio.active || audio.producerEnded || audio.inFlight)
+			return Promise.resolve();
+		if (audio.context && audio.context.state === 'closed') {
+			self._disableCpuAudio(
+				session,
+				_('The browser closed the router-decoded PCM output.')
+			);
+			return Promise.resolve();
+		}
+		if (!Number.isSafeInteger(sequence) || sequence < 0) {
+			self._failCpuBufferedPlayback(
+				session, _('The router PCM buffer entered an invalid state.')
+			);
+			return Promise.resolve();
+		}
+		if (Math.max(
+				0,
+				Number(audio.bufferedUntil) - Number(session.playedSeconds)
+			) >= CPU_BUFFER_HIGH_WATER_SECONDS ||
+		    (session.bufferState !== 'buffering' &&
+		     self._cpuBufferedBytes(session) >=
+			CPU_BUFFER_HARD_LIMIT_BYTES * 0.9)) {
+			self._scheduleCpuAudioPoll(session, CPU_BUFFER_POLL_MS);
+			return Promise.resolve();
+		}
+		audio.inFlight = true;
+		audio.inFlightGeneration = pollGeneration;
+
+		return request.get(audio.url, {
+			responseType: 'blob',
+			timeout: CPU_AUDIO_REQUEST_TIMEOUT_MS,
+			cache: true,
+			query: { chunk: String(sequence), count: String(count) }
+		}).then(function (res) {
+			if (!self._isCurrentCpuSession(session) ||
+			    session.audio !== audio || !audio.active ||
+			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
+				return { done: true };
+			if (res.status === 202)
+				return { retry: true, delay: 50 };
+			if (res.status === 204) {
+				audio.producerEnded = true;
+				audio.ended = true;
+				self._maybeStartCpuBufferedPlayback(session);
+				self._scheduleCpuBufferedPresentation(session, 0);
+				return { done: true };
+			}
+			if (res.status === 409 && String(
+				res.headers && res.headers.get('X-Videoplayer-Audio-State') || ''
+			).toLowerCase() === 'unavailable') {
+				return self._disableCpuAudio(
+					session,
+					_('Router-decoded PCM audio became unavailable; using protected browser audio while router-rendered video continues.'),
+					true
+				).then(function () { return { done: true }; });
+			}
+			if (res.status === 409 || res.status === 404 || res.status === 410) {
+				self._failCpuBufferedPlayback(
+					session,
+					_('The router PCM buffer no longer contains the next synchronized audio chunk.')
+				);
+				return { done: true };
+			}
+			if (!res.ok || res.status !== 200)
+				throw new Error(
+					_('Audio request failed with HTTP %d').format(res.status)
+				);
+
+			const type = String(res.headers.get('Content-Type') || '')
+				.split(';', 1)[0].trim().toLowerCase();
+			const format = String(
+				res.headers.get('X-Videoplayer-Audio-Format') || ''
+			).toLowerCase();
+			const sequenceText = String(
+				res.headers.get('X-Videoplayer-Audio-Sequence') || ''
+			);
+			const responseCountText = String(
+				res.headers.get('X-Videoplayer-Audio-Chunk-Count') || '1'
+			);
+			const framesPerChunkText = String(
+				res.headers.get('X-Videoplayer-Audio-Frames-Per-Chunk') ||
+				res.headers.get('X-Videoplayer-Audio-Frames') || ''
+			);
+			const totalFramesText = String(
+				res.headers.get('X-Videoplayer-Audio-Total-Frames') || ''
+			);
+			const sampleRate = Number(
+				res.headers.get('X-Videoplayer-Audio-Sample-Rate')
+			);
+			const channels = Number(
+				res.headers.get('X-Videoplayer-Audio-Channels')
+			);
+			const contentLength = Number(
+				res.headers.get('Content-Length')
+			);
+			const responseCount = Number(responseCountText);
+			const responseSequence = Number(sequenceText);
+			const framesPerChunk = Number(framesPerChunkText);
+			const totalFrames = Number(totalFramesText);
+
+			if (type !== 'application/octet-stream' || format !== 's16le' ||
+			    !/^(0|[1-9][0-9]{0,7})$/.test(sequenceText) ||
+			    responseSequence !== sequence ||
+			    !/^[1-8]$/.test(responseCountText) ||
+			    responseCount > count ||
+			    sampleRate !== CPU_AUDIO_SAMPLE_RATE ||
+			    channels !== CPU_AUDIO_CHANNELS ||
+			    framesPerChunk !== CPU_AUDIO_FRAMES_PER_CHUNK ||
+			    totalFrames !== responseCount * CPU_AUDIO_FRAMES_PER_CHUNK ||
+			    contentLength !== responseCount * CPU_AUDIO_CHUNK_BYTES)
+				throw new Error(_('The router returned invalid buffered audio metadata.'));
+
+			const blob = res.blob();
+			if (!blob || blob.size !== contentLength)
+				throw new Error(_('The router returned an invalid buffered audio batch.'));
+			return blobToArrayBuffer(blob).then(function (arrayBuffer) {
+				if (!self._isCurrentCpuSession(session) ||
+				    session.audio !== audio || !audio.active ||
+				    (Number(audio.pollGeneration) || 0) !== pollGeneration)
+					return { done: true };
+				if (!(arrayBuffer instanceof ArrayBuffer) ||
+				    arrayBuffer.byteLength !== contentLength)
+					throw new Error(_('The router returned an invalid buffered audio batch.'));
+				if (self._cpuBufferedBytes(session) + arrayBuffer.byteLength >
+				    CPU_BUFFER_HARD_LIMIT_BYTES) {
+					self._failCpuBufferedPlayback(
+						session,
+						_('The two-minute router render buffer exceeded the 512 MiB browser memory safety limit.')
+					);
+					return { done: true };
+				}
+				for (let i = 0; i < responseCount; i++) {
+					const chunkSequence = sequence + i;
+					const chunk = arrayBuffer.slice(
+						i * CPU_AUDIO_CHUNK_BYTES,
+						(i + 1) * CPU_AUDIO_CHUNK_BYTES
+					);
+					audio.bufferedChunks[chunkSequence] = chunk;
+					audio.bufferedBytes += chunk.byteLength;
+				}
+				audio.fetchSequence += responseCount;
+				audio.sequence = audio.fetchSequence;
+				audio.bufferedUntil = audio.fetchSequence *
+					CPU_AUDIO_CHUNK_MS / 1000;
+				audio.hasDecoded = true;
+				audio.errors = 0;
+				if (session.bufferState === 'playing')
+					self._fillCpuBufferedAudioQueue(session);
+				self._maybeStartCpuBufferedPlayback(session);
+				self._updateCpuBufferedCounters(session, false);
+				return { retry: true, delay: 0 };
+			});
+		}).then(function (result) {
+			if (!result || result.done ||
+			    !self._isCurrentCpuSession(session) ||
+			    session.audio !== audio || !audio.active ||
+			    audio.producerEnded ||
+			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
+				return;
+			self._scheduleCpuAudioPoll(session, result.delay || 0);
+		}).catch(function (err) {
+			if (!self._isCurrentCpuSession(session) ||
+			    session.audio !== audio || !audio.active ||
+			    (Number(audio.pollGeneration) || 0) !== pollGeneration)
+				return;
+			audio.errors = (Number(audio.errors) || 0) + 1;
+			if (audio.errors < 3) {
+				self._scheduleCpuAudioPoll(
+					session,
+					Math.min(1000, 100 * Math.pow(2, audio.errors))
+				);
+				return;
+			}
+			self._failCpuBufferedPlayback(
+				session,
+				_('Router-decoded buffered PCM audio failed: %s')
+					.format(errorText(err))
+			);
+		}).finally(function () {
+			if (audio.inFlightGeneration === pollGeneration) {
+				audio.inFlight = false;
+				audio.inFlightGeneration = null;
+			}
+		});
+	},
+
 	_pollCpuAudio: function (session) {
 		const self = this;
 		const audio = session && session.audio;
@@ -3954,6 +6036,8 @@ return view.extend({
 			? 'live'
 			: String(audio && audio.sequence);
 
+		if (session && session.bufferedPlayback)
+			return self._pollCpuBufferedAudio(session);
 		if (!self._isCurrentCpuSession(session) || !audio || !audio.active ||
 		    audio.ended ||
 		    audio.inFlight || audio.videoHeld)
@@ -4109,7 +6193,7 @@ return view.extend({
 		});
 	},
 
-	_playCpuStream: function (res, label, generation, pendingAudio) {
+	_playCpuStream: function (res, label, generation, pendingAudio, relPath) {
 		const self = this;
 		const token = String(res.session_token || '');
 		const streamUrl = String(res.stream_url || '');
@@ -4123,6 +6207,10 @@ return view.extend({
 			Number(res.audio_sample_rate) === CPU_AUDIO_SAMPLE_RATE &&
 			Number(res.audio_channels) === CPU_AUDIO_CHANNELS &&
 			Number(res.audio_frames_per_chunk) === CPU_AUDIO_FRAMES_PER_CHUNK;
+		const requireBufferedPlayback = !!String(relPath || '');
+		let bufferedUnavailableReason = '';
+		let canvas = null;
+		let canvasContext = null;
 
 		if (!/^[0-9a-f]{32}$/.test(token) ||
 		    !/^\/cgi-bin\/videoplayer-frame\?token=[0-9a-f]{32}$/.test(streamUrl) ||
@@ -4159,6 +6247,57 @@ return view.extend({
 		else if (pendingAudio) {
 			pendingAudio.url = audioUrl;
 		}
+		if (requireBufferedPlayback && hasAudio && !audioMetadataValid)
+			bufferedUnavailableReason = _('The router returned invalid PCM metadata required for synchronized buffering.');
+		else if (requireBufferedPlayback) {
+			canvas = document.getElementById('videoplayer-cpu-canvas');
+			try {
+				canvasContext = self._canUseCpuFetchStream() && canvas &&
+					typeof canvas.getContext === 'function'
+					? canvas.getContext('2d')
+					: null;
+			}
+			catch (err) { canvasContext = null; }
+			if (!canvasContext)
+				bufferedUnavailableReason = _('This browser cannot provide the canvas and streaming APIs required for synchronized router buffering.');
+		}
+		if (bufferedUnavailableReason) {
+			self._disposeCpuAudio(pendingAudio);
+			callStopRenderer(token).catch(function () {});
+			notify(null, E('p', {},
+				_('%s Using browser decoding instead; fallback starts muted.')
+					.format(bufferedUnavailableReason)),
+			9000, 'warning');
+			return callResolve(relPath).then(function (fallback) {
+				if (generation !== self._playGeneration || !fallback ||
+				    fallback.error || !fallback.stream_url)
+					throw new Error(String(fallback && fallback.error ||
+						_('The streamer did not return a playback URL.')));
+				return self._playInVideo(
+					fallback.stream_url, label, generation, 'local', true
+				);
+			}).catch(function (err) {
+				if (generation !== self._playGeneration)
+					return;
+				self._currentKind = null;
+				self._currentRenderMode = null;
+				self._currentSrc = null;
+				self._setPlayerSurface('none');
+				self._setNowPlaying(
+					_('Unable to play %s: %s').format(label, errorText(err))
+				);
+				notify(null, E('p', {},
+					_('Browser fallback failed: %s').format(errorText(err))),
+				7000, 'error');
+			});
+		}
+
+		if (canvas && canvasContext) {
+			try {
+				canvasContext.clearRect(0, 0, canvas.width, canvas.height);
+			}
+			catch (err) {}
+		}
 
 		const session = {
 			token: token,
@@ -4166,8 +6305,53 @@ return view.extend({
 			streamSegmentMs: segmentSeconds * 1000,
 			generation: generation,
 			label: label,
+			relPath: String(relPath || ''),
 			fps: normalizeRouterFps(res.router_fps),
 			active: true,
+			bufferedPlayback: requireBufferedPlayback,
+			bufferState: requireBufferedPlayback ? 'buffering' : null,
+			producerEnded: false,
+			videoProducerDrained: false,
+			videoTerminalDrainConfirmed: false,
+			videoTerminalDrainBodyClean: false,
+			videoTerminalDrainCandidateId: null,
+			videoTerminalDrainRetryConsume: false,
+			videoTerminalDrainStartedAt: null,
+			videoTerminalDrainErrors: 0,
+			durationSeconds: Number.isSafeInteger(Number(res.duration_ms)) &&
+				Number(res.duration_ms) > 0
+				? Number(res.duration_ms) / 1000
+				: null,
+			durationSealed: false,
+			totalFrames: Number.isSafeInteger(Number(res.total_frames)) &&
+				Number(res.total_frames) > 0
+				? Number(res.total_frames)
+				: null,
+			canvas: canvas,
+			canvasContext: canvasContext,
+			videoFrames: [],
+			videoFrameIndex: 0,
+			videoBufferBytes: 0,
+			videoDecodeBytes: 0,
+			videoDecodeInFlight: null,
+			videoDecodeGeneration: 0,
+			displayedSequence: -1,
+			lastBufferedFrameSequence: -1,
+			lastDecodeFailureSequence: -1,
+			renderedSeconds: 0,
+			playedSeconds: 0,
+			playClockMediaBase: 0,
+			playClockContextAt: null,
+			playClockWallAt: null,
+			bufferResumeGeneration: 0,
+			presentationTimer: null,
+			presentationTimerType: null,
+			counterUpdatedAt: null,
+			bufferFallbackPending: false,
+			audioBatchMaxChunks: Math.max(
+				1,
+				Math.min(8, Number(res.audio_batch_max_chunks) || 1)
+			),
 			firstFrameSeen: false,
 			firstFrameAt: null,
 			visibleFrame: document.getElementById('videoplayer-cpu-frame'),
@@ -4205,6 +6389,7 @@ return view.extend({
 			pendingAudio: pendingAudio,
 			audioWarned: false,
 			audioFailureReason: '',
+			audioDrainer: null,
 			browserAudio: null,
 			browserAudioFailed: false,
 			browserAudioWarned: false,
@@ -4217,15 +6402,30 @@ return view.extend({
 		self._currentRenderMode = 'router';
 		self._currentLabel = label;
 		self._currentSrc = streamUrl;
-		self._setPlayerSurface('cpu');
-		self._setNowPlaying(_('Starting router CPU renderer: %s').format(label));
+		if (session.bufferedPlayback && audioMetadataValid && !pendingAudio)
+			self._startCpuAudioDrainer(
+				session, audioUrl, 0, session.audioBatchMaxChunks
+			);
+		self._setPlayerSurface(
+			session.bufferedPlayback ? 'cpu-buffered' : 'cpu'
+		);
+		self._setNowPlaying(
+			session.bufferedPlayback
+				? _('Rendering the initial two-minute buffer on the router: %s')
+					.format(label)
+				: _('Starting router CPU renderer: %s').format(label)
+		);
+		if (session.bufferedPlayback)
+			self._updateCpuBufferedCounters(session, true);
 		self._openCpuStream(session);
 		self._scheduleCpuStreamStatus(session, 0);
 		if (session.pendingAudio) {
+			if (session.bufferedPlayback)
+				self._activatePendingCpuAudio(session);
 			/* CPU mode deliberately uses router-decoded PCM as its primary sound.
-			 * Unlike HTMLMediaElement audio, Web Audio can follow a renderer that
-			 * is running below 0.25x without audibly racing ahead. The original
-			 * browser-decoded track is opened only if PCM later becomes unusable. */
+			 * Sequential chunks are buffered in the browser and played on one fixed
+			 * 1x Web Audio clock; video holds and refills with that clock instead of
+			 * changing audio speed or pitch. */
 			self._updateCpuAudioPresentation(session);
 			return Promise.resolve(true);
 		}
@@ -4385,7 +6585,9 @@ return view.extend({
 				if (self._pendingCpuAudio === audio)
 					self._pendingCpuAudio = null;
 				pendingAudio = null;
-				return self._playCpuStream(res, label, generation, audio);
+				return self._playCpuStream(
+					res, label, generation, audio, relPath
+				);
 			}
 			discardPendingAudio();
 			return self._playInVideo(
