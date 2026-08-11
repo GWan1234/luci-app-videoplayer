@@ -90,8 +90,9 @@ bounded FIFO and one relay CGI at a time forwards it directly to the browser.
 LuCI incrementally parses complete JPEG parts and stores them in a bounded
 browser-side queue. There is no temporary JPEG, filesystem scan, or process
 launch per frame on the router. The application ends each nonterminal response
-after the first of 45 wall-clock seconds, five seconds of configured video
-frames, or 16 MiB of complete JPEG payload, always between frames, then LuCI
+after the first of 45 wall-clock seconds, 20 seconds of configured video frames
+(capped at 300 frames), or 16 MiB of complete JPEG payload, always between
+frames, then LuCI
 opens the next segment when its bounded buffer has capacity. This is one
 request per segment rather than one request per frame. The frame sequence is
 global across those segments, so reconnect wall time is not added to media
@@ -109,10 +110,11 @@ descriptor: one selects video and one selects audio. This prevents a much
 longer audio track in one container from hiding video EOF until global input
 EOF. The process produces MJPEG and PCM from the same normalized input
 timeline. Video decoding uses the detected online CPU count, capped at four
-threads to bound memory on embedded targets. Filtering and MJPEG encoding use
-one thread on a single-core router and at most two elsewhere. FFmpeg remains at
-reduced scheduler priority so it yields to LuCI and network traffic under load,
-but no input pacing option limits how quickly it can use otherwise idle CPU.
+threads to bound memory on embedded targets. The Fast profile uses the same
+bounded count for filtering and MJPEG encoding; Quality uses one thread on a
+single-core router and at most two elsewhere. FFmpeg remains at reduced
+scheduler priority so it yields to LuCI and network traffic under load, but no
+input pacing option limits how quickly it can use otherwise idle CPU.
 Its unified `tee` output pads a short audio track with silence
 and stops an overlong audio track when video ends, so video is the authoritative
 timeline and neither length mismatch can stall the producer. LuCI immediately
@@ -534,6 +536,7 @@ config videoplayer 'main'
 	option media_path '/mnt/video'
 	option allow_remote '1'
 	option render_mode 'browser'
+	option router_profile 'fast'
 	option router_fps '8'
 	option max_depth '8'
 ```
@@ -544,7 +547,8 @@ config videoplayer 'main'
 | `media_path` | Root directory of the local media library |
 | `allow_remote` | Show the remote URL field in the interface |
 | `render_mode` | Local playback mode: `browser` or `router`; unknown values safely fall back to `browser` |
-| `router_fps` | Router CPU output frame rate: `5`, `8` (default), `12`, `15`, `20`, `24`, `30`, `48`, `50`, or `60` (maximum); higher rates also increase browser prebuffer memory and JPEG decoding work, and unknown values safely fall back to `8` |
+| `router_profile` | Router CPU profile: `fast` (default, 480×270 JPEG q12 with decoder speed optimizations and an 8 FPS cap) or `quality` (640×360 JPEG q8); unknown values safely fall back to `fast` |
+| `router_fps` | Router CPU output frame rate: `5`, `8` (default), `12`, `15`, `20`, `24`, `30`, `48`, `50`, or `60` (maximum); Fast accepts 5 or 8 and clamps stale higher values to 8, while Quality permits the full list |
 | `max_depth` | Maximum traversal depth for nested directories |
 
 The `uci-defaults` script is idempotent: it restores a missing section and adds
@@ -577,10 +581,12 @@ on the package manager and whether the file has been modified.
 
 - This is a web interface, not a hardware HDMI player.
 - Browser mode codec support depends on the client browser.
-- Router CPU mode is experimental and capped at 640×360. Its frame rate is
-  selectable at 5, 8, 12, 15, 20, 24, 30, 48, 50, or 60 FPS. The default is
-  8 FPS; higher settings progressively increase CPU and network load, and
-  60 FPS may overload even fast routers. Rendering can be slower than media
+- Router CPU mode is experimental. The default Fast profile renders 480×270
+  JPEG q12, uses safe decoder shortcuts, and caps output at 8 FPS; 5 FPS reduces
+  load further. The Quality profile preserves the 640×360 JPEG q8 path and
+  permits 5, 8, 12, 15, 20, 24, 30, 48, 50, or 60 FPS. Higher settings
+  progressively increase CPU and network load, and 60 FPS may overload even
+  fast routers. Rendering can still be slower than media
   time; initial buffering then takes longer and playback pauses to refill
   instead of changing audio speed or pitch. The continuous MJPEG transport
   removes per-frame HTTP requests, but the browser still parses and stores
@@ -596,15 +602,16 @@ on the package manager and whether the file has been modified.
   An underrun pauses both tracks instead of stopping, rebasing, or resampling
   short audio fragments. Browser autoplay policies may require pressing
   **Unmute** once.
-- Router-decoded PCM uses a bounded eight-second router-side staging ring rather
+- Router-decoded PCM uses one-second chunks and a bounded eight-second
+  router-side staging ring rather
   than an unbounded cache. It is not the playback buffer: LuCI continuously
   drains it into the bounded client-side buffer while the one FFmpeg producer
   creates video and audio from the same input timeline. Each validated batch
   request acknowledges only earlier PCM chunks; a full ring backpressures the
   shared FFmpeg process instead of overwriting sound that the browser has not
-  received. Numeric requests avoid rescanning the whole ring while waiting for
-  a complete batch, and LuCI backs off repeated empty polls from 50 ms to an
-  interval of 250 ms.
+  received. Numeric requests fetch at most two chunks (384 KiB), avoid rescanning
+  the whole ring while waiting for a complete batch, and LuCI backs off repeated
+  empty polls from 50 ms to an interval of one second.
   A short authenticated lock-busy response is retried for a bounded interval
   instead of aborting the entire CPU-rendered session. If the backend explicitly
   reports that its PCM chunker is
@@ -624,7 +631,9 @@ on the package manager and whether the file has been modified.
   are decoded; this trades some storage I/O for deterministic track-length
   handling without a second renderer process.
 - Router CPU mode has no user-controlled pause or seeking. Separate
-  **Rendered time** and **Played time** counters show elapsed media time against
+  **Rendered time**, **Played time**, **Render speed**, and **Buffered ahead**
+  counters distinguish producer throughput from the fixed 1× playback clock.
+  The two time counters show elapsed media time against
   advisory container duration while rendering; the total is shown as `?` when
   the container does not report one. Container metadata never shortens the
   two-minute start gate or ends playback. After a clean renderer EOF, LuCI
@@ -632,8 +641,9 @@ on the package manager and whether the file has been modified.
   remains at its original rate while
   playing. LuCI reconnects the producer stream only at clean frame-aligned CGI
   handoffs and keeps the last canvas image during handoff or refill. Every
-  nonterminal response closes after the first of 45 seconds of wall time, five
-  seconds of configured video frames, or 16 MiB of complete JPEG payload (with
+  nonterminal response closes after the first of 45 seconds of wall time, 20
+  seconds of configured video frames (capped at 300 frames), or 16 MiB of
+  complete JPEG payload (with
   room for at most one final 4 MiB frame). An active response is always drained
   to that validated frame boundary; high-water backpressure delays only
   its successor, so a hidden tab cannot leave uHTTPd holding an unread body.

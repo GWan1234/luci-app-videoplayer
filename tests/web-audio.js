@@ -244,7 +244,7 @@ function fakeContext(options = {}) {
 		},
 		createBuffer(channels, frames, rate) {
 			check(channels === 1 || channels === 2, 'unexpected channel count');
-			check(frames === 1 || frames === 12000, 'unexpected frame count');
+			check(frames === 1 || frames === 48000, 'unexpected frame count');
 			check(rate === 48000, 'unexpected sample rate');
 			const data = Array.from(
 				{ length: channels },
@@ -561,7 +561,7 @@ async function main() {
 		sources: []
 	};
 	const session = { audio };
-	const pcm = new ArrayBuffer(48000);
+	const pcm = new ArrayBuffer(192000);
 	const data = new DataView(pcm);
 	data.setInt16(0, -32768, true);
 	data.setInt16(2, 32767, true);
@@ -624,12 +624,12 @@ async function main() {
 	};
 	const headerValues = {
 		'content-type': 'application/octet-stream',
-		'content-length': '48000',
+		'content-length': '192000',
 		'x-videoplayer-audio-format': 's16le',
 		'x-videoplayer-audio-sequence': '9',
 		'x-videoplayer-audio-sample-rate': '48000',
 		'x-videoplayer-audio-channels': '2',
-		'x-videoplayer-audio-frames': '12000'
+		'x-videoplayer-audio-frames': '48000'
 	};
 	request.get = () => Promise.resolve({
 		status: 200,
@@ -637,7 +637,7 @@ async function main() {
 		headers: {
 			get: name => headerValues[String(name).toLowerCase()] || null
 		},
-		blob: () => new Blob([new Uint8Array(48000)])
+		blob: () => new Blob([new Uint8Array(192000)])
 	});
 	await app._pollCpuAudio(pollSession);
 	check(pollAudio.sequence === 10, 'live audio response did not set next sequence');
@@ -662,7 +662,7 @@ async function main() {
 		headers: {
 			get: name => headerValues[String(name).toLowerCase()] || null
 		},
-		blob: () => new Blob([new Uint8Array(48000)])
+		blob: () => new Blob([new Uint8Array(192000)])
 	});
 	await stalePcmPoll;
 	check(pollAudio.sequence === null && pollAudio.sources.length === 0,
@@ -998,13 +998,15 @@ async function main() {
 		mime: 'multipart/x-mixed-replace',
 		stream_segment_seconds: 45,
 		has_audio: 0,
+		router_profile: 'fast',
 		router_fps: 60
 	}, 'bad apple.mp4', 6, null);
 
 	const browserSession = app._cpuSession;
 	const browserAudio = browserSession && browserSession.browserAudio;
 	check(browserSession && browserSession.active, 'CPU session was not retained');
-	check(browserSession.fps === 60, '60 FPS was normalized to another frame rate');
+	check(browserSession.profile === 'fast' && browserSession.fps === 8,
+		'fast profile did not clamp a stale 60 FPS renderer response to 8 FPS');
 	const firstStreamFrame = browserSession.streamPending &&
 		browserSession.streamPending.node;
 	check(firstStreamFrame && firstStreamFrame !== browserFrame,
@@ -1195,10 +1197,13 @@ async function main() {
 		audio_type: 'pcm-s16le-chunks',
 		audio_sample_rate: 48000,
 		audio_channels: 2,
-		audio_frames_per_chunk: 12000,
+		audio_frames_per_chunk: 48000,
+		router_profile: 'quality',
 		router_fps: 60
 	}, 'primary-audio.mp4', 60, dormantPcm);
 	const primarySession = app._cpuSession;
+	check(primarySession.profile === 'quality' && primarySession.fps === 60,
+		'quality profile did not retain its explicit 60 FPS target');
 	check(
 		primarySession.audio === null &&
 		primarySession.pendingAudio === dormantPcm &&
@@ -1296,7 +1301,8 @@ async function main() {
 		audio_type: 'pcm-s16le-chunks',
 		audio_sample_rate: 48000,
 		audio_channels: 2,
-		audio_frames_per_chunk: 12000,
+		audio_frames_per_chunk: 48000,
+		router_profile: 'quality',
 		router_fps: 60
 	}, 'native-fallback.mp4', 61, nativePcm);
 	const nativeSession = app._cpuSession;
@@ -1748,6 +1754,7 @@ async function main() {
 		mime: 'multipart/x-mixed-replace',
 		stream_segment_seconds: 45,
 		has_audio: 0,
+		router_profile: 'quality',
 		router_fps: 60
 	}, 'invalid-stream.mp4', 64, null);
 	check(app._cpuSession === null,
@@ -2296,20 +2303,41 @@ async function main() {
 		'ready PCM fallback was not activated');
 	check(app._cpuVideoStallMs({ fps: 60, videoPlaybackRate: 0.01 }) > 4000,
 		'very slow rendering still used the selected FPS as its stall clock');
-	check(pcmSyncAudio.sequence === 5 &&
-		Math.abs(pcmSyncAudio.startOffsetSeconds - 0.125) < 0.001,
+	check(pcmSyncAudio.sequence === 1 &&
+		Math.abs(pcmSyncAudio.startOffsetSeconds - 0.375) < 0.001,
 		'PCM fallback did not preserve the video sub-chunk offset');
 	app._decodeCpuAudioChunk(
-		pcmSyncSession, new ArrayBuffer(48000), 5
+		pcmSyncSession, new ArrayBuffer(192000), 1
 	);
 	const offsetSource = pcmSyncContext.createdSources.at(-1);
-	check(Math.abs(offsetSource.startOffset - 0.125) < 0.001,
+	check(Math.abs(offsetSource.startOffset - 0.375) < 0.001,
 		'PCM AudioBufferSource did not start at the sub-chunk offset');
 	check(Math.abs(offsetSource.videoplayerPlaybackRate - 1) < 0.001,
 		'PCM playback rate changed pitch to follow the displayed video rate');
 	check(Math.abs(offsetSource.videoplayerMediaStart - 1.375) < 0.001 &&
-		Math.abs(offsetSource.videoplayerEndAt - offsetSource.videoplayerStartAt - 0.125) < 0.001,
+		Math.abs(offsetSource.videoplayerEndAt - offsetSource.videoplayerStartAt - 0.625) < 0.001,
 		'PCM source timeline metadata does not match its offset and rate');
+	/* One-second transport chunks must not widen A/V synchronization to a whole
+	 * second. Preserve the old quarter-second rebase threshold independently. */
+	const originalPcmRebase = app._rebaseCpuAudio;
+	const originalPcmAvScheduler = app._scheduleCpuAvSync;
+	let driftRebases = 0;
+	app._rebaseCpuAudio = (activeSession, activeAudio) => {
+		check(activeSession === pcmSyncSession && activeAudio === pcmSyncAudio,
+			'PCM drift rebase targeted the wrong session');
+		driftRebases++;
+	};
+	app._scheduleCpuAvSync = () => {};
+	pcmSyncContext.currentTime = offsetSource.videoplayerStartAt + 0.3;
+	pcmSyncSession.videoMediaTime = 1.375;
+	pcmSyncSession.videoFrameAt = Date.now();
+	pcmSyncAudio.lastVideoRebaseAt = null;
+	app._pollCpuAvSync(pcmSyncSession);
+	check(driftRebases === 1,
+		'one-second PCM transport chunk allowed more than 250 ms of A/V drift');
+	app._rebaseCpuAudio = originalPcmRebase;
+	app._scheduleCpuAvSync = originalPcmAvScheduler;
+	pcmSyncContext.currentTime = 1;
 	pcmSyncSession.videoFrameAt = Date.now() - 1000;
 	app._pollCpuAvSync(pcmSyncSession);
 	check(pcmSyncAudio.videoHeld && offsetSource.stopped &&
@@ -2342,7 +2370,7 @@ async function main() {
 	 * recent visible frame is available again. */
 	const visibilitySequence = pcmSyncAudio.sequence;
 	app._decodeCpuAudioChunk(
-		pcmSyncSession, new ArrayBuffer(48000), visibilitySequence
+		pcmSyncSession, new ArrayBuffer(192000), visibilitySequence
 	);
 	const visibilitySource = pcmSyncContext.createdSources.at(-1);
 	document.hidden = true;
@@ -2369,8 +2397,8 @@ async function main() {
 	/* A 410 response can race a newly displayed frame. The retry must update
 	 * both the sequence and its intra-chunk offset. */
 	pcmSyncAudio.rebased = false;
-	pcmSyncAudio.sequence = 5;
-	pcmSyncAudio.startOffsetSequence = 5;
+	pcmSyncAudio.sequence = 2;
+	pcmSyncAudio.startOffsetSequence = 2;
 	pcmSyncAudio.startOffsetSeconds = 0;
 	pcmSyncAudio.inFlight = false;
 	pcmSyncAudio.videoHeld = false;
@@ -2384,9 +2412,9 @@ async function main() {
 	});
 	pcmPollDelay = null;
 	await app._pollCpuAudio(pcmSyncSession);
-	check(pcmSyncAudio.sequence === 6 &&
-		pcmSyncAudio.startOffsetSequence === 6 &&
-		Math.abs(pcmSyncAudio.startOffsetSeconds - 0.125) < 0.001,
+	check(pcmSyncAudio.sequence === 1 &&
+		pcmSyncAudio.startOffsetSequence === 1 &&
+		Math.abs(pcmSyncAudio.startOffsetSeconds - 0.625) < 0.001,
 		'PCM 410 retry lost the synchronized sub-chunk offset');
 	check(pcmPollDelay === 0,
 		'PCM 410 retry was not scheduled immediately');
@@ -2395,7 +2423,7 @@ async function main() {
 	 * the queued tail. That forced reset must also run the normal drain cleanup
 	 * instead of leaving an ended AudioContext attached forever. */
 	app._decodeCpuAudioChunk(
-		pcmSyncSession, new ArrayBuffer(48000), pcmSyncAudio.sequence
+		pcmSyncSession, new ArrayBuffer(192000), pcmSyncAudio.sequence
 	);
 	const endedVisibilitySource = pcmSyncContext.createdSources.at(-1);
 	pcmSyncAudio.ended = true;
@@ -2650,6 +2678,8 @@ async function main() {
 	 * the backend duration when present. Unknown duration remains explicit. */
 	elements['vp-cpu-rendered-time'] = { textContent: '' };
 	elements['vp-cpu-played-time'] = { textContent: '' };
+	elements['vp-cpu-render-speed'] = { textContent: '' };
+	elements['vp-cpu-buffered-ahead'] = { textContent: '' };
 	gateSession.renderedSeconds = 120.8;
 	gateSession.playedSeconds = 31.9;
 	gateSession.durationSeconds = 600;
@@ -2662,8 +2692,64 @@ async function main() {
 	app._updateCpuBufferedCounters(gateSession, true);
 	check(elements['vp-cpu-rendered-time'].textContent.endsWith(' / ?'),
 		'unknown backend duration was not shown as unknown');
+
+	/* Render throughput is accepted media time divided by monotonic wall time.
+	 * A deliberate high-water hold is labelled and excluded from the next rate
+	 * sample instead of being averaged into an apparent slow renderer. */
+	const telemetryClock = installFakeClock(2800000);
+	gateSession.producerEnded = false;
+	gateSession.videoProducerDrained = false;
+	gateSession.durationSealed = false;
+	gateSession.fps = 10;
+	gateSession.renderedSeconds = 1;
+	gateSession.playedSeconds = 0;
+	gateSession.audio.producerEnded = false;
+	gateSession.audio.bufferedUntil = 1;
+	gateSession.renderRateAnchorAt = null;
+	gateSession.renderRateAnchorSeconds = null;
+	gateSession.renderSpeed = null;
+	gateSession.renderEffectiveFps = null;
+	gateSession.renderCapacityHeld = false;
+	gateSession.counterUpdatedAt = null;
+	gateSession.renderedSeconds = 0;
+	app._updateCpuBufferedCounters(gateSession, true);
+	telemetryClock.jump(15000);
+	gateSession.renderedSeconds = 1;
+	app._updateCpuBufferedCounters(gateSession, true);
+	check(elements['vp-cpu-render-speed'].textContent ===
+		'Measuring… (target 10 FPS)',
+		'render-speed counter included startup time before the first accepted JPEG');
+	telemetryClock.jump(1000);
+	gateSession.renderedSeconds = 3;
+	gateSession.playedSeconds = 1;
+	gateSession.audio.bufferedUntil = 3;
+	app._updateCpuBufferedCounters(gateSession, true);
+	check(elements['vp-cpu-render-speed'].textContent ===
+		'2.00× real time (20.0 FPS / 10 FPS target)',
+		'render-speed counter did not report media/wall throughput and target FPS');
+	check(elements['vp-cpu-buffered-ahead'].textContent === '00:02',
+		'buffered-ahead counter did not report synchronized media lead');
+	app._setCpuRenderCapacityHeld(gateSession, true);
+	check(elements['vp-cpu-render-speed'].textContent ===
+		'Paused — buffer full (target 10 FPS)',
+		'high-water pause was displayed as renderer throughput');
+	telemetryClock.jump(90000);
+	app._setCpuRenderCapacityHeld(gateSession, false);
+	check(elements['vp-cpu-render-speed'].textContent ===
+		'Measuring… (target 10 FPS)',
+		'capacity resume retained the pre-pause rate sample');
+	telemetryClock.jump(1000);
+	gateSession.renderedSeconds = 5;
+	gateSession.audio.bufferedUntil = 5;
+	app._updateCpuBufferedCounters(gateSession, true);
+	check(elements['vp-cpu-render-speed'].textContent ===
+		'2.00× real time (20.0 FPS / 10 FPS target)',
+		'deliberate 90-second capacity hold polluted resumed render speed');
+	telemetryClock.restore();
 	delete elements['vp-cpu-rendered-time'];
 	delete elements['vp-cpu-played-time'];
+	delete elements['vp-cpu-render-speed'];
+	delete elements['vp-cpu-buffered-ahead'];
 
 	/* PCM prefetch starts at sequence zero and drains multiple contiguous chunks
 	 * per request into browser-owned memory. */
@@ -2678,7 +2764,7 @@ async function main() {
 		inFlightGeneration: null,
 		fetchSequence: 0,
 		playSequence: null,
-		batchMaxChunks: 8,
+		batchMaxChunks: 2,
 		bufferedChunks: Object.create(null),
 		bufferedBytes: 0,
 		bufferedUntil: 0,
@@ -2726,12 +2812,12 @@ async function main() {
 		bufferedQuery = options.query;
 		const values = {
 			'content-type': 'application/octet-stream',
-			'content-length': '96000',
+			'content-length': '384000',
 			'x-videoplayer-audio-format': 's16le',
 			'x-videoplayer-audio-sequence': '0',
 			'x-videoplayer-audio-chunk-count': '2',
-			'x-videoplayer-audio-frames-per-chunk': '12000',
-			'x-videoplayer-audio-total-frames': '24000',
+			'x-videoplayer-audio-frames-per-chunk': '48000',
+			'x-videoplayer-audio-total-frames': '96000',
 			'x-videoplayer-audio-sample-rate': '48000',
 			'x-videoplayer-audio-channels': '2'
 		};
@@ -2739,20 +2825,20 @@ async function main() {
 			status: 200,
 			ok: true,
 			headers: { get: name => values[String(name).toLowerCase()] || null },
-			blob: () => new Blob([ new Uint8Array(96000) ])
+			blob: () => new Blob([ new Uint8Array(384000) ])
 		});
 	};
 	await app._pollCpuBufferedAudio(bufferedSession);
-	check(bufferedQuery.chunk === '0' && bufferedQuery.count === '8',
+	check(bufferedQuery.chunk === '0' && bufferedQuery.count === '2',
 		'buffered PCM did not start at zero with the advertised batch size');
 	check(bufferedAudio.fetchSequence === 2 &&
 		bufferedAudio.bufferedChunks[0] instanceof ArrayBuffer &&
 		bufferedAudio.bufferedChunks[1] instanceof ArrayBuffer &&
-		bufferedAudio.bufferedUntil === 0.5,
+		bufferedAudio.bufferedUntil === 2,
 		'buffered PCM batch was not retained as two sequential chunks');
 	check(bufferedPollDelay === 0, 'buffered PCM did not immediately drain the next batch');
 
-	/* A slow producer exposes the edge of each complete eight-chunk batch for
+	/* A slow producer exposes the edge of each complete two-chunk batch for
 	 * roughly two media seconds. Back off repeated 202 responses instead of
 	 * running an expensive CGI/ring scan at 20 requests per second. */
 	const notReadyDelays = [];
@@ -2770,10 +2856,10 @@ async function main() {
 	for (let attempt = 0; attempt < 8; attempt++)
 		await app._pollCpuBufferedAudio(bufferedSession);
 	check(JSON.stringify(notReadyDelays) ===
-		JSON.stringify([ 50, 100, 200, 250, 250, 250, 250, 250 ]),
+		JSON.stringify([ 50, 100, 200, 400, 800, 1000, 1000, 1000 ]),
 		'buffered PCM 202 polling did not use the bounded exponential backoff');
-	check(notReadyDelays.slice(-4).reduce((sum, delay) => sum + delay, 0) === 1000,
-		'sustained empty PCM polling exceeded four CGI requests per second');
+	check(notReadyDelays.slice(-3).reduce((sum, delay) => sum + delay, 0) === 3000,
+		'sustained empty PCM polling exceeded one CGI request per second');
 	check(bufferedAudio.errors === 0,
 		'a healthy buffered PCM 202 did not reset prior transport failures');
 
@@ -2841,8 +2927,13 @@ async function main() {
 	app._fillCpuBufferedAudioQueue(bufferedSession);
 	const fixedRateSource = bufferedContext.createdSources.at(-1);
 	check(fixedRateSource.videoplayerPlaybackRate === 1 &&
-		fixedRateSource.playbackRate.value === 1,
+		fixedRateSource.playbackRate.value === 1 &&
+		Math.abs(fixedRateSource.videoplayerEndAt -
+			fixedRateSource.videoplayerStartAt - 1) < 0.001,
 		'buffered PCM was pitch-shifted away from normal speed');
+	check(bufferedAudio.nextPlayTime - bufferedContext.currentTime > 2 &&
+		bufferedAudio.nextPlayTime - bufferedContext.currentTime < 3,
+		'one-second PCM chunks created an underrun-prone or excessive audio lead');
 	const originalCreatePcmBuffer = bufferedContext.createBuffer;
 	const originalScheduleDisable = app._disableCpuAudio;
 	let scheduleDisableCalls = 0;
@@ -2857,7 +2948,7 @@ async function main() {
 		return Promise.resolve(true);
 	};
 	const retainedPlaySequence = bufferedAudio.playSequence;
-	const retainedChunk = new ArrayBuffer(48000);
+	const retainedChunk = new ArrayBuffer(192000);
 	const retainedNextPlayTime = bufferedAudio.nextPlayTime;
 	const retainedBufferedBytes = bufferedAudio.bufferedBytes;
 	const previousRetainedChunk =
@@ -3133,7 +3224,7 @@ async function main() {
 		gain: closeContext.createGain(),
 		url: '/cgi-bin/videoplayer-audio?token=' + '1'.repeat(32),
 		fetchSequence: 12,
-		batchMaxChunks: 8,
+		batchMaxChunks: 2,
 		pollGeneration: 0,
 		timer: null,
 		inFlight: false,
@@ -3441,7 +3532,7 @@ async function main() {
 	const lifecycleAudio = app._createCpuAudio();
 	lifecycleAudio.url = '/cgi-bin/videoplayer-audio?token=' + '2'.repeat(32);
 	lifecycleAudio.fetchSequence = 16;
-	lifecycleAudio.batchMaxChunks = 8;
+	lifecycleAudio.batchMaxChunks = 2;
 	lifecycleAudio.bufferedChunks = Object.create(null);
 	lifecycleAudio.bufferedBytes = 0;
 	lifecycleAudio.bufferedUntil = 120;
@@ -4348,13 +4439,17 @@ async function main() {
 		app._scheduleCpuStreamReconnect(heldSession, 0);
 		capacityClock.advance(91000);
 		check(capacityOpens === opensBeforeHold &&
-			heldSession.streamReconnectTimer != null,
+			heldSession.streamReconnectTimer != null &&
+			heldSession.renderCapacityHeld === true &&
+			heldSession.renderSpeed == null,
 			(withPcm ? 'PCM' : 'audio-less') +
-				' high-water hold opened a successor before capacity returned');
+				' high-water hold opened a successor or retained a stale rate');
 		heldSession.playedSeconds = 20;
 		capacityClock.advance(100);
 		check(capacityOpens === opensBeforeHold + 1 &&
-			heldSession.streamReconnectTimer === null,
+			heldSession.streamReconnectTimer === null &&
+			heldSession.renderCapacityHeld === false &&
+			Number.isFinite(heldSession.renderRateAnchorAt),
 			(withPcm ? 'PCM' : 'audio-less') +
 				' high-water hold did not reopen below the threshold');
 	}
@@ -4396,7 +4491,7 @@ async function main() {
 
 	/* With no AudioContext, hybrid browser audio still needs to ACK every PCM
 	 * chunk so the shared FFmpeg process cannot block on its small router ring.
-	 * The discard cursor begins at zero, batches eight chunks, and advances by
+	 * The discard cursor begins at zero, batches two chunks, and advances by
 	 * the actual response count only. */
 	const drainCanvas = fakeCanvasElement();
 	elements['videoplayer-cpu-canvas'] = drainCanvas;
@@ -4438,8 +4533,9 @@ async function main() {
 		audio_type: 'pcm-s16le-chunks',
 		audio_sample_rate: 48000,
 		audio_channels: 2,
-		audio_frames_per_chunk: 12000,
-		audio_batch_max_chunks: 8,
+		audio_frames_per_chunk: 48000,
+		audio_batch_max_chunks: 2,
+		router_profile: 'quality',
 		router_fps: 60
 	}, 'hybrid-drain.mp4', 126, null, 'hybrid-drain.mp4');
 	const drainSession = app._cpuSession;
@@ -4458,17 +4554,17 @@ async function main() {
 				ok: false,
 				headers: { get: () => null }
 			});
-		const responseSequence = drainResponseIndex === 1 ? 0 : 8;
-		const responseCount = drainResponseIndex === 1 ? 8 : 2;
-		const responseBytes = responseCount * 48000;
+		const responseSequence = drainResponseIndex === 1 ? 0 : 2;
+		const responseCount = 2;
+		const responseBytes = responseCount * 192000;
 		const values = {
 			'content-type': 'application/octet-stream',
 			'content-length': String(responseBytes),
 			'x-videoplayer-audio-format': 's16le',
 			'x-videoplayer-audio-sequence': String(responseSequence),
 			'x-videoplayer-audio-chunk-count': String(responseCount),
-			'x-videoplayer-audio-frames-per-chunk': '12000',
-			'x-videoplayer-audio-total-frames': String(responseCount * 12000),
+			'x-videoplayer-audio-frames-per-chunk': '48000',
+			'x-videoplayer-audio-total-frames': String(responseCount * 48000),
 			'x-videoplayer-audio-sample-rate': '48000',
 			'x-videoplayer-audio-channels': '2'
 		};
@@ -4480,20 +4576,20 @@ async function main() {
 		});
 	};
 	await app._pollCpuAudioDrainer(drainSession);
-	check(drainSession.audioDrainer.fetchSequence === 8,
+	check(drainSession.audioDrainer.fetchSequence === 2,
 		'discard drainer did not consume its first full batch');
 	drainSession.audioDrainer.errors = 2;
 	await app._pollCpuAudioDrainer(drainSession);
-	check(drainSession.audioDrainer.fetchSequence === 8 &&
+	check(drainSession.audioDrainer.fetchSequence === 2 &&
 		drainSession.audioDrainer.errors === 0,
 		'healthy HTTP 202 advanced the discard cursor or retained old failures');
 	await app._pollCpuAudioDrainer(drainSession);
 	check(
 		drainQueries.length === 3 &&
-		drainQueries[0].chunk === '0' && drainQueries[0].count === '8' &&
-		drainQueries[1].chunk === '8' && drainQueries[1].count === '8' &&
-		drainQueries[2].chunk === '8' && drainQueries[2].count === '8' &&
-		drainSession.audioDrainer.fetchSequence === 10,
+		drainQueries[0].chunk === '0' && drainQueries[0].count === '2' &&
+		drainQueries[1].chunk === '2' && drainQueries[1].count === '2' &&
+		drainQueries[2].chunk === '2' && drainQueries[2].count === '2' &&
+		drainSession.audioDrainer.fetchSequence === 4,
 		'discard drainer did not retry/advance its strict sequential batch cursor'
 	);
 	const drainBusyClock = installFakeClock(4000000);
@@ -4591,6 +4687,7 @@ async function main() {
 		mime: 'multipart/x-mixed-replace',
 		stream_segment_seconds: 45,
 		has_audio: 0,
+		router_profile: 'quality',
 		router_fps: 60
 	}, 'canvas-fallback.mp4', 127, null, 'canvas-fallback.mp4');
 	check(
@@ -4622,7 +4719,8 @@ async function main() {
 		audio_type: 'pcm-s16le-chunks',
 		audio_sample_rate: 44100,
 		audio_channels: 2,
-		audio_frames_per_chunk: 12000,
+		audio_frames_per_chunk: 48000,
+		router_profile: 'quality',
 		router_fps: 60
 	}, 'bad-pcm-metadata.mp4', 128, null, 'bad-pcm-metadata.mp4');
 	check(
@@ -4635,6 +4733,122 @@ async function main() {
 	app._canUseCpuFetchStream = originalCanFetchForFallback;
 	app._playInVideo = originalPlayInVideo;
 	app._startCpuAudioDrainer = originalStartDrainer;
+
+	/* Fast is a persisted rendering profile, not merely descriptive UI. A stale
+	 * high FPS is clamped in the control and again at save time; Quality retains
+	 * 60 FPS, and changing profile invalidates an active router worker. */
+	const originalUciGet = uci.get;
+	const originalUciSet = uci.set;
+	const originalGetStatusHandler = rpcHandlers.get_status;
+	const originalCanBrowseForProfile = app._canBrowseLocal;
+	const originalRenderUnavailableForProfile = app._renderLocalUnavailable;
+	const originalSyncRemoteForProfile = app._syncRemoteControls;
+	const originalSyncLocalForProfile = app._syncLocalControls;
+	const originalUpdateRendererForProfile = app._updateRendererStatus;
+	const originalSetSaveBusyForProfile = app._setSaveBusy;
+	const originalClearFieldForProfile = app._clearFieldError;
+	const originalHandleStopForProfile = app.handleStop;
+	const savedSettings = {
+		enabled: '1',
+		media_path: '/mnt/video',
+		allow_remote: '1',
+		render_mode: 'router',
+		router_profile: 'fast',
+		router_fps: '60'
+	};
+	const profileControl = { value: 'fast' };
+	const fpsControl = {
+		value: '60',
+		options: [ 5, 8, 12, 15, 20, 24, 30, 48, 50, 60 ].map(value => ({
+			value: String(value),
+			disabled: false
+		}))
+	};
+	elements['vp-enabled'] = { checked: true };
+	elements['vp-media-path'] = { value: '/mnt/video', setAttribute() {} };
+	elements['vp-allow-remote'] = { checked: true };
+	elements['vp-render-mode'] = { value: 'router' };
+	elements['vp-router-profile'] = profileControl;
+	elements['vp-router-fps'] = fpsControl;
+	uci.get = (config, section, option) => savedSettings[option];
+	uci.set = (config, section, option, value) => {
+		savedSettings[option] = String(value);
+	};
+	rpcHandlers.get_status = () => ({
+		enabled: savedSettings.enabled,
+		media_path: savedSettings.media_path,
+		allow_remote: savedSettings.allow_remote,
+		render_mode: savedSettings.render_mode,
+		router_profile: savedSettings.router_profile,
+		router_fps: savedSettings.router_fps,
+		renderer_available: 1
+	});
+	app._canWriteSettings = true;
+	app._rendererAvailable = true;
+	app._renderMode = 'router';
+	app._routerProfile = 'fast';
+	app._routerFps = 8;
+	app._status = { media_path: '/mnt/video', renderer_available: 1 };
+	app._browseRequestId = 0;
+	app._cwd = '';
+	app._currentKind = null;
+	app._currentRenderMode = null;
+	app._canBrowseLocal = () => false;
+	app._renderLocalUnavailable = () => {};
+	app._syncRemoteControls = () => {};
+	app._syncLocalControls = () => {};
+	app._updateRendererStatus = () => {};
+	app._setSaveBusy = () => {};
+	app._clearFieldError = () => {};
+	let profileStops = 0;
+	app.handleStop = function () {
+		profileStops++;
+		this._currentKind = null;
+		this._currentRenderMode = null;
+		return Promise.resolve();
+	};
+	app.handleRouterProfileChange();
+	check(fpsControl.value === '8' &&
+		fpsControl.options.filter(option => Number(option.value) > 8)
+			.every(option => option.disabled),
+		'fast profile UI did not clamp and disable stale FPS values above 8');
+	fpsControl.value = '60';
+	await app.handleSaveSettings();
+	check(savedSettings.router_profile === 'fast' &&
+		savedSettings.router_fps === '8' && app._routerFps === 8,
+		'fast profile save persisted a stale FPS above its effective cap');
+	profileControl.value = 'quality';
+	app.handleRouterProfileChange();
+	fpsControl.value = '60';
+	app._currentKind = 'local';
+	app._currentRenderMode = 'router';
+	await app.handleSaveSettings();
+	check(savedSettings.router_profile === 'quality' &&
+		savedSettings.router_fps === '60' && app._routerFps === 60 &&
+		fpsControl.options.every(option => !option.disabled),
+		'quality profile did not retain and expose its 60 FPS target');
+	check(profileStops === 1,
+		'profile change did not stop exactly one active router session');
+	uci.get = originalUciGet;
+	uci.set = originalUciSet;
+	if (originalGetStatusHandler)
+		rpcHandlers.get_status = originalGetStatusHandler;
+	else
+		delete rpcHandlers.get_status;
+	app._canBrowseLocal = originalCanBrowseForProfile;
+	app._renderLocalUnavailable = originalRenderUnavailableForProfile;
+	app._syncRemoteControls = originalSyncRemoteForProfile;
+	app._syncLocalControls = originalSyncLocalForProfile;
+	app._updateRendererStatus = originalUpdateRendererForProfile;
+	app._setSaveBusy = originalSetSaveBusyForProfile;
+	app._clearFieldError = originalClearFieldForProfile;
+	app.handleStop = originalHandleStopForProfile;
+	delete elements['vp-enabled'];
+	delete elements['vp-media-path'];
+	delete elements['vp-allow-remote'];
+	delete elements['vp-render-mode'];
+	delete elements['vp-router-profile'];
+	delete elements['vp-router-fps'];
 
 	process.stdout.write('web-audio-test: ok\n');
 }

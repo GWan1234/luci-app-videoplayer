@@ -9,5 +9,7 @@ config videoplayer 'main'
 	option render_mode 'browser'
 	# Router CPU renderer FPS: 5, 8, 12, 15, 20, 24, 30, 48, 50, or 60
 	option router_fps '8'
+	# CPU renderer preset: fast favors throughput on low-end routers; quality keeps 640x360
+	option router_profile 'fast'
 	# Max depth when browsing local folders
 	option max_depth '8'

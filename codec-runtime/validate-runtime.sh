@@ -253,12 +253,14 @@ encoders="$work/encoders.txt"
 demuxers="$work/demuxers.txt"
 muxers="$work/muxers.txt"
 filters="$work/filters.txt"
+mjpeg_help="$work/mjpeg-help.txt"
 
 run_target -hide_banner -decoders > "$decoders" 2>&1
 run_target -hide_banner -encoders > "$encoders" 2>&1
 run_target -hide_banner -demuxers > "$demuxers" 2>&1
 run_target -hide_banner -muxers > "$muxers" 2>&1
 run_target -hide_banner -filters > "$filters" 2>&1
+run_target -hide_banner -h encoder=mjpeg > "$mjpeg_help" 2>&1
 
 has_component() {
 	awk -v name="$2" '
@@ -281,6 +283,12 @@ do
 done
 has_component "$encoders" mjpeg ||
 	die "MJPEG encoder is missing"
+grep -Eq '^[[:space:]]*-huffman[[:space:]]' "$mjpeg_help" ||
+	die "MJPEG encoder has no Huffman strategy option"
+if ! grep -Eq '^[[:space:]]+default[[:space:]]' "$mjpeg_help" ||
+   ! grep -Eq '^[[:space:]]+optimal[[:space:]]' "$mjpeg_help"; then
+	die "MJPEG encoder lacks a required Huffman strategy"
+fi
 has_component "$encoders" pcm_s16le ||
 	die "PCM S16LE encoder is missing"
 for demuxer in mov matroska avi mpegts
@@ -336,7 +344,7 @@ ffmpeg \
 		-i /proc/self/fd/3 -map 0:V:0 -an -sn -dn -map_metadata -1 \
 		-filter_threads 1 \
 		-vf "fps=3,scale=160:90:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
-		-frames:v 1 -threads 1 -c:v mjpeg -q:v 8 \
+		-frames:v 1 -threads 1 -c:v mjpeg -q:v 8 -huffman optimal \
 		-f mpjpeg -boundary_tag videoplayer-validation "$video_stream"
 )
 
@@ -376,24 +384,28 @@ audio_size="$(wc -c < "$audio_pcm" | tr -d '[:space:]')"
 [ $((audio_size % 48000)) -eq 0 ] ||
 	die "PCM smoke-test size is not an exact number of 48,000-byte chunks"
 
-# Exercise the exact unified output topology used by the router renderer. The
-# apad/shortest pair makes video authoritative while tee sends each selected
-# stream to its own transport. asetnsamples follows apad so even the terminal
-# padded PCM block remains exactly 48,000 bytes.
+# Exercise the unified output topology and Fast-profile FFmpeg options used by
+# the router renderer. This runtime capability test deliberately retains the
+# published quarter-second PCM block contract; the application groups the same
+# PCM output into one-second transport chunks. The apad/shortest pair makes
+# video authoritative while tee sends each selected stream to its own transport.
 (
 	exec 3< "$long_audio_sample"
 	run_target \
 		-y -hide_banner -loglevel error -nostats -nostdin \
-		-filter_threads 2 \
+		-filter_threads 4 \
 		-protocol_whitelist file,pipe -threads 4 \
-		-fflags +genpts -err_detect ignore_err -i /proc/self/fd/3 \
+		-fflags +genpts -err_detect ignore_err \
+		-skip_loop_filter:v noref -flags2:v +fast \
+		-i /proc/self/fd/3 \
 		-protocol_whitelist file,pipe -threads 1 \
 		-fflags +genpts -err_detect ignore_err -i /proc/self/fd/3 \
 		-map 0:V:0 -map 1:a:0 -sn -dn -map_metadata -1 \
 		-vf "fps=fps=5:start_time=0,scale=160:90:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 		-af "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=12000:p=1" \
-		-threads:v 2 -threads:a 1 \
-		-c:v mjpeg -q:v 8 -c:a pcm_s16le -shortest -flush_packets 1 \
+		-threads:v 4 -threads:a 1 \
+		-c:v mjpeg -q:v 12 -huffman default \
+		-c:a pcm_s16le -shortest -flush_packets 1 \
 		-f tee \
 		"[select=v:f=mpjpeg:boundary_tag=videoplayer-validation]$tee_video_stream|[select=a:f=s16le:onfail=ignore]$tee_audio_pcm"
 )

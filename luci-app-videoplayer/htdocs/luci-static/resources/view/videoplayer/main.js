@@ -20,6 +20,7 @@ const callStopRenderer   = rpc.declare({
 });
 const PAGE_SIZE = 100;
 const CPU_ROUTER_FPS_OPTIONS = [ 5, 8, 12, 15, 20, 24, 30, 48, 50, 60 ];
+const CPU_ROUTER_PROFILE_OPTIONS = [ 'fast', 'quality' ];
 const CPU_STREAM_ATTEMPT_TIMEOUT_MS = 5000;
 const CPU_STREAM_IDLE_TIMEOUT_MS = 15000;
 const CPU_STREAM_STATUS_INTERVAL_MS = 3000;
@@ -32,9 +33,10 @@ const CPU_TERMINAL_DRAIN_TIMEOUT_MS = 120000;
 const CPU_TERMINAL_FIRST_FRAME_TIMEOUT_MS = 15000;
 const CPU_AUDIO_SAMPLE_RATE = 48000;
 const CPU_AUDIO_CHANNELS = 2;
-const CPU_AUDIO_FRAMES_PER_CHUNK = 12000;
-const CPU_AUDIO_CHUNK_BYTES = 48000;
-const CPU_AUDIO_CHUNK_MS = 250;
+const CPU_AUDIO_FRAMES_PER_CHUNK = 48000;
+const CPU_AUDIO_CHUNK_BYTES = 192000;
+const CPU_AUDIO_CHUNK_MS = 1000;
+const CPU_AUDIO_BATCH_MAX_CHUNKS = 2;
 const CPU_AUDIO_REQUEST_TIMEOUT_MS = 2500;
 const CPU_AUDIO_BUSY_RETRY_MS = CPU_AUDIO_REQUEST_TIMEOUT_MS + 500;
 const CPU_AUDIO_NOT_READY_MIN_MS = 50;
@@ -42,7 +44,7 @@ const CPU_AUDIO_NOT_READY_MAX_MS = CPU_AUDIO_CHUNK_MS;
 const CPU_AUDIO_START_TIMEOUT_MS = 10000;
 const CPU_AUDIO_DRAIN_TIMEOUT_MS = 5000;
 const CPU_AUDIO_INITIAL_LEAD_SECONDS = 0.12;
-const CPU_AUDIO_MAX_LEAD_SECONDS = 0.75;
+const CPU_AUDIO_MAX_LEAD_SECONDS = 2;
 const CPU_MAX_MEDIA_OFFSET_MS = 21605000;
 const CPU_MJPEG_MAX_HEADER_BYTES = 4096;
 const CPU_MJPEG_MAX_FRAME_BYTES = 4 * 1024 * 1024;
@@ -50,6 +52,10 @@ const CPU_AV_SYNC_INTERVAL_MS = 100;
 const CPU_AV_STALL_MIN_MS = 350;
 const CPU_AV_RATE_WINDOW_MS = 500;
 const CPU_AV_HARD_DRIFT_SECONDS = 0.10;
+const CPU_AV_PCM_REBASE_DRIFT_SECONDS = 0.25;
+const CPU_AV_PCM_REBASE_INTERVAL_MS = 500;
+const CPU_AV_HIDDEN_HOLD_MS = 500;
+const CPU_AV_BUFFER_TOLERANCE_SECONDS = 0.25;
 const CPU_AV_MIN_ESTIMATED_RATE = 0.001;
 const CPU_BUFFER_INITIAL_SECONDS = 120;
 const CPU_BUFFER_HIGH_WATER_SECONDS = 180;
@@ -58,6 +64,7 @@ const CPU_BUFFER_HARD_LIMIT_BYTES = 512 * 1024 * 1024;
 const CPU_BUFFER_SEGMENT_RESERVE_BYTES = 20 * 1024 * 1024;
 const CPU_BUFFER_POLL_MS = 100;
 const CPU_BUFFER_COUNTER_INTERVAL_MS = 250;
+const CPU_RENDER_RATE_SAMPLE_MS = 1000;
 const CPU_BUFFER_UNDERRUN_GUARD_SECONDS = 0.25;
 
 function cpuMonotonicNow() {
@@ -132,6 +139,17 @@ function normalizeRenderMode(value) {
 function normalizeRouterFps(value) {
 	value = Number(value);
 	return CPU_ROUTER_FPS_OPTIONS.indexOf(value) !== -1 ? value : 8;
+}
+
+function normalizeRouterProfile(value) {
+	value = String(value || '').toLowerCase();
+	return CPU_ROUTER_PROFILE_OPTIONS.indexOf(value) !== -1 ? value : 'fast';
+}
+
+function normalizeRouterFpsForProfile(value, profile) {
+	const fps = normalizeRouterFps(value);
+
+	return normalizeRouterProfile(profile) === 'fast' && fps > 8 ? 8 : fps;
 }
 
 function errorText(err) {
@@ -265,6 +283,7 @@ return view.extend({
 		const mediaPath = uci.get('videoplayer', 'main', 'media_path') || status.media_path || '/mnt/video';
 		const allowRemote = uci.get('videoplayer', 'main', 'allow_remote');
 		const configuredRenderMode = uci.get('videoplayer', 'main', 'render_mode');
+		const configuredRouterProfile = uci.get('videoplayer', 'main', 'router_profile');
 		const configuredRouterFps = uci.get('videoplayer', 'main', 'router_fps');
 		const localEnabled = enabled !== undefined
 			? flagOn(enabled)
@@ -275,8 +294,14 @@ return view.extend({
 		const renderMode = normalizeRenderMode(
 			configuredRenderMode !== undefined ? configuredRenderMode : status.render_mode
 		);
-		const routerFps = normalizeRouterFps(
-			configuredRouterFps !== undefined ? configuredRouterFps : status.router_fps
+		const routerProfile = normalizeRouterProfile(
+			configuredRouterProfile !== undefined
+				? configuredRouterProfile
+				: status.router_profile
+		);
+		const routerFps = normalizeRouterFpsForProfile(
+			configuredRouterFps !== undefined ? configuredRouterFps : status.router_fps,
+			routerProfile
 		);
 		const rendererAvailable = status.renderer_available === undefined
 			? null
@@ -298,6 +323,7 @@ return view.extend({
 		self._localEnabled = localEnabled;
 		self._allowRemote = remoteAllowed;
 		self._renderMode = renderMode;
+		self._routerProfile = routerProfile;
 		self._routerFps = routerFps;
 		self._rendererAvailable = rendererAvailable;
 		self._canWriteSettings = canWriteSettings;
@@ -307,7 +333,13 @@ return view.extend({
 			enabled: status.enabled !== undefined ? status.enabled : localEnabled,
 			allow_remote: status.allow_remote !== undefined ? status.allow_remote : remoteAllowed,
 			render_mode: normalizeRenderMode(status.render_mode || renderMode),
-			router_fps: normalizeRouterFps(status.router_fps || routerFps),
+			router_profile: normalizeRouterProfile(
+				status.router_profile || routerProfile
+			),
+			router_fps: normalizeRouterFpsForProfile(
+				status.router_fps || routerFps,
+				status.router_profile || routerProfile
+			),
 			renderer_available: status.renderer_available,
 			renderer_reason: status.renderer_reason,
 			media_path_valid: status.media_path_valid,
@@ -471,8 +503,36 @@ return view.extend({
 					E('div', { class: 'cbi-value' }, [
 						E('label', {
 							class: 'cbi-value-title',
+							for: 'vp-router-profile'
+						}, _('Router rendering profile')),
+						E('div', { class: 'cbi-value-field' }, [
+							E('select', {
+								id: 'vp-router-profile',
+								class: 'cbi-input-select',
+								disabled: canWriteSettings ? null : 'disabled',
+								'aria-describedby': 'vp-router-profile-desc',
+								change: ui.createHandlerFn(self, 'handleRouterProfileChange')
+							}, [
+								E('option', {
+									value: 'fast',
+									selected: routerProfile === 'fast' ? 'selected' : null
+								}, _('Fast — 480×270, JPEG q12 (optimized)')),
+								E('option', {
+									value: 'quality',
+									selected: routerProfile === 'quality' ? 'selected' : null
+								}, _('Quality — 640×360, JPEG q8'))
+							]),
+							E('div', {
+								id: 'vp-router-profile-desc',
+								class: 'cbi-value-description'
+							}, _('Fast is the default and is optimized for faster rendering at 480×270 with JPEG q12; it caps output at 8 FPS. Quality uses 640×360 with JPEG q8 and costs substantially more CPU, network bandwidth, and browser memory.'))
+						])
+					]),
+					E('div', { class: 'cbi-value' }, [
+						E('label', {
+							class: 'cbi-value-title',
 							for: 'vp-router-fps'
-						}, _('Router frame rate')),
+						}, _('Router output frame rate')),
 						E('div', { class: 'cbi-value-field' }, [
 							E('select', {
 								id: 'vp-router-fps',
@@ -482,13 +542,16 @@ return view.extend({
 							}, CPU_ROUTER_FPS_OPTIONS.map(function (fps) {
 								return E('option', {
 									value: String(fps),
-									selected: routerFps === fps ? 'selected' : null
+									selected: routerFps === fps ? 'selected' : null,
+									disabled: routerProfile === 'fast' && fps > 8
+										? 'disabled'
+										: null
 								}, _('%d FPS').format(fps));
 							})),
 							E('div', {
 								id: 'vp-router-fps-desc',
 								class: 'cbi-value-description'
-							}, _('Used only for router CPU rendering. This is the FFmpeg target rate for the continuous MJPEG stream; slow routers or networks may drop frames. 8 FPS is the balanced default and 5 reduces load. Higher settings are progressively heavier; 60 FPS is the maximum target, may overload even fast routers, and is not guaranteed.'))
+							}, _('Used only for router CPU rendering. Fast mode permits 5 or 8 FPS and automatically clamps stale higher settings to 8 FPS. Quality mode permits the full list up to 60 FPS. Higher output rates render more JPEGs and can sharply reduce rendering speed.'))
 						])
 					]),
 					E('div', { class: 'cbi-value' }, [
@@ -637,6 +700,14 @@ return view.extend({
 						E('span', {}, [
 							E('strong', {}, _('Played time:')), ' ',
 							E('span', { id: 'vp-cpu-played-time' }, '00:00 / ?')
+						]),
+						E('span', {}, [
+							E('strong', {}, _('Render speed:')), ' ',
+							E('span', { id: 'vp-cpu-render-speed' }, _('Measuring…'))
+						]),
+						E('span', {}, [
+							E('strong', {}, _('Buffered ahead:')), ' ',
+							E('span', { id: 'vp-cpu-buffered-ahead' }, '00:00')
 						])
 					]),
 					E('div', { class: 'vp-toolbar' }, [
@@ -825,6 +896,7 @@ return view.extend({
 
 		/* Defer initial listing until DOM is attached */
 		window.setTimeout(function () {
+			self._syncRouterProfileControls();
 			self._syncRemoteControls();
 			self._updateRendererStatus();
 			self._setPlayerSurface('none');
@@ -849,16 +921,48 @@ return view.extend({
 		return root;
 	},
 
+	handleRouterProfileChange: function () {
+		this._syncRouterProfileControls();
+	},
+
+	_syncRouterProfileControls: function () {
+		const profileEl = document.getElementById('vp-router-profile');
+		const fpsEl = document.getElementById('vp-router-fps');
+		const profile = normalizeRouterProfile(
+			profileEl ? profileEl.value : this._routerProfile
+		);
+
+		if (profileEl)
+			profileEl.value = profile;
+		if (!fpsEl)
+			return;
+		if (fpsEl.options) {
+			for (let i = 0; i < fpsEl.options.length; i++) {
+				const option = fpsEl.options[i];
+
+				option.disabled = profile === 'fast' && Number(option.value) > 8;
+			}
+		}
+		fpsEl.value = String(normalizeRouterFpsForProfile(fpsEl.value, profile));
+	},
+
 	handleSaveSettings: function () {
 		const self = this;
 		const enabledEl = document.getElementById('vp-enabled');
 		const pathEl = document.getElementById('vp-media-path');
 		const remoteEl = document.getElementById('vp-allow-remote');
 		const renderModeEl = document.getElementById('vp-render-mode');
+		const routerProfileEl = document.getElementById('vp-router-profile');
 		const routerFpsEl = document.getElementById('vp-router-fps');
 		let path = (pathEl && pathEl.value || '').trim();
 		const renderMode = normalizeRenderMode(renderModeEl && renderModeEl.value);
-		const routerFps = normalizeRouterFps(routerFpsEl && routerFpsEl.value);
+		const routerProfile = normalizeRouterProfile(
+			routerProfileEl && routerProfileEl.value
+		);
+		const routerFps = normalizeRouterFpsForProfile(
+			routerFpsEl && routerFpsEl.value,
+			routerProfile
+		);
 
 		if (!self._canWriteSettings) {
 			notify(null, _('Settings are read-only for the current LuCI account.'), 5000, 'warning');
@@ -903,8 +1007,13 @@ return view.extend({
 		const modeChanged = renderMode !== normalizeRenderMode(
 			uci.get('videoplayer', 'main', 'render_mode') || self._renderMode
 		);
-		const fpsChanged = routerFps !== normalizeRouterFps(
-			uci.get('videoplayer', 'main', 'router_fps') || self._routerFps
+		const previousRouterProfile = normalizeRouterProfile(
+			uci.get('videoplayer', 'main', 'router_profile') || self._routerProfile
+		);
+		const profileChanged = routerProfile !== previousRouterProfile;
+		const fpsChanged = routerFps !== normalizeRouterFpsForProfile(
+			uci.get('videoplayer', 'main', 'router_fps') || self._routerFps,
+			previousRouterProfile
 		);
 		const localEnabled = !!(enabledEl && enabledEl.checked);
 		const remoteAllowed = !!(remoteEl && remoteEl.checked);
@@ -916,6 +1025,7 @@ return view.extend({
 		uci.set('videoplayer', 'main', 'media_path', path);
 		uci.set('videoplayer', 'main', 'allow_remote', remoteAllowed ? '1' : '0');
 		uci.set('videoplayer', 'main', 'render_mode', renderMode);
+		uci.set('videoplayer', 'main', 'router_profile', routerProfile);
 		uci.set('videoplayer', 'main', 'router_fps', String(routerFps));
 
 		return uci.save().then(function () {
@@ -924,6 +1034,7 @@ return view.extend({
 			self._localEnabled = localEnabled;
 			self._allowRemote = remoteAllowed;
 			self._renderMode = renderMode;
+			self._routerProfile = routerProfile;
 			self._routerFps = routerFps;
 			self._statusLoadError = null;
 			self._status = {
@@ -931,6 +1042,7 @@ return view.extend({
 				enabled: localEnabled,
 				allow_remote: remoteAllowed,
 				render_mode: renderMode,
+				router_profile: routerProfile,
 				router_fps: routerFps,
 				renderer_available: self._rendererAvailable,
 				renderer_reason: self._status && self._status.renderer_reason,
@@ -943,7 +1055,8 @@ return view.extend({
 			self._browseRequestId++;
 			self._browseLoading = true;
 			if ((!localEnabled || pathChanged || modeChanged ||
-			     (fpsChanged && self._currentRenderMode === 'router')) &&
+			     ((profileChanged || fpsChanged) &&
+			      self._currentRenderMode === 'router')) &&
 			    self._currentKind === 'local')
 				self.handleStop();
 			else if (!remoteAllowed && self._currentKind === 'remote')
@@ -951,12 +1064,18 @@ return view.extend({
 
 			return callStatus().then(function (st) {
 				st = st || {};
+				const refreshedProfile = normalizeRouterProfile(
+					st.router_profile || routerProfile
+				);
 				self._status = {
 					media_path: st.media_path || path,
 					enabled: st.enabled !== undefined ? st.enabled : localEnabled,
 					allow_remote: st.allow_remote !== undefined ? st.allow_remote : remoteAllowed,
 					render_mode: normalizeRenderMode(st.render_mode || renderMode),
-					router_fps: normalizeRouterFps(st.router_fps || routerFps),
+					router_profile: refreshedProfile,
+					router_fps: normalizeRouterFpsForProfile(
+						st.router_fps || routerFps, refreshedProfile
+					),
 					renderer_available: st.renderer_available,
 					renderer_reason: st.renderer_reason,
 					media_path_valid: st.media_path_valid,
@@ -966,7 +1085,10 @@ return view.extend({
 				self._localEnabled = st.enabled !== undefined ? flagOn(st.enabled) : localEnabled;
 				self._allowRemote = st.allow_remote !== undefined ? flagOn(st.allow_remote) : remoteAllowed;
 				self._renderMode = normalizeRenderMode(st.render_mode || renderMode);
-				self._routerFps = normalizeRouterFps(st.router_fps || routerFps);
+				self._routerProfile = refreshedProfile;
+				self._routerFps = normalizeRouterFpsForProfile(
+					st.router_fps || routerFps, refreshedProfile
+				);
 				self._rendererAvailable = st.renderer_available === undefined
 					? null
 					: flagOn(st.renderer_available);
@@ -983,8 +1105,11 @@ return view.extend({
 				remoteEl.checked = self._allowRemote;
 			if (renderModeEl)
 				renderModeEl.value = self._renderMode;
+			if (routerProfileEl)
+				routerProfileEl.value = self._routerProfile;
 			if (routerFpsEl)
 				routerFpsEl.value = String(self._routerFps);
+			self._syncRouterProfileControls();
 
 			if (pathChanged) {
 				self._cwd = '';
@@ -993,7 +1118,8 @@ return view.extend({
 
 			self._browseLoading = false;
 			if ((!self._canBrowseLocal() || pathChanged || modeChanged ||
-			     (fpsChanged && self._currentRenderMode === 'router')) &&
+			     ((profileChanged || fpsChanged) &&
+			      self._currentRenderMode === 'router')) &&
 			    self._currentKind === 'local')
 				self.handleStop();
 			else if (!self._allowRemote && self._currentKind === 'remote')
@@ -1388,7 +1514,9 @@ return view.extend({
 			);
 		}
 		else if (this._rendererAvailable === true && this._renderMode === 'router') {
-			statusEl.textContent = _('The FFmpeg output pipeline is available. Router playback uses %d FPS. Synchronized router-decoded PCM is the primary audio path; browser-decoded original audio is the fallback. Expect high CPU usage; video startup failures fall back to full browser decoding.').format(this._routerFps);
+			statusEl.textContent = this._routerProfile === 'quality'
+				? _('The FFmpeg output pipeline is available. Quality profile uses 640×360 JPEG q8 at a target of %d FPS. Synchronized router-decoded PCM is the primary audio path; browser-decoded original audio is the fallback.').format(this._routerFps)
+				: _('The FFmpeg output pipeline is available. Fast profile uses optimized 480×270 JPEG q12 at a target of %d FPS. Synchronized router-decoded PCM is the primary audio path; browser-decoded original audio is the fallback.').format(this._routerFps);
 		}
 		else {
 			statusEl.textContent = '';
@@ -1955,20 +2083,20 @@ return view.extend({
 			return;
 		if (pcm) {
 			this._setNowPlaying(
-				_('Router CPU playback: %s (target %d FPS, PCM audio)')
-					.format(session.label, session.fps)
+				_('Router CPU playback: %s (%s profile, target %d FPS, PCM audio)')
+					.format(session.label, session.profile || 'fast', session.fps)
 			);
 		}
 		else if (browserAudio) {
 			this._setNowPlaying(
-				_('Router CPU playback: %s (target %d FPS, browser audio)')
-					.format(session.label, session.fps)
+				_('Router CPU playback: %s (%s profile, target %d FPS, browser audio)')
+					.format(session.label, session.profile || 'fast', session.fps)
 			);
 		}
 		else {
 			this._setNowPlaying(
-				_('Router CPU playback: %s (target %d FPS, silent)')
-					.format(session.label, session.fps)
+				_('Router CPU playback: %s (%s profile, target %d FPS, silent)')
+					.format(session.label, session.profile || 'fast', session.fps)
 			);
 		}
 	},
@@ -2228,10 +2356,11 @@ return view.extend({
 			const videoTime = this._cpuVideoTarget(session, now);
 
 			if (Number.isFinite(pcmTime) && Number.isFinite(videoTime) &&
-			    Math.abs(pcmTime - videoTime) > CPU_AUDIO_CHUNK_MS / 1000 &&
+			    Math.abs(pcmTime - videoTime) >
+				CPU_AV_PCM_REBASE_DRIFT_SECONDS &&
 			    (!Number.isFinite(session.audio.lastVideoRebaseAt) ||
 			     now - session.audio.lastVideoRebaseAt >=
-				CPU_AUDIO_CHUNK_MS * 2)) {
+				CPU_AV_PCM_REBASE_INTERVAL_MS)) {
 				session.audio.lastVideoRebaseAt = now;
 				this._rebaseCpuAudio(session, session.audio);
 			}
@@ -2262,7 +2391,10 @@ return view.extend({
 			audio.bufferedUntil = 0;
 			audio.batchMaxChunks = Math.max(
 				1,
-				Math.min(8, Number(session.audioBatchMaxChunks) || 1)
+				Math.min(
+					CPU_AUDIO_BATCH_MAX_CHUNKS,
+					Number(session.audioBatchMaxChunks) || 1
+				)
 			);
 			audio.producerEnded = false;
 			audio.bufferPaused = false;
@@ -2738,7 +2870,10 @@ return view.extend({
 			url: url,
 			fetchSequence: Math.max(0, Number(sequence) || 0),
 			batchMaxChunks: Math.max(
-				1, Math.min(8, Number(batchMaxChunks) || 1)
+				1, Math.min(
+					CPU_AUDIO_BATCH_MAX_CHUNKS,
+					Number(batchMaxChunks) || 1
+				)
 			),
 			generation: 0,
 			timer: null,
@@ -2758,7 +2893,10 @@ return view.extend({
 		const generation = drainer ? Number(drainer.generation) || 0 : 0;
 		const sequence = drainer && Number(drainer.fetchSequence);
 		const count = drainer
-			? Math.max(1, Math.min(8, Number(drainer.batchMaxChunks) || 1))
+			? Math.max(1, Math.min(
+				CPU_AUDIO_BATCH_MAX_CHUNKS,
+				Number(drainer.batchMaxChunks) || 1
+			))
 			: 1;
 
 		if (!self._isCurrentCpuSession(session) || !drainer ||
@@ -2849,7 +2987,7 @@ return view.extend({
 			    get('X-Videoplayer-Audio-Format').toLowerCase() !== 's16le' ||
 			    !/^(0|[1-9][0-9]{0,7})$/.test(responseSequenceText) ||
 			    responseSequence !== sequence ||
-			    !/^[1-8]$/.test(responseCountText) || responseCount > count ||
+			    !/^[1-2]$/.test(responseCountText) || responseCount > count ||
 			    Number(get('X-Videoplayer-Audio-Sample-Rate')) !==
 				CPU_AUDIO_SAMPLE_RATE ||
 			    Number(get('X-Videoplayer-Audio-Channels')) !==
@@ -3067,7 +3205,7 @@ return view.extend({
 				this._rebaseCpuAudio(session, session.audio);
 			}
 			else if (!session.audio.videoHeld &&
-			         hiddenFor > CPU_AUDIO_CHUNK_MS * 2) {
+			         hiddenFor > CPU_AV_HIDDEN_HOLD_MS) {
 				this._rebaseCpuAudio(session, session.audio);
 			}
 		}
@@ -3185,14 +3323,64 @@ return view.extend({
 		this._updateCpuBufferedCounters(session, true);
 	},
 
+	_sampleCpuRenderRate: function (session, now) {
+		const rendered = Number(session && session.renderedSeconds);
+		let elapsedMs, mediaDelta, speed;
+
+		if (!session || !session.bufferedPlayback || session.renderCapacityHeld ||
+		    session.producerEnded || !Number.isFinite(rendered) || rendered <= 0)
+			return;
+		now = Number.isFinite(now) ? now : cpuMonotonicNow();
+		if (!Number.isFinite(session.renderRateAnchorAt) ||
+		    !Number.isFinite(session.renderRateAnchorSeconds) ||
+		    rendered < session.renderRateAnchorSeconds) {
+			session.renderRateAnchorAt = now;
+			session.renderRateAnchorSeconds = rendered;
+			return;
+		}
+		elapsedMs = now - session.renderRateAnchorAt;
+		if (!Number.isFinite(elapsedMs) || elapsedMs < CPU_RENDER_RATE_SAMPLE_MS)
+			return;
+		mediaDelta = rendered - session.renderRateAnchorSeconds;
+		speed = mediaDelta * 1000 / elapsedMs;
+		if (Number.isFinite(speed) && speed >= 0) {
+			session.renderSpeed = Number.isFinite(session.renderSpeed)
+				? session.renderSpeed * 0.6 + speed * 0.4
+				: speed;
+			session.renderEffectiveFps = session.renderSpeed * Math.max(
+				1, Number(session.fps) || 1
+			);
+		}
+		session.renderRateAnchorAt = now;
+		session.renderRateAnchorSeconds = rendered;
+	},
+
+	_setCpuRenderCapacityHeld: function (session, held) {
+		if (!session || !session.bufferedPlayback)
+			return;
+		held = !!held && !session.producerEnded;
+		if (!!session.renderCapacityHeld === held)
+			return;
+		session.renderCapacityHeld = held;
+		session.renderRateAnchorAt = cpuMonotonicNow();
+		session.renderRateAnchorSeconds = Math.max(
+			0, Number(session.renderedSeconds) || 0
+		);
+		session.renderSpeed = null;
+		session.renderEffectiveFps = null;
+		this._updateCpuBufferedCounters(session, true);
+	},
+
 	_updateCpuBufferedCounters: function (session, force) {
-		const now = Date.now();
+		const now = cpuMonotonicNow();
 		const rendered = document.getElementById('vp-cpu-rendered-time');
 		const played = document.getElementById('vp-cpu-played-time');
+		const speed = document.getElementById('vp-cpu-render-speed');
+		const ahead = document.getElementById('vp-cpu-buffered-ahead');
 		const total = Number.isFinite(session && session.durationSeconds)
 			? formatCpuDuration(session.durationSeconds)
 			: '?';
-		let renderedSeconds, playedSeconds;
+		let renderedSeconds, playedSeconds, targetFps;
 
 		if (!session || !session.bufferedPlayback)
 			return;
@@ -3200,8 +3388,10 @@ return view.extend({
 		    now - session.counterUpdatedAt < CPU_BUFFER_COUNTER_INTERVAL_MS)
 			return;
 		session.counterUpdatedAt = now;
+		this._sampleCpuRenderRate(session, now);
 		renderedSeconds = Math.max(0, Number(session.renderedSeconds) || 0);
 		playedSeconds = Math.max(0, Number(session.playedSeconds) || 0);
+		targetFps = Math.max(1, Number(session.fps) || 1);
 		if (session.durationSealed && Number.isFinite(session.durationSeconds)) {
 			renderedSeconds = Math.min(renderedSeconds, session.durationSeconds);
 			playedSeconds = Math.min(playedSeconds, session.durationSeconds);
@@ -3210,6 +3400,25 @@ return view.extend({
 			rendered.textContent = formatCpuDuration(renderedSeconds) + ' / ' + total;
 		if (played)
 			played.textContent = formatCpuDuration(playedSeconds) + ' / ' + total;
+		if (speed) {
+			if (session.renderCapacityHeld && !session.producerEnded) {
+				speed.textContent = _('Paused — buffer full (target %d FPS)')
+					.format(targetFps);
+			}
+			else if (Number.isFinite(session.renderSpeed) &&
+			         Number.isFinite(session.renderEffectiveFps)) {
+				speed.textContent = _('%s× real time (%s FPS / %d FPS target)').format(
+					session.renderSpeed.toFixed(2),
+					session.renderEffectiveFps.toFixed(1),
+					targetFps
+				);
+			}
+			else {
+				speed.textContent = _('Measuring… (target %d FPS)').format(targetFps);
+			}
+		}
+		if (ahead)
+			ahead.textContent = formatCpuDuration(this._cpuBufferedAhead(session));
 	},
 
 	_cpuBufferedAvailableUntil: function (session) {
@@ -4209,7 +4418,8 @@ return view.extend({
 		}
 		self._setPlayerSurface('cpu-buffered');
 		self._setNowPlaying(
-			_('Playing buffered router CPU render: %s').format(session.label)
+			_('Playing buffered router CPU render: %s (%s profile, target %d FPS)')
+				.format(session.label, session.profile || 'fast', session.fps)
 		);
 		self._decodeCpuBufferedFrame(session, 0);
 		self._updateCpuAudioPresentation(session);
@@ -4223,7 +4433,7 @@ return view.extend({
 		const browserAudio = session && session.browserAudio;
 		const tolerance = Math.max(
 			1 / Math.max(1, Number(session && session.fps) || 1),
-			CPU_AUDIO_CHUNK_MS / 1000
+			CPU_AV_BUFFER_TOLERANCE_SECONDS
 		);
 		const cleanEof = !!(session && session.producerEnded &&
 			session.videoProducerDrained === true &&
@@ -5115,19 +5325,24 @@ return view.extend({
 			return;
 		}
 		if (session.bufferedPlayback &&
-		    !self._cpuBufferedTransportHasCapacity(session))
+		    !self._cpuBufferedTransportHasCapacity(session)) {
+			self._setCpuRenderCapacityHeld(session, true);
 			reconnectDelay = Math.max(reconnectDelay, CPU_BUFFER_POLL_MS);
+		}
 		if (session.streamReconnectTimer != null)
 			window.clearTimeout(session.streamReconnectTimer);
 		session.streamReconnectTimer = window.setTimeout(function () {
 			session.streamReconnectTimer = null;
 			if (session.bufferedPlayback &&
 			    !self._cpuBufferedTransportHasCapacity(session)) {
+				self._setCpuRenderCapacityHeld(session, true);
 				self._scheduleCpuStreamReconnect(
 					session, CPU_BUFFER_POLL_MS
 				);
 				return;
 			}
+			if (session.bufferedPlayback)
+				self._setCpuRenderCapacityHeld(session, false);
 			self._openCpuStream(session);
 		}, reconnectDelay);
 	},
@@ -5332,9 +5547,12 @@ return view.extend({
 		}
 		if (session.bufferedPlayback &&
 		    !self._cpuBufferedTransportHasCapacity(session)) {
+			self._setCpuRenderCapacityHeld(session, true);
 			self._scheduleCpuStreamReconnect(session, CPU_BUFFER_POLL_MS);
 			return;
 		}
+		if (session.bufferedPlayback)
+			self._setCpuRenderCapacityHeld(session, false);
 		if (!visible || !parent ||
 		    typeof document.createElement !== 'function' ||
 		    typeof parent.insertBefore !== 'function') {
@@ -5899,7 +6117,10 @@ return view.extend({
 			: 0;
 		const sequence = audio && Number(audio.fetchSequence);
 		const count = audio
-			? Math.max(1, Math.min(8, Number(audio.batchMaxChunks) || 1))
+			? Math.max(1, Math.min(
+				CPU_AUDIO_BATCH_MAX_CHUNKS,
+				Number(audio.batchMaxChunks) || 1
+			))
 			: 1;
 
 		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
@@ -6034,7 +6255,7 @@ return view.extend({
 			if (type !== 'application/octet-stream' || format !== 's16le' ||
 			    !/^(0|[1-9][0-9]{0,7})$/.test(sequenceText) ||
 			    responseSequence !== sequence ||
-			    !/^[1-8]$/.test(responseCountText) ||
+			    !/^[1-2]$/.test(responseCountText) ||
 			    responseCount > count ||
 			    sampleRate !== CPU_AUDIO_SAMPLE_RATE ||
 			    channels !== CPU_AUDIO_CHANNELS ||
@@ -6312,6 +6533,9 @@ return view.extend({
 		const segmentSeconds = Number(res.stream_segment_seconds);
 		const hasAudio = flagOn(res.has_audio);
 		const audioUrl = String(res.audio_url || '');
+		const routerProfile = normalizeRouterProfile(
+			res.router_profile || self._routerProfile
+		);
 		const audioMetadataValid = hasAudio &&
 			/^\/cgi-bin\/videoplayer-audio\?token=[0-9a-f]{32}$/.test(audioUrl) &&
 			audioUrl.slice(-32) === token &&
@@ -6418,7 +6642,8 @@ return view.extend({
 			generation: generation,
 			label: label,
 			relPath: String(relPath || ''),
-			fps: normalizeRouterFps(res.router_fps),
+			profile: routerProfile,
+			fps: normalizeRouterFpsForProfile(res.router_fps, routerProfile),
 			active: true,
 			bufferedPlayback: requireBufferedPlayback,
 			bufferState: requireBufferedPlayback ? 'buffering' : null,
@@ -6452,6 +6677,11 @@ return view.extend({
 			lastDecodeFailureSequence: -1,
 			renderedSeconds: 0,
 			playedSeconds: 0,
+			renderRateAnchorAt: null,
+			renderRateAnchorSeconds: null,
+			renderSpeed: null,
+			renderEffectiveFps: null,
+			renderCapacityHeld: false,
 			playClockMediaBase: 0,
 			playClockContextAt: null,
 			playClockWallAt: null,
@@ -6462,7 +6692,10 @@ return view.extend({
 			bufferFallbackPending: false,
 			audioBatchMaxChunks: Math.max(
 				1,
-				Math.min(8, Number(res.audio_batch_max_chunks) || 1)
+				Math.min(
+					CPU_AUDIO_BATCH_MAX_CHUNKS,
+					Number(res.audio_batch_max_chunks) || 1
+				)
 			),
 			firstFrameSeen: false,
 			firstFrameAt: null,
@@ -6523,9 +6756,10 @@ return view.extend({
 		);
 		self._setNowPlaying(
 			session.bufferedPlayback
-				? _('Rendering the initial two-minute buffer on the router: %s')
-					.format(label)
-				: _('Starting router CPU renderer: %s').format(label)
+				? _('Rendering the initial two-minute buffer on the router: %s (%s profile, target %d FPS)')
+					.format(label, session.profile, session.fps)
+				: _('Starting router CPU renderer: %s (%s profile, target %d FPS)')
+					.format(label, session.profile, session.fps)
 		);
 		if (session.bufferedPlayback)
 			self._updateCpuBufferedCounters(session, true);

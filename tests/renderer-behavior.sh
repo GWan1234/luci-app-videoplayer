@@ -57,7 +57,9 @@ mkdir -m 0755 -- "$bin" "$work/media"
 export VIDEOPLAYER_TEST_MEDIA_ROOT="$work/media"
 export VIDEOPLAYER_TEST_RUNTIME="$runtime"
 export VIDEOPLAYER_TEST_ROUTER_FPS=60
-export VIDEOPLAYER_EXPECT_FPS=60
+export VIDEOPLAYER_TEST_ROUTER_PROFILE=fast
+export VIDEOPLAYER_EXPECT_PROFILE=fast
+export VIDEOPLAYER_EXPECT_FPS=8
 VIDEOPLAYER_EXPECT_DECODER_THREADS="$(
 	awk '/^processor[[:space:]]*:/ { count++ } END { print count + 0 }' \
 		/proc/cpuinfo 2>/dev/null
@@ -107,7 +109,7 @@ cleanup() {
 
 	for pid in \
 		"${ring_fill_pid:-}" \
-		"${audio_drain_pid:-}" \
+		"${audio_drain_pid:-}" "${fast_av_drain_pid:-}" \
 		"${worker1:-}" "${ffmpeg1:-}" "${chunker1:-}" \
 		"${worker2:-}" "${ffmpeg2:-}" "${chunker2:-}" \
 		"${finite_worker:-}" "${finite_ffmpeg:-}" \
@@ -119,7 +121,7 @@ cleanup() {
 		"${relay_partial_writer:-}" "${relay_partial_marker_writer:-}" \
 		"${status_touch_race_pid:-}" \
 		"${instant_worker:-}" "${delayed_worker:-}" \
-		"${fast_worker:-}" \
+		"${fast_worker:-}" "${fast_av_worker:-}" "${quality_worker:-}" \
 		"${chunker_failure_worker:-}" "${chunker_failure_ffmpeg:-}" \
 		"${chunker_failure_chunker:-}" "${chunker_failure_cgi:-}" \
 		"${chunker_failure_video_cgi:-}" \
@@ -163,11 +165,15 @@ grep -Fq 'VIDEO_DRAIN_TIMEOUT=120' "$source_helper" ||
 	fail "unexpected terminal MJPEG drain deadline"
 grep -Fq 'HEARTBEAT_TIMEOUT=90' "$source_helper" ||
 	fail "unexpected renderer heartbeat timeout"
-grep -Fq 'AUDIO_RING_SEGMENTS=32' "$source_helper" ||
+grep -Fq 'AUDIO_FRAMES_PER_CHUNK=48000' "$source_helper" ||
+	fail "unexpected PCM chunk duration"
+grep -Fq 'MAX_AUDIO_BYTES=192000' "$source_helper" ||
+	fail "unexpected PCM chunk byte size"
+grep -Fq 'AUDIO_RING_SEGMENTS=8' "$source_helper" ||
 	fail "unexpected PCM ring size"
-grep -Fq 'AUDIO_BATCH_MAX_SEGMENTS=8' "$source_helper" ||
+grep -Fq 'AUDIO_BATCH_MAX_SEGMENTS=2' "$source_helper" ||
 	fail "unexpected PCM batch size"
-grep -Fq 'nice -n 10' "$source_helper" ||
+grep -Fq "nice -n \"\$nice_level\"" "$source_helper" ||
 	fail "renderer no longer yields CPU to LuCI under contention"
 if grep -Eq '(^|[[:space:]"])-(re|readrate[^[:space:]"]*)($|[[:space:]"])' \
 	"$source_helper"; then
@@ -501,7 +507,7 @@ cat > "$rpc_renderer" <<'SH'
 printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" >> "$RPC_RENDERER_CALL_LOG"
 case "${1:-}" in
 	start) printf 'started\n' ;;
-	media-info) printf '125500\t7530\n' ;;
+	media-info) printf '125500\t1004\t8\tfast\n' ;;
 	has-audio) printf '1\n' ;;
 	status-touch) printf 'running\n' ;;
 	reason) : ;;
@@ -538,6 +544,9 @@ case "${2:-}" in
 		;;
 	videoplayer.main.router_fps)
 		printf '%s\n' "${VIDEOPLAYER_TEST_ROUTER_FPS:-8}"
+		;;
+	videoplayer.main.router_profile)
+		printf '%s\n' "${VIDEOPLAYER_TEST_ROUTER_PROFILE:-fast}"
 		;;
 	*)
 		exit 1
@@ -625,7 +634,9 @@ static int count_input_group(int argc, char **argv, const char *threads)
 	int count = 0;
 	int i;
 
-	for (i = 1; i + 9 < argc; ++i)
+	for (i = 1; i + 9 < argc; ++i) {
+		int input_offset = 8;
+
 		if (strcmp(argv[i], "-protocol_whitelist") == 0 &&
 		    strcmp(argv[i + 1], "file,pipe") == 0 &&
 		    strcmp(argv[i + 2], "-threads") == 0 &&
@@ -633,10 +644,19 @@ static int count_input_group(int argc, char **argv, const char *threads)
 		    strcmp(argv[i + 4], "-fflags") == 0 &&
 		    strcmp(argv[i + 5], "+genpts") == 0 &&
 		    strcmp(argv[i + 6], "-err_detect") == 0 &&
-		    strcmp(argv[i + 7], "ignore_err") == 0 &&
-		    strcmp(argv[i + 8], "-i") == 0 &&
-		    strcmp(argv[i + 9], "/proc/self/fd/3") == 0)
-			++count;
+		    strcmp(argv[i + 7], "ignore_err") == 0) {
+			if (i + 13 < argc &&
+			    strcmp(argv[i + 8], "-skip_loop_filter:v") == 0 &&
+			    strcmp(argv[i + 9], "noref") == 0 &&
+			    strcmp(argv[i + 10], "-flags2:v") == 0 &&
+			    strcmp(argv[i + 11], "+fast") == 0)
+				input_offset = 12;
+			if (i + input_offset + 1 < argc &&
+			    strcmp(argv[i + input_offset], "-i") == 0 &&
+			    strcmp(argv[i + input_offset + 1], "/proc/self/fd/3") == 0)
+				++count;
+		}
+	}
 
 	return count;
 }
@@ -769,7 +789,7 @@ static int publish_mjpeg_trailer(int fd, const char *boundary)
 
 static int publish_audio(int fd, unsigned int sequence)
 {
-	unsigned char pcm[48000];
+	unsigned char pcm[192000];
 	size_t written = 0;
 	ssize_t result;
 
@@ -790,7 +810,7 @@ static int publish_audio(int fd, unsigned int sequence)
 
 static int publish_partial_audio(int fd, unsigned int sequence)
 {
-	unsigned char pcm[24000];
+	unsigned char pcm[96000];
 
 	memset(pcm, (int)(sequence & 0xffU), sizeof(pcm));
 	return write_all(fd, pcm, sizeof(pcm));
@@ -916,19 +936,41 @@ int main(int argc, char **argv)
 	const char *expected_decoder_threads;
 	const char *expected_pipeline_threads;
 	const char *expected_fps;
+	const char *expected_profile;
+	const char *expected_huffman;
+	const char *expected_quality;
+	const char *expected_width;
+	const char *expected_height;
 	const char *library_path;
 
 	expected_private_lib = getenv("VIDEOPLAYER_EXPECT_PRIVATE_LIB");
 	expected_decoder_threads = getenv("VIDEOPLAYER_EXPECT_DECODER_THREADS");
 	expected_fps = getenv("VIDEOPLAYER_EXPECT_FPS");
+	expected_profile = getenv("VIDEOPLAYER_EXPECT_PROFILE");
 	if (expected_decoder_threads == NULL ||
 	    (strcmp(expected_decoder_threads, "1") != 0 &&
 	     strcmp(expected_decoder_threads, "2") != 0 &&
 	     strcmp(expected_decoder_threads, "3") != 0 &&
 	     strcmp(expected_decoder_threads, "4") != 0))
 		return 78;
-	expected_pipeline_threads = strcmp(expected_decoder_threads, "1") == 0
-		? "1" : "2";
+	if (expected_profile == NULL || expected_profile[0] == '\0')
+		expected_profile = "fast";
+	if (strcmp(expected_profile, "fast") == 0) {
+		expected_pipeline_threads = expected_decoder_threads;
+		expected_huffman = "default";
+		expected_quality = "12";
+		expected_width = "480";
+		expected_height = "270";
+	} else if (strcmp(expected_profile, "quality") == 0) {
+		expected_pipeline_threads = strcmp(expected_decoder_threads, "1") == 0
+			? "1" : "2";
+		expected_huffman = "optimal";
+		expected_quality = "8";
+		expected_width = "640";
+		expected_height = "360";
+	} else {
+		return 78;
+	}
 	library_path = getenv("LD_LIBRARY_PATH");
 	if (expected_fps == NULL || expected_fps[0] == '\0')
 		expected_fps = "8";
@@ -938,19 +980,18 @@ int main(int argc, char **argv)
 	    parsed_fps == 0 || parsed_fps > 1000)
 		return 78;
 	frame_delay_us = (unsigned int)(1000000UL / parsed_fps);
-	audio_frame_interval = (unsigned int)(parsed_fps / 4UL);
-	if (audio_frame_interval == 0)
-		audio_frame_interval = 1;
+	audio_frame_interval = (unsigned int)parsed_fps;
 	if (snprintf(
 		    expected_video_filter,
 		    sizeof(expected_video_filter),
-		    "fps=fps=%s:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p",
-		    expected_fps) >= (int)sizeof(expected_video_filter))
+		    "fps=fps=%s:start_time=0,scale=%s:%s:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p",
+		    expected_fps, expected_width, expected_height) >=
+	    (int)sizeof(expected_video_filter))
 		return 78;
 	if (snprintf(
 		    expected_audio_filter,
 		    sizeof(expected_audio_filter),
-		    "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=12000:p=1") >=
+		    "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=48000:p=1") >=
 	    (int)sizeof(expected_audio_filter))
 		return 78;
 	if (expected_private_lib != NULL) {
@@ -979,6 +1020,13 @@ int main(int argc, char **argv)
 	if (count_pair(argc, argv, "-h", "muxer=mpjpeg") == 1) {
 		puts("mpjpeg_muxer AVOptions:");
 		puts("  -boundary_tag <string> E.......... Boundary tag");
+		return 0;
+	}
+	if (count_pair(argc, argv, "-h", "encoder=mjpeg") == 1) {
+		puts("mjpeg encoder AVOptions:");
+		puts("  -huffman <int> E.......... Huffman strategy");
+		puts("     default 0 E.......... Default tables");
+		puts("     optimal 1 E.......... Optimal tables");
 		return 0;
 	}
 
@@ -1108,6 +1156,8 @@ int main(int argc, char **argv)
 	if (
 	    count_pair(argc, argv, "-filter_threads", expected_pipeline_threads) != 1 ||
 	    count_pair(argc, argv, "-threads:v", expected_pipeline_threads) != 1 ||
+	    count_pair(argc, argv, "-q:v", expected_quality) != 1 ||
+	    count_pair(argc, argv, "-huffman", expected_huffman) != 1 ||
 	    count_pair(argc, argv, "-i", "/proc/self/fd/3") !=
 		    (audio_output != NULL ? 2 : 1) ||
 	    count_pair(argc, argv, "-map", "0:V:0") != 1 ||
@@ -1127,6 +1177,14 @@ int main(int argc, char **argv)
 	    !output_is_safe(video_output, "/video.pipe") ||
 	    !boundary_matches_output(boundary, video_output))
 		return 64;
+	if (strcmp(expected_profile, "fast") == 0) {
+		if (count_pair(argc, argv, "-skip_loop_filter:v", "noref") != 1 ||
+		    count_pair(argc, argv, "-flags2:v", "+fast") != 1)
+			return 64;
+	} else if (has_arg(argc, argv, "-skip_loop_filter:v") ||
+		   has_arg(argc, argv, "-flags2:v")) {
+		return 64;
+	}
 	if (audio_output == NULL && tee_mode)
 		return 64;
 
@@ -1138,7 +1196,8 @@ int main(int argc, char **argv)
 		marker_is(marker, marker_size, "audio-finite") ||
 		marker_is(marker, marker_size, "video-short-audio-long");
 	instant_video = marker_is(marker, marker_size, "instant-media");
-	fast_producer = marker_is(marker, marker_size, "fast-producer");
+	fast_producer = marker_is(marker, marker_size, "fast-producer") ||
+		marker_is(marker, marker_size, "fast-av-producer");
 	audio_finite = marker_is(marker, marker_size, "audio-finite");
 	audio_runtime_failure =
 		marker_is(marker, marker_size, "audio-runtime-failure");
@@ -1282,13 +1341,14 @@ int main(int argc, char **argv)
 			return 0;
 		}
 		if (finite_video &&
-		    video_sequence >= (audio_finite ||
-					      marker_is(
-						      marker,
-						      marker_size,
-						      "video-short-audio-long")
-					      ? 68U
-					      : 4U)) {
+		    video_sequence >=
+			    (audio_finite ||
+				     marker_is(
+					     marker,
+					     marker_size,
+					     "video-short-audio-long")
+				     ? (unsigned int)((parsed_fps * 113UL + 99UL) / 100UL)
+				     : 4U)) {
 			if (publish_mjpeg_trailer(video_output_fd, boundary) != 0) {
 				if (audio_output_fd >= 0)
 					close(audio_output_fd);
@@ -1340,6 +1400,7 @@ printf 'audio-runtime-failure fixture\n' > "$work/media/audio-runtime.mp4"
 printf 'audio-finite fixture\n' > "$work/media/audio-finite.mp4"
 printf 'finite-media fixture\n' > "$work/media/finite-media.mp4"
 printf 'fast-producer fixture\n' > "$work/media/fast-producer.mp4"
+printf 'fast-av-producer fixture\n' > "$work/media/fast-av-producer.mp4"
 printf 'video-short-audio-long fixture\n' \
 	> "$work/media/video-short-audio-long.mp4"
 printf 'instant-media fixture\n' > "$work/media/instant-media.mp4"
@@ -1354,7 +1415,7 @@ printf 'duration-unknown fixture\n' > "$work/media/duration-unknown.mp4"
 rpc_token=57575757575757575757575757575757
 rpc_start_fields="$(
 	# These harness overrides are invoked indirectly by sourced RPC handlers.
-	# shellcheck disable=SC2034,SC2317,SC2329
+	# shellcheck disable=SC2030,SC2034,SC2317,SC2329
 	(
 		# shellcheck disable=SC1090
 		source "$rpc_harness"
@@ -1371,23 +1432,55 @@ rpc_start_fields="$(
 		json_add_boolean() { printf 'boolean\t%s\t%s\n' "$1" "$2"; }
 		json_dump() { :; }
 		json_error() { printf 'error\t%s\n' "$1"; }
+		# The worker already froze Fast/8 in media-info. A concurrent UCI
+		# change must not relabel the active session as Quality/60.
+		export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
 		cmd_resolve '{}' router
 	)
 )"
 printf '%s\n' "$rpc_start_fields" | grep -Fxq $'int\tduration_ms\t125500' ||
 	fail "start_renderer omitted validated duration_ms"
-printf '%s\n' "$rpc_start_fields" | grep -Fxq $'int\ttotal_frames\t7530' ||
+printf '%s\n' "$rpc_start_fields" | grep -Fxq $'int\ttotal_frames\t1004' ||
 	fail "start_renderer omitted validated total_frames"
 printf '%s\n' "$rpc_start_fields" |
-	grep -Fxq $'int\taudio_batch_max_chunks\t8' ||
+	grep -Fxq $'int\taudio_frames_per_chunk\t48000' ||
+	fail "start_renderer omitted PCM chunk duration"
+printf '%s\n' "$rpc_start_fields" |
+	grep -Fxq $'int\taudio_batch_max_chunks\t2' ||
 	fail "start_renderer omitted PCM batch limit"
 printf '%s\n' "$rpc_start_fields" |
-	grep -Fxq $'int\taudio_ring_chunks\t32' ||
+	grep -Fxq $'int\taudio_ring_chunks\t8' ||
 	fail "start_renderer omitted PCM ring size"
+printf '%s\n' "$rpc_start_fields" | grep -Fxq $'string\trouter_profile\tfast' ||
+	fail "start_renderer omitted effective renderer profile"
+printf '%s\n' "$rpc_start_fields" | grep -Fxq $'int\trouter_fps\t8' ||
+	fail "fast profile did not cap configured 60 FPS to 8 FPS"
+
+rpc_quality_status_fields="$(
+	# These overrides are deliberately isolated from the main lifecycle fixture.
+	# shellcheck disable=SC2030,SC2031,SC2317,SC2329
+	(
+		export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
+		# shellcheck disable=SC1090
+		source "$rpc_harness"
+		PATH="$bin:$PATH"
+		json_init() { :; }
+		json_add_string() { printf 'string\t%s\t%s\n' "$1" "$2"; }
+		json_add_int() { printf 'int\t%s\t%s\n' "$1" "$2"; }
+		json_add_boolean() { printf 'boolean\t%s\t%s\n' "$1" "$2"; }
+		json_dump() { :; }
+		cmd_get_status
+	)
+)"
+printf '%s\n' "$rpc_quality_status_fields" |
+	grep -Fxq $'string\trouter_profile\tquality' ||
+	fail "get_status omitted the quality renderer profile"
+printf '%s\n' "$rpc_quality_status_fields" | grep -Fxq $'int\trouter_fps\t60' ||
+	fail "quality profile did not preserve configured 60 FPS"
 
 rpc_status_fields="$(
 	# These harness overrides are invoked indirectly by the sourced status handler.
-	# shellcheck disable=SC2034,SC2317,SC2329
+	# shellcheck disable=SC2030,SC2031,SC2034,SC2317,SC2329
 	(
 		# shellcheck disable=SC1090
 		source "$rpc_harness"
@@ -1397,6 +1490,7 @@ rpc_status_fields="$(
 		json_add_int() { printf 'int\t%s\t%s\n' "$1" "$2"; }
 		json_dump() { :; }
 		json_error() { printf 'error\t%s\n' "$1"; }
+		export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
 		cmd_renderer_status '{}'
 	)
 )"
@@ -1404,8 +1498,13 @@ printf '%s\n' "$rpc_status_fields" | grep -Fxq $'string\tstate\trunning' ||
 	fail "renderer_status did not return running state"
 printf '%s\n' "$rpc_status_fields" | grep -Fxq $'int\tduration_ms\t125500' ||
 	fail "renderer_status omitted validated duration_ms"
-printf '%s\n' "$rpc_status_fields" | grep -Fxq $'int\ttotal_frames\t7530' ||
+printf '%s\n' "$rpc_status_fields" | grep -Fxq $'int\ttotal_frames\t1004' ||
 	fail "renderer_status omitted validated total_frames"
+printf '%s\n' "$rpc_status_fields" | grep -Fxq $'int\trouter_fps\t8' ||
+	fail "renderer_status omitted frozen renderer FPS"
+printf '%s\n' "$rpc_status_fields" |
+	grep -Fxq $'string\trouter_profile\tfast' ||
+	fail "renderer_status omitted frozen renderer profile"
 grep -Fq $'status-touch\t57575757575757575757575757575757\t' \
 	"$rpc_call_log" || fail "renderer_status did not renew the renderer lease"
 
@@ -1560,19 +1659,19 @@ lines = head.decode("ascii").split("\r\n")
 assert lines[0] == "Status: 200 OK", f"{sys.argv[1]}: {lines[0]}"
 headers = dict(line.split(": ", 1) for line in lines[1:])
 assert headers["Content-Type"] == "application/octet-stream"
-assert headers["Content-Length"] == "48000"
+assert headers["Content-Length"] == "192000"
 assert headers["Accept-Ranges"] == "none"
 assert headers["X-Videoplayer-Audio-Format"] == "s16le"
 assert headers["X-Videoplayer-Audio-Chunk-Count"] == "1"
 assert headers["X-Videoplayer-Audio-Sample-Rate"] == "48000"
 assert headers["X-Videoplayer-Audio-Channels"] == "2"
-assert headers["X-Videoplayer-Audio-Frames"] == "12000"
-assert headers["X-Videoplayer-Audio-Frames-Per-Chunk"] == "12000"
-assert headers["X-Videoplayer-Audio-Total-Frames"] == "12000"
+assert headers["X-Videoplayer-Audio-Frames"] == "48000"
+assert headers["X-Videoplayer-Audio-Frames-Per-Chunk"] == "48000"
+assert headers["X-Videoplayer-Audio-Total-Frames"] == "48000"
 sequence = int(headers["X-Videoplayer-Audio-Sequence"])
 if sys.argv[2] == "GET":
-	assert len(body) == 48000, len(body)
-	assert body == bytes([sequence & 0xff]) * 48000
+	assert len(body) == 192000, len(body)
+	assert body == bytes([sequence & 0xff]) * 192000
 else:
 	assert body == b"", len(body)
 print(sequence)
@@ -1593,17 +1692,17 @@ headers = dict(line.split(": ", 1) for line in lines[1:])
 start = int(sys.argv[3])
 count = int(sys.argv[4])
 assert headers["Content-Type"] == "application/octet-stream"
-assert headers["Content-Length"] == str(count * 48000)
+assert headers["Content-Length"] == str(count * 192000)
 assert headers["X-Videoplayer-Audio-Sequence"] == str(start)
 assert headers["X-Videoplayer-Audio-Chunk-Count"] == str(count)
-assert headers["X-Videoplayer-Audio-Frames"] == "12000"
-assert headers["X-Videoplayer-Audio-Frames-Per-Chunk"] == "12000"
-assert headers["X-Videoplayer-Audio-Total-Frames"] == str(count * 12000)
+assert headers["X-Videoplayer-Audio-Frames"] == "48000"
+assert headers["X-Videoplayer-Audio-Frames-Per-Chunk"] == "48000"
+assert headers["X-Videoplayer-Audio-Total-Frames"] == str(count * 48000)
 if sys.argv[2] == "GET":
-	assert len(body) == count * 48000, len(body)
+	assert len(body) == count * 192000, len(body)
 	for offset in range(count):
-		chunk = body[offset * 48000 : (offset + 1) * 48000]
-		assert chunk == bytes([(start + offset) & 0xff]) * 48000
+		chunk = body[offset * 192000 : (offset + 1) * 192000]
+		assert chunk == bytes([(start + offset) & 0xff]) * 192000
 else:
 	assert body == b"", len(body)
 PY
@@ -1658,7 +1757,7 @@ inspect_audio_ring() {
 	for path in "$runtime/s-$token"/audio-????????.pcm; do
 		[[ -f "$path" && ! -L "$path" ]] || continue
 		size="$(stat -c '%s' -- "$path" 2>/dev/null)" || continue
-		[[ "$size" -eq 48000 ]] ||
+		[[ "$size" -eq 192000 ]] ||
 			fail "audio ring contains a partial segment: $path ($size bytes)"
 		AUDIO_FILE_COUNT=$((AUDIO_FILE_COUNT + 1))
 		AUDIO_TOTAL_BYTES=$((AUDIO_TOTAL_BYTES + size))
@@ -1669,7 +1768,7 @@ inspect_audio_ring() {
 			fail "audio ring contains an unsafe staging file: $path"
 		metadata="$(stat -c '%u:%a:%s' -- "$path" 2>/dev/null)" || continue
 		size="${metadata##*:}"
-		[[ "$size" -ge 0 && "$size" -le 48000 ]] ||
+		[[ "$size" -ge 0 && "$size" -le 192000 ]] ||
 			fail "audio staging file exceeded one segment: $path ($size bytes)"
 		[[ "${metadata%:*}" == 0:600 ]] ||
 			fail "audio staging file has unsafe ownership or mode: $path"
@@ -1678,14 +1777,14 @@ inspect_audio_ring() {
 	done
 	[[ "$AUDIO_STAGED_COUNT" -le 1 ]] ||
 		fail "audio ring contains multiple staging files: $AUDIO_STAGED_COUNT"
-	[[ "$AUDIO_FILE_COUNT" -le 32 ]] ||
+	[[ "$AUDIO_FILE_COUNT" -le 8 ]] ||
 		fail "audio ring exceeded its hard bound: $AUDIO_FILE_COUNT"
 }
 
 assert_audio_storage_bound() {
-	[[ $((AUDIO_FILE_COUNT + AUDIO_STAGED_COUNT)) -le 32 ]] ||
-		fail "audio staging exceeded the 32-slot hard bound"
-	[[ "$AUDIO_TOTAL_BYTES" -le $((32 * 48000)) ]] ||
+	[[ $((AUDIO_FILE_COUNT + AUDIO_STAGED_COUNT)) -le 8 ]] ||
+		fail "audio staging exceeded the eight-slot hard bound"
+	[[ "$AUDIO_TOTAL_BYTES" -le $((8 * 192000)) ]] ||
 		fail "audio storage exceeded its byte bound: $AUDIO_TOTAL_BYTES"
 }
 
@@ -1875,6 +1974,8 @@ chunker_failure=37373737373737373737373737373737
 chunker_terminal_capability=48484848484848484848484848484848
 finite_media=38383838383838383838383838383838
 fast_producer=50505050505050505050505050505050
+quality_producer=51515151515151515151515151515151
+fast_av_producer=52525252525252525252525252525252
 instant_media=39393939393939393939393939393939
 delayed_start=40404040404040404040404040404040
 delayed_capability=41414141414141414141414141414141
@@ -2149,7 +2250,7 @@ assert_eq \
 	"video-only start"
 assert_eq \
 	"$("$helper" media-info "$no_audio")" \
-	$'125500\t7530' \
+	$'125500\t1004\t8\tfast' \
 	"video-only duration metadata"
 assert_eq \
 	"$("$helper" source "$no_audio")" \
@@ -2253,29 +2354,35 @@ mv -- "$work/media/no-audio-extensionless.opened" \
 
 # FFmpeg must be allowed to fill the browser prebuffer faster than wall time.
 # This clock-free fake produces an audio-less stream as quickly as FIFO
-# backpressure permits. Two native-relay responses contain ten media seconds
-# at 60 FPS and must finish in substantially less wall time; the argv validator
+# backpressure permits. Two native-relay responses contain forty media seconds
+# at the fast profile's effective 8 FPS and must finish in substantially less
+# wall time; the argv validator
 # above separately rejects both -re and every -readrate* pacing option.
 assert_eq \
 	"$("$helper" start "$fast_producer" "$work/media/fast-producer.mp4")" \
 	started \
 	"fast producer start"
 fast_worker="$(session_pid "$fast_producer" worker)"
+# Mutating UCI after start must not change this session's 8 FPS timeline or
+# its 160-frame (20 media second) response cap.
+# shellcheck disable=SC2031
+export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
 fast_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
 run_mjpeg_cgi "$fast_producer" 1-1 "$work/fast-producer-1"
 IFS=: read -r fast_parts_1 fast_first_1 fast_last_1 fast_preamble_1 <<< "$(
 	check_mjpeg_response \
-		"$work/fast-producer-1" "$fast_producer" 250 initial
+		"$work/fast-producer-1" "$fast_producer" 100 initial
 )"
 run_mjpeg_cgi "$fast_producer" 1-2 "$work/fast-producer-2"
 IFS=: read -r fast_parts_2 fast_first_2 fast_last_2 fast_preamble_2 <<< "$(
 	check_mjpeg_response \
-		"$work/fast-producer-2" "$fast_producer" 250 reconnect
+		"$work/fast-producer-2" "$fast_producer" 100 reconnect
 )"
 fast_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
 fast_elapsed_ms=$(( (fast_finished_ns - fast_started_ns) / 1000000 ))
-fast_media_ms=$(( (fast_parts_1 + fast_parts_2) * 1000 / 60 ))
+fast_media_ms=$(( (fast_parts_1 + fast_parts_2) * 1000 / 8 ))
 [[ "$fast_preamble_1" -eq 0 && "$fast_preamble_2" -le 8192 &&
+	"$fast_parts_1" -le 160 && "$fast_parts_2" -le 160 &&
    "$fast_first_1" -le "$fast_last_1" &&
    "$fast_first_2" -le "$fast_last_2" &&
    "$fast_first_2" -gt "$fast_last_1" ]] ||
@@ -2285,6 +2392,124 @@ fast_media_ms=$(( (fast_parts_1 + fast_parts_2) * 1000 / 60 ))
 assert_eq "$($helper stop "$fast_producer")" stopped "fast producer stop"
 wait_dead "$fast_worker"
 fast_worker=""
+export VIDEOPLAYER_TEST_ROUTER_PROFILE=fast
+
+# The unified A/V tee must also outrun wall time. Drain two one-second PCM
+# chunks per request while the native relay consumes two 160-frame segments;
+# this catches accidental pacing in either side of the shared producer.
+assert_eq \
+	"$("$helper" start "$fast_av_producer" "$work/media/fast-av-producer.mp4")" \
+	started \
+	"fast A/V producer start"
+fast_av_worker="$(session_pid "$fast_av_producer" worker)"
+fast_av_drain_error="$work/fast-av-drain.error"
+fast_av_drain_stop="$work/fast-av-drain.stop"
+rm -f -- "$fast_av_drain_error" "$fast_av_drain_stop"
+(
+	sequence=0
+	attempts=0
+	IFS='. ' read -r uptime_seconds _ < /proc/uptime
+	deadline=$((uptime_seconds + 20))
+	while [[ ! -e "$fast_av_drain_stop" ]]; do
+		attempts=$((attempts + 1))
+		IFS='. ' read -r uptime_seconds _ < /proc/uptime
+		if [[ "$attempts" -gt 1000 || "$uptime_seconds" -gt "$deadline" ]]; then
+			printf 'fast A/V audio drain exceeded its bounded deadline at %s\n' \
+				"$sequence" > "$fast_av_drain_error"
+			exit 1
+		fi
+		run_audio_batch_cgi \
+			GET "$fast_av_producer" "$sequence" 2 \
+			"$work/fast-av-audio-response"
+		case "$(head -n 1 "$work/fast-av-audio-response" | tr -d '\r')" in
+			'Status: 200 OK')
+				check_audio_batch_response \
+					"$work/fast-av-audio-response" GET "$sequence" 2
+				sequence=$((sequence + 2))
+				;;
+			'Status: 202 Accepted')
+				sleep 0.01
+				;;
+			'Status: 409 Conflict')
+				if grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
+					"$work/fast-av-audio-response"; then
+					printf 'fast A/V audio became unavailable at %s\n' "$sequence" \
+						> "$fast_av_drain_error"
+					exit 1
+				fi
+				sleep 0.01
+				;;
+			*)
+				printf 'unexpected fast A/V audio response at %s\n' "$sequence" \
+					> "$fast_av_drain_error"
+				exit 1
+				;;
+		esac
+	done
+) &
+fast_av_drain_pid=$!
+fast_av_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+run_mjpeg_cgi "$fast_av_producer" 52-1 "$work/fast-av-video-1"
+IFS=: read -r fast_av_parts_1 _ _ _ <<< "$(
+	check_mjpeg_response \
+		"$work/fast-av-video-1" "$fast_av_producer" 32 initial
+)"
+run_mjpeg_cgi "$fast_av_producer" 52-2 "$work/fast-av-video-2"
+IFS=: read -r fast_av_parts_2 _ _ _ <<< "$(
+	check_mjpeg_response \
+		"$work/fast-av-video-2" "$fast_av_producer" 32 reconnect
+)"
+: > "$fast_av_drain_stop"
+wait "$fast_av_drain_pid"
+fast_av_drain_pid=""
+[[ ! -e "$fast_av_drain_error" ]] ||
+	fail "$(< "$fast_av_drain_error")"
+fast_av_finished_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+fast_av_elapsed_ms=$(( (fast_av_finished_ns - fast_av_started_ns) / 1000000 ))
+fast_av_media_ms=$(( (fast_av_parts_1 + fast_av_parts_2) * 1000 / 8 ))
+[[ "$fast_av_parts_1" -le 160 && "$fast_av_parts_2" -le 160 ]] ||
+	fail "fast A/V session ignored its frozen segment frame cap"
+[[ "$fast_av_media_ms" -gt $((fast_av_elapsed_ms * 2)) ]] ||
+	fail "unified A/V pipeline remained wall-clock paced: media=${fast_av_media_ms}ms, wall=${fast_av_elapsed_ms}ms"
+assert_eq \
+	"$("$helper" stop "$fast_av_producer")" \
+	stopped \
+	"fast A/V producer stop"
+wait_dead "$fast_av_worker"
+fast_av_worker=""
+
+# The opt-in quality profile preserves the configured 60 FPS timeline and the
+# legacy 640x360/q8/optimal-Huffman pipeline. The FFmpeg stub rejects any
+# cross-profile option leakage.
+export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
+export VIDEOPLAYER_EXPECT_PROFILE=quality
+export VIDEOPLAYER_EXPECT_FPS=60
+assert_eq \
+	"$("$helper" start "$quality_producer" "$work/media/fast-producer.mp4")" \
+	started \
+	"quality producer start"
+quality_worker="$(session_pid "$quality_producer" worker)"
+assert_eq \
+	"$("$helper" media-info "$quality_producer")" \
+	$'125500\t7530\t60\tquality' \
+	"quality profile preserved configured FPS"
+run_mjpeg_cgi "$quality_producer" 51-1 "$work/quality-producer"
+IFS=: read -r quality_parts quality_first quality_last quality_preamble <<< "$(
+	check_mjpeg_response \
+		"$work/quality-producer" "$quality_producer" 100 initial
+)"
+[[ "$quality_parts" -le 300 && "$quality_preamble" -eq 0 &&
+   "$quality_first" -le "$quality_last" ]] ||
+	fail "quality producer did not use its frozen 300-frame response cap"
+assert_eq \
+	"$("$helper" stop "$quality_producer")" \
+	stopped \
+	"quality producer stop"
+wait_dead "$quality_worker"
+quality_worker=""
+export VIDEOPLAYER_TEST_ROUTER_PROFILE=fast
+export VIDEOPLAYER_EXPECT_PROFILE=fast
+export VIDEOPLAYER_EXPECT_FPS=8
 
 # Unknown container duration is valid but must stay unpublished rather than
 # accepting a metadata key that merely contains a spoofed Duration substring.
@@ -2295,7 +2520,7 @@ assert_eq \
 	"unknown-duration start"
 assert_eq \
 	"$("$helper" media-info "$duration_unknown")" \
-	$'0\t0' \
+	$'0\t0\t8\tfast' \
 	"unknown-duration metadata"
 assert_eq \
 	"$("$helper" stop "$duration_unknown")" \
@@ -2463,8 +2688,8 @@ assert_eq \
 wait_dead "$delayed_worker"
 
 # A short source audio track is padded until the longer video ends. Use a
-# 68-frame (1.13-second) video so its end is not on a 250 ms PCM boundary;
-# asetnsamples after apad must still publish only complete 48,000-byte chunks.
+# A 1.13-second video ends between one-second PCM boundaries; asetnsamples
+# after apad must still publish only complete 192,000-byte chunks.
 assert_eq \
 	"$("$helper" start "$finite_audio" "$work/media/audio-finite.mp4")" \
 	started \
@@ -2481,20 +2706,20 @@ done
 wait "$finite_audio_cgi"
 finite_audio_cgi=""
 check_mjpeg_response \
-	"$work/finite-audio-mjpeg" "$finite_audio" 68 finite >/dev/null
+	"$work/finite-audio-mjpeg" "$finite_audio" 10 finite >/dev/null
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$finite_audio/audio-state")" \
 	ended \
 	"finite-audio final state"
 inspect_audio_ring "$finite_audio"
-assert_eq "$AUDIO_FILE_COUNT" 5 "finite-audio padded chunk count"
+assert_eq "$AUDIO_FILE_COUNT" 2 "finite-audio padded chunk count"
 assert_audio_storage_bound
 assert_eq "$("$helper" has-audio "$finite_audio")" 1 "finite-audio capability"
-run_audio_batch_cgi GET "$finite_audio" 0 8 "$work/audio-batch-response"
-check_audio_batch_response "$work/audio-batch-response" GET 0 5
-run_audio_batch_cgi HEAD "$finite_audio" 0 5 "$work/audio-batch-response"
-check_audio_batch_response "$work/audio-batch-response" HEAD 0 5
-run_audio_batch_cgi GET "$finite_audio" 0 9 "$work/audio-batch-response"
+run_audio_batch_cgi GET "$finite_audio" 0 2 "$work/audio-batch-response"
+check_audio_batch_response "$work/audio-batch-response" GET 0 2
+run_audio_batch_cgi HEAD "$finite_audio" 0 2 "$work/audio-batch-response"
+check_audio_batch_response "$work/audio-batch-response" HEAD 0 2
+run_audio_batch_cgi GET "$finite_audio" 0 3 "$work/audio-batch-response"
 check_status_line "$work/audio-batch-response" "400 Bad Request"
 run_audio_cgi GET "$finite_audio" live "$work/audio-response"
 check_audio_response "$work/audio-response" GET >/dev/null
@@ -2526,14 +2751,14 @@ done
 wait "$long_audio_cgi"
 long_audio_cgi=""
 check_mjpeg_response \
-	"$work/long-audio-mjpeg" "$long_audio" 68 finite >/dev/null
+	"$work/long-audio-mjpeg" "$long_audio" 10 finite >/dev/null
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$long_audio/audio-state")" \
 	ended \
 	"long-audio video-authoritative state"
 wait_dead "$long_audio_ffmpeg"
 inspect_audio_ring "$long_audio"
-assert_eq "$AUDIO_FILE_COUNT" 5 "long-audio truncated chunk count"
+assert_eq "$AUDIO_FILE_COUNT" 2 "long-audio truncated chunk count"
 assert_audio_storage_bound
 case "$("$helper" status "$long_audio")" in
 	running|ended) ;;
@@ -2785,7 +3010,7 @@ assert_eq "$("$helper" start "$token1" "$media")" started "start"
 assert_eq "$("$helper" status "$token1")" running "status after start"
 assert_eq \
 	"$("$helper" media-info "$token1")" \
-	$'125500\t7530' \
+	$'125500\t1004\t8\tfast' \
 	"validated renderer media metadata"
 assert_eq \
 	"$(stat -c '%u:%a' -- "$runtime/s-$token1/media-info")" \
@@ -2852,10 +3077,10 @@ grep -Fq $'X-Videoplayer-Audio-State: busy\r' \
 	fail "busy PCM response omitted its bounded-retry state"
 
 # Drain video while forcing audio-ring saturation. With no browser audio
-# request, the chunker must preserve the first 32 unacknowledged chunks and
+# request, the chunker must preserve the first eight unacknowledged chunks and
 # backpressure the shared producer before reading another PCM block.
-# A PCM chunk represents 250 ms, so the clock-faithful fake needs roughly
-# eight seconds to fill 32 slots. Reconnect bounded MJPEG segments throughout
+# A PCM chunk represents one second, so the clock-faithful fake needs roughly
+# eight seconds to fill eight slots. Reconnect bounded MJPEG segments throughout
 # that interval so the video FIFO cannot become the source of backpressure.
 (
 	for segment in {0..4}; do
@@ -2868,7 +3093,7 @@ ring_fill_pid=$!
 ring_saturated=0
 for _ in {1..240}; do
 	inspect_audio_ring "$token1"
-	[[ "$AUDIO_FILE_COUNT" -eq 32 ]] && ring_saturated=1
+	[[ "$AUDIO_FILE_COUNT" -eq 8 ]] && ring_saturated=1
 	[[ "$ring_saturated" -eq 1 ]] && break
 	sleep 0.05
 done
@@ -2886,9 +3111,9 @@ done
 inspect_audio_ring "$token1"
 hard_bound_count=$((AUDIO_FILE_COUNT + AUDIO_STAGED_COUNT))
 hard_bound_bytes="$AUDIO_TOTAL_BYTES"
-[[ "$hard_bound_count" -le 32 ]] ||
-	fail "saturated audio ring exceeded 32 storage slots: $hard_bound_count"
-[[ "$hard_bound_bytes" -le $((32 * 48000)) ]] ||
+[[ "$hard_bound_count" -le 8 ]] ||
+	fail "saturated audio ring exceeded eight storage slots: $hard_bound_count"
+[[ "$hard_bound_bytes" -le $((8 * 192000)) ]] ||
 	fail "saturated audio ring exceeded its byte bound: $hard_bound_bytes"
 [[ -f "$runtime/s-$token1/audio-00000000.pcm" ]] ||
 	fail "unacknowledged first audio chunk was overwritten"
@@ -2900,17 +3125,17 @@ assert_eq \
 # HEAD is read-only even when it describes a complete future batch. A request
 # beyond the published high-water mark is also non-destructive: validating the
 # entire requested batch must happen before ACK/deletion is committed.
-run_ready_audio_batch_cgi HEAD "$token1" 8 8 "$work/audio-batch-head-8"
-check_audio_batch_response "$work/audio-batch-head-8" HEAD 8 8
-run_ready_audio_batch_cgi GET "$token1" 32 1 "$work/audio-batch-invalid"
+run_ready_audio_batch_cgi HEAD "$token1" 2 2 "$work/audio-batch-head-2"
+check_audio_batch_response "$work/audio-batch-head-2" HEAD 2 2
+run_ready_audio_batch_cgi GET "$token1" 8 1 "$work/audio-batch-invalid"
 check_status_line "$work/audio-batch-invalid" "202 Accepted"
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$token1/audio-ack")" \
 	0 \
 	"non-destructive HEAD and unavailable batch"
 inspect_audio_ring "$token1"
-assert_eq "$AUDIO_FILE_COUNT" 32 "unacknowledged saturated audio ring"
-for sequence in {0..31}; do
+assert_eq "$AUDIO_FILE_COUNT" 8 "unacknowledged saturated audio ring"
+for sequence in {0..7}; do
 	[[ -f "$runtime/s-$token1/audio-$(printf '%08d' "$sequence").pcm" ]] ||
 		fail "audio chunk $sequence disappeared before acknowledgement"
 done
@@ -2918,38 +3143,38 @@ done
 # GET(S) acknowledges only chunks strictly before S. The current response can
 # therefore be retried after a lost HTTP body, while a later valid S releases
 # capacity and lets the same FFmpeg producer resume both tracks.
-run_ready_audio_batch_cgi GET "$token1" 0 8 "$work/audio-batch-get-0"
-check_audio_batch_response "$work/audio-batch-get-0" GET 0 8
-for sequence in {0..7}; do
+run_ready_audio_batch_cgi GET "$token1" 0 2 "$work/audio-batch-get-0"
+check_audio_batch_response "$work/audio-batch-get-0" GET 0 2
+for sequence in {0..1}; do
 	[[ -f "$runtime/s-$token1/audio-$(printf '%08d' "$sequence").pcm" ]] ||
 		fail "current audio batch was deleted before it could be retried"
 done
-run_ready_audio_batch_cgi GET "$token1" 0 8 "$work/audio-batch-retry"
-check_audio_batch_response "$work/audio-batch-retry" GET 0 8
+run_ready_audio_batch_cgi GET "$token1" 0 2 "$work/audio-batch-retry"
+check_audio_batch_response "$work/audio-batch-retry" GET 0 2
 # The full-ring chunker is held by the disposable hook immediately after it
-# read the old ACK=0 snapshot. GET(8) now atomically advances ACK and deletes
-# 0..7. Holding audio.lock before releasing the hook proves both invariants:
+# read the old ACK=0 snapshot. GET(2) now atomically advances ACK and deletes
+# 0..1. Holding audio.lock before releasing the hook proves both invariants:
 # the chunker rechecks ACK after observing the missing oldest file, and its
 # capacity path no longer collides with valid browser requests. The old
 # implementation either reports false corruption or blocks on this lock.
-run_ready_audio_batch_cgi GET "$token1" 8 8 "$work/audio-batch-get-8"
-check_audio_batch_response "$work/audio-batch-get-8" GET 8 8
+run_ready_audio_batch_cgi GET "$token1" 2 2 "$work/audio-batch-get-2"
+check_audio_batch_response "$work/audio-batch-get-2" GET 2 2
 exec 7< "$runtime/s-$token1/audio.lock"
 flock -x 7
 : > "$audio_capacity_race_release"
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$token1/audio-ack")" \
-	8 \
+	2 \
 	"advanced audio acknowledgement"
-for sequence in {0..7}; do
+for sequence in {0..1}; do
 	[[ ! -e "$runtime/s-$token1/audio-$(printf '%08d' "$sequence").pcm" ]] ||
 		fail "acknowledged audio chunk $sequence was not released"
 done
-[[ -f "$runtime/s-$token1/audio-00000008.pcm" ]] ||
+[[ -f "$runtime/s-$token1/audio-00000002.pcm" ]] ||
 	fail "current acknowledged audio batch was not retained for retry"
 audio_unblocked=0
 for _ in {1..100}; do
-	[[ -f "$runtime/s-$token1/audio-00000032.pcm" ]] && audio_unblocked=1
+	[[ -f "$runtime/s-$token1/audio-00000008.pcm" ]] && audio_unblocked=1
 	[[ "$audio_unblocked" -eq 1 ]] && break
 	sleep 0.02
 done
@@ -2964,12 +3189,12 @@ audio_drain_stop="$work/audio-drain.stop"
 audio_drain_error="$work/audio-drain.error"
 rm -f -- "$audio_drain_stop" "$audio_drain_error"
 (
-	sequence=16
+	sequence=4
 	while [[ ! -e "$audio_drain_stop" ]]; do
 		run_ready_audio_batch_cgi \
-			GET "$token1" "$sequence" 8 "$work/audio-drain-response"
+			GET "$token1" "$sequence" 2 "$work/audio-drain-response"
 		case "$(head -c 32 "$work/audio-drain-response")" in
-			'Status: 200 OK'*) sequence=$((sequence + 8)) ;;
+			'Status: 200 OK'*) sequence=$((sequence + 2)) ;;
 			'Status: 202 Accepted'*) sleep 0.02 ;;
 			*)
 				printf '%s\n' \
@@ -2991,7 +3216,7 @@ run_mjpeg_head "$token1" "$work/mjpeg-head"
 check_mjpeg_head "$work/mjpeg-head" "$token1"
 assert_eq "$(< "$heartbeat")" "$before" "MJPEG HEAD heartbeat"
 
-# Keep one stream open long enough to prove that 60 FPS FFmpeg output shares
+# Keep one stream open long enough to prove that continuous FFmpeg output shares
 # one HTTP response. A concurrent viewer must fail fast instead of consuming
 # all of uhttpd's bounded CGI worker slots.
 while [[ "$(date +%s)" -le "$before" ]]; do
@@ -3018,9 +3243,9 @@ wait "$mjpeg_pid"
 IFS=: read -r \
 	mjpeg_parts mjpeg_first mjpeg_last mjpeg_preamble <<< "$(
 		check_mjpeg_response \
-			"$work/mjpeg-response" "$token1" 40 initial
+			"$work/mjpeg-response" "$token1" 12 initial
 	)"
-[[ "$mjpeg_parts" -ge 40 && "$mjpeg_first" -le "$mjpeg_last" ]] ||
+[[ "$mjpeg_parts" -ge 12 && "$mjpeg_first" -le "$mjpeg_last" ]] ||
 	fail "invalid initial MJPEG sequence summary"
 assert_eq "$mjpeg_preamble" 0 "initial MJPEG preamble"
 after="$(< "$heartbeat")"
@@ -3038,9 +3263,9 @@ IFS=: read -r \
 	reconnected_parts reconnected_first reconnected_last \
 	reconnected_preamble <<< "$(
 		check_mjpeg_response \
-			"$work/mjpeg-reconnected" "$token1" 20 reconnect
-	)"
-[[ "$reconnected_parts" -ge 20 &&
+			"$work/mjpeg-reconnected" "$token1" 12 reconnect
+)"
+[[ "$reconnected_parts" -ge 12 &&
    "$reconnected_preamble" -le 8192 &&
    "$reconnected_first" -le "$reconnected_last" ]] ||
 	fail "invalid reconnected MJPEG sequence summary"
@@ -3080,9 +3305,9 @@ IFS=: read -r \
 	after_disconnect_parts after_disconnect_first after_disconnect_last \
 	after_disconnect_preamble <<< "$(
 		check_mjpeg_response \
-			"$work/mjpeg-after-disconnect" "$token1" 20 reconnect
+			"$work/mjpeg-after-disconnect" "$token1" 12 reconnect
 	)"
-[[ "$after_disconnect_parts" -ge 20 &&
+[[ "$after_disconnect_parts" -ge 12 &&
    "$after_disconnect_preamble" -le 8192 &&
    "$after_disconnect_first" -le "$after_disconnect_last" ]] ||
 	fail "invalid post-disconnect MJPEG sequence summary"

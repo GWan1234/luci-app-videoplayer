@@ -163,12 +163,18 @@ ln -s -- "$work/outside.mp4" "$media/out-of-root-link.mp4"
 source "$rpc_harness"
 
 VIDEOPLAYER_TEST_ROUTER_FPS=8
+VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
 uci() {
-	[[ "$#" -eq 3 &&
-	   "$1" == "-q" &&
-	   "$2" == "get" &&
-	   "$3" == "videoplayer.main.router_fps" ]] || return 1
-	printf '%s\n' "$VIDEOPLAYER_TEST_ROUTER_FPS"
+	[[ "$#" -eq 3 && "$1" == "-q" && "$2" == "get" ]] || return 1
+	case "$3" in
+		videoplayer.main.router_fps)
+			printf '%s\n' "$VIDEOPLAYER_TEST_ROUTER_FPS"
+			;;
+		videoplayer.main.router_profile)
+			printf '%s\n' "$VIDEOPLAYER_TEST_ROUTER_PROFILE"
+			;;
+		*) return 1 ;;
+	esac
 }
 
 declare -A seen=()
@@ -248,6 +254,10 @@ case "${1:-}" in
 	has-audio)
 		[ "$#" -eq 2 ] || exit 2
 		printf '1\n'
+		;;
+	media-info)
+		[ "$#" -eq 2 ] || exit 2
+		printf '0\t0\t60\tquality\n'
 		;;
 	source)
 		[ "$#" -eq 2 ] || exit 2
@@ -357,6 +367,11 @@ do
 		"$expected_interval" \
 		"frame interval for $test_router_fps FPS"
 done
+VIDEOPLAYER_TEST_ROUTER_PROFILE=fast
+VIDEOPLAYER_TEST_ROUTER_FPS=60
+assert_eq "$(get_router_fps)" "8" \
+	"fast profile high-FPS clamp"
+VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
 for invalid_router_fps in 31 61; do
 	VIDEOPLAYER_TEST_ROUTER_FPS="$invalid_router_fps"
 	assert_eq "$(get_router_fps)" "8" \
@@ -382,8 +397,13 @@ assert_eq "${json_fields[has_audio]:-}" "1" "router audio flag"
 assert_eq "${json_fields[audio_sample_rate]:-}" "48000" \
 	"router audio sample rate"
 assert_eq "${json_fields[audio_channels]:-}" "2" "router audio channels"
-assert_eq "${json_fields[audio_frames_per_chunk]:-}" "12000" \
+assert_eq "${json_fields[audio_frames_per_chunk]:-}" "48000" \
 	"router audio chunk frames"
+assert_eq "${json_fields[audio_batch_max_chunks]:-}" "2" \
+	"router audio batch size"
+assert_eq "${json_fields[audio_ring_chunks]:-}" "8" \
+	"router audio ring size"
+assert_eq "${json_fields[router_profile]:-}" "quality" "router profile"
 assert_eq "${json_fields[router_fps]:-}" "60" "router FPS"
 assert_eq "${json_fields[frame_interval_ms]:-}" "17" \
 	"router frame interval"

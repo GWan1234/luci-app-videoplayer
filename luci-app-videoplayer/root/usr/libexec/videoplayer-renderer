@@ -41,12 +41,12 @@ MJPEG_SEGMENT_SECONDS=45
 # timeout (45 s ordinary segment + 10 s terminal/header resolution).
 MJPEG_HEADER_WAIT_SECONDS=10
 VIDEO_DRAIN_TIMEOUT=120
-MAX_AUDIO_BYTES=48000
+MAX_AUDIO_BYTES=192000
 AUDIO_SAMPLE_RATE=48000
 AUDIO_CHANNELS=2
-AUDIO_FRAMES_PER_CHUNK=12000
-AUDIO_RING_SEGMENTS=32
-AUDIO_BATCH_MAX_SEGMENTS=8
+AUDIO_FRAMES_PER_CHUNK=48000
+AUDIO_RING_SEGMENTS=8
+AUDIO_BATCH_MAX_SEGMENTS=2
 AUDIO_PROBE_TIMEOUT=5
 FFMPEG_LOG_MAX_BYTES=65536
 FFMPEG_LOG_HEAD_BYTES=16384
@@ -110,12 +110,30 @@ get_render_mode() {
 }
 
 get_router_fps() {
-	local value
+	local value profile="${1:-}"
 
 	value="$(uci -q get videoplayer.main.router_fps 2>/dev/null)" || value=""
 	case "$value" in
-		5|8|12|15|20|24|30|48|50|60) printf '%s\n' "$value" ;;
-		*) printf '8\n' ;;
+		5|8|12|15|20|24|30|48|50|60) ;;
+		*) value=8 ;;
+	esac
+	case "$profile" in
+		fast|quality) ;;
+		*) profile="$(get_router_profile)" ;;
+	esac
+	if [ "$profile" = "fast" ] && [ "$value" -gt 8 ]; then
+		value=8
+	fi
+	printf '%s\n' "$value"
+}
+
+get_router_profile() {
+	local value
+
+	value="$(uci -q get videoplayer.main.router_profile 2>/dev/null)" || value=""
+	case "$value" in
+		quality) printf 'quality\n' ;;
+		*) printf 'fast\n' ;;
 	esac
 }
 
@@ -450,7 +468,7 @@ load_status() {
 }
 
 write_media_info() {
-	local token="$1" duration_ms="$2" total_frames="$3" fps="$4"
+	local token="$1" duration_ms="$2" total_frames="$3" fps="$4" profile="$5"
 	local dir tmp expected_frames
 
 	valid_token "$token" || return 1
@@ -459,6 +477,10 @@ write_media_info() {
 	valid_decimal "$total_frames" 10 || return 1
 	case "$fps" in
 		5|8|12|15|20|24|30|48|50|60) ;;
+		*) return 1 ;;
+	esac
+	case "$profile" in
+		fast|quality) ;;
 		*) return 1 ;;
 	esac
 	if [ "$duration_ms" -eq 0 ]; then
@@ -474,8 +496,9 @@ write_media_info() {
 	rm -f -- "$tmp" || return 1
 	if ! (
 		umask 077
-		printf '%s\n%s\n%s\n%s\n' \
-			"$LAYOUT" "$duration_ms" "$total_frames" "$fps" > "$tmp"
+		printf '%s\n%s\n%s\n%s\n%s\n' \
+			"$LAYOUT" "$duration_ms" "$total_frames" "$fps" \
+			"$profile" > "$tmp"
 	); then
 		rm -f -- "$tmp"
 		return 1
@@ -488,11 +511,13 @@ write_media_info() {
 }
 
 load_media_info() {
-	local token="$1" dir version duration_ms total_frames fps extra
+	local token="$1" dir version duration_ms total_frames fps profile extra
 	local expected_frames
 
 	MEDIA_DURATION_MS=""
 	MEDIA_TOTAL_FRAMES=""
+	MEDIA_FPS=""
+	MEDIA_PROFILE=""
 	valid_token "$token" || return 1
 	dir="$RUNTIME_DIR/s-$token"
 	session_dir_is_safe "$token" || return 1
@@ -514,6 +539,10 @@ load_media_info() {
 		exec 7<&-
 		return 1
 	}
+	IFS= read -r profile <&7 || {
+		exec 7<&-
+		return 1
+	}
 	if IFS= read -r extra <&7; then
 		: "$extra"
 		exec 7<&-
@@ -529,6 +558,10 @@ load_media_info() {
 		5|8|12|15|20|24|30|48|50|60) ;;
 		*) return 1 ;;
 	esac
+	case "$profile" in
+		fast|quality) ;;
+		*) return 1 ;;
+	esac
 	if [ "$duration_ms" -eq 0 ]; then
 		expected_frames=0
 	else
@@ -537,6 +570,8 @@ load_media_info() {
 	[ "$total_frames" -eq "$expected_frames" ] || return 1
 	MEDIA_DURATION_MS="$duration_ms"
 	MEDIA_TOTAL_FRAMES="$total_frames"
+	MEDIA_FPS="$fps"
+	MEDIA_PROFILE="$profile"
 	return 0
 }
 
@@ -872,6 +907,24 @@ probe_selected_ffmpeg() {
 			FFMPEG_PROBE_REASON="$label has no MJPEG encoder"
 			return 1
 		}
+	output="$(
+		invoke_selected_ffmpeg -hide_banner -h encoder=mjpeg 2>/dev/null
+	)" || {
+		FFMPEG_PROBE_REASON="$label MJPEG option probe failed"
+		return 1
+	}
+	printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]*-huffman[[:space:]]' || {
+			FFMPEG_PROBE_REASON="$label has no MJPEG Huffman strategy option"
+			return 1
+		}
+	if ! printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]+default[[:space:]]' ||
+	   ! printf '%s\n' "$output" |
+		grep -Eq '^[[:space:]]+optimal[[:space:]]'; then
+			FFMPEG_PROBE_REASON="$label has no required MJPEG Huffman strategies"
+			return 1
+	fi
 	output="$(invoke_selected_ffmpeg -hide_banner -muxers 2>/dev/null)" || {
 		FFMPEG_PROBE_REASON="$label muxer probe failed"
 		return 1
@@ -1531,11 +1584,15 @@ duration_ms_from_probe_log() {
 }
 
 probe_source_media_info() {
-	local token="$1" fps="$2" dir log duration_ms=0 total_frames=0
+	local token="$1" fps="$2" profile="$3" dir log duration_ms=0 total_frames=0
 
 	valid_token "$token" || return 1
 	case "$fps" in
 		5|8|12|15|20|24|30|48|50|60) ;;
+		*) return 1 ;;
+	esac
+	case "$profile" in
+		fast|quality) ;;
 		*) return 1 ;;
 	esac
 	dir="$RUNTIME_DIR/s-$token"
@@ -1586,7 +1643,8 @@ probe_source_media_info() {
 		total_frames=0
 	fi
 	rm -f -- "$log" 2>/dev/null || :
-	write_media_info "$token" "$duration_ms" "$total_frames" "$fps"
+	write_media_info \
+		"$token" "$duration_ms" "$total_frames" "$fps" "$profile"
 }
 
 probe_source_audio() {
@@ -1779,7 +1837,7 @@ audio_published_high() {
 		unavailable|error) return 1 ;;
 	esac
 	audio_sequence_bounds "$token" || return 1
-	# The chunker publishes only complete 48,000-byte files with an atomic
+	# The chunker publishes only complete 192,000-byte files with an atomic
 	# rename, so even the newest visible sequence is safe to serve.
 	AUDIO_PUBLISHED_HIGH="$AUDIO_HIGHEST"
 	return 0
@@ -1862,7 +1920,7 @@ cmd_audio_chunker() {
 		# process, keeping audio and video on the same producer clock while the
 		# browser owns the long prebuffer. audio-ack is replaced atomically and
 		# the CGI is the sole file deleter, so the chunker does not need to take
-		# audio.lock every 250 ms. That lock is reserved for short CGI responses
+		# audio.lock every media second. That lock is reserved for short CGI responses
 		# and terminal state transitions; competing for it here used to expose a
 		# normal capacity check to LuCI as a fatal HTTP 409.
 		if [ "$sequence" -ge "$AUDIO_RING_SEGMENTS" ]; then
@@ -2171,8 +2229,9 @@ cmd_worker() {
 	local audio_pipe audio_capable=0 audio_running_written=0 audio_finalized=0
 	local audio_failed=0 chunker_launching=0 audio_anchor_open=0
 	local fallback_audio_state=""
-	local audio_standby_open=0 audio_file last_audio router_fps decoder_threads
-	local pipeline_threads
+	local audio_standby_open=0 audio_file last_audio router_fps router_profile
+	local decoder_threads pipeline_threads scale_width scale_height
+	local video_quality video_huffman nice_level
 	local ffmpeg_launching=0
 	local audio_path_metadata audio_standby_metadata
 	local running_written=0 stopping=0 failure_reason=""
@@ -2203,10 +2262,28 @@ cmd_worker() {
 		exec 3<&-
 		exit 1
 	fi
-	router_fps="$(get_router_fps)"
+	router_profile="$(get_router_profile)"
+	router_fps="$(get_router_fps "$router_profile")"
 	decoder_threads="$(renderer_decoder_threads)"
-	pipeline_threads=1
-	[ "$decoder_threads" -gt 1 ] && pipeline_threads=2
+	case "$router_profile" in
+		fast)
+			pipeline_threads="$decoder_threads"
+			scale_width=480
+			scale_height=270
+			video_quality=12
+			video_huffman=default
+			nice_level=5
+			;;
+		quality)
+			pipeline_threads=1
+			[ "$decoder_threads" -gt 1 ] && pipeline_threads=2
+			scale_width=640
+			scale_height=360
+			video_quality=8
+			video_huffman=optimal
+			nice_level=10
+			;;
+	esac
 	dir="$RUNTIME_DIR/s-$token"
 	video_pipe="$dir/video.pipe"
 	boundary="videoplayer-$token"
@@ -2228,7 +2305,7 @@ cmd_worker() {
 		fi
 		rm -f -- "$audio_file" 2>/dev/null || :
 	done
-	if ! probe_source_media_info "$token" "$router_fps"; then
+	if ! probe_source_media_info "$token" "$router_fps" "$router_profile"; then
 		write_status "$token" error "Cannot publish media duration" 2>/dev/null || :
 		exec 3<&-
 		exit 1
@@ -2804,7 +2881,13 @@ cmd_worker() {
 			-protocol_whitelist file,pipe \
 			-threads "$decoder_threads" \
 			-fflags +genpts \
-			-err_detect ignore_err \
+			-err_detect ignore_err
+		if [ "$router_profile" = "fast" ]; then
+			set -- "$@" \
+				-skip_loop_filter:v noref \
+				-flags2:v +fast
+		fi
+		set -- "$@" \
 			-i /proc/self/fd/3 \
 			-protocol_whitelist file,pipe \
 			-threads 1 \
@@ -2816,12 +2899,13 @@ cmd_worker() {
 			-sn \
 			-dn \
 			-map_metadata -1 \
-			-vf "fps=fps=$router_fps:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
+			-vf "fps=fps=$router_fps:start_time=0,scale=${scale_width}:${scale_height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 			-af "aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=${AUDIO_FRAMES_PER_CHUNK}:p=1" \
 			-threads:v "$pipeline_threads" \
 			-threads:a 1 \
 			-c:v mjpeg \
-			-q:v 8 \
+			-q:v "$video_quality" \
+			-huffman "$video_huffman" \
 			-c:a pcm_s16le \
 			-shortest \
 			-flush_packets 1 \
@@ -2832,17 +2916,24 @@ cmd_worker() {
 			-protocol_whitelist file,pipe \
 			-threads "$decoder_threads" \
 			-fflags +genpts \
-			-err_detect ignore_err \
+			-err_detect ignore_err
+		if [ "$router_profile" = "fast" ]; then
+			set -- "$@" \
+				-skip_loop_filter:v noref \
+				-flags2:v +fast
+		fi
+		set -- "$@" \
 			-i /proc/self/fd/3 \
 			-map 0:V:0 \
 			-an \
 			-sn \
 			-dn \
 			-map_metadata -1 \
-			-vf "fps=fps=$router_fps:start_time=0,scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
+			-vf "fps=fps=$router_fps:start_time=0,scale=${scale_width}:${scale_height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
 			-threads:v "$pipeline_threads" \
 			-c:v mjpeg \
-			-q:v 8 \
+			-q:v "$video_quality" \
+			-huffman "$video_huffman" \
 			-flush_packets 1 \
 			-f mpjpeg \
 			-boundary_tag "$boundary" \
@@ -2851,10 +2942,10 @@ cmd_worker() {
 	ffmpeg_launching=1
 	if [ -n "$FFMPEG_LIBRARY_PATH" ]; then
 		LD_LIBRARY_PATH="$FFMPEG_LIBRARY_PATH" \
-			nice -n 10 "$FFMPEG_BIN" "$@" \
+			nice -n "$nice_level" "$FFMPEG_BIN" "$@" \
 			4<&- 5>&- 8<&- 9>&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
 	else
-		nice -n 10 "$FFMPEG_BIN" "$@" \
+		nice -n "$nice_level" "$FFMPEG_BIN" "$@" \
 			4<&- 5>&- 8<&- 9>&- </dev/null >/dev/null 2>"$log_pipe" 7>&- &
 	fi
 	ffmpeg_pid=$!
@@ -3487,7 +3578,9 @@ cmd_media_info() {
 	load_current || return 1
 	[ "$CURRENT_TOKEN" = "$token" ] || return 1
 	load_media_info "$token" || return 1
-	printf '%s\t%s\n' "$MEDIA_DURATION_MS" "$MEDIA_TOTAL_FRAMES"
+	printf '%s\t%s\t%s\t%s\n' \
+		"$MEDIA_DURATION_MS" "$MEDIA_TOTAL_FRAMES" "$MEDIA_FPS" \
+		"$MEDIA_PROFILE"
 }
 
 load_live_source() {
@@ -4342,6 +4435,13 @@ cmd_cgi() {
 		write_mjpeg_headers "$boundary"
 		exit 0
 	fi
+	load_media_info "$CGI_TOKEN" ||
+		http_error "503 Service Unavailable" "Invalid renderer media info"
+	router_fps="$MEDIA_FPS"
+	if ! valid_decimal "$router_fps" 2 ||
+	   [ "$router_fps" -lt 1 ] || [ "$router_fps" -gt 60 ]; then
+		http_error "503 Service Unavailable" "Invalid router frame rate"
+	fi
 
 	ensure_lock_file "$dir/stream.lock" ||
 		http_error "503 Service Unavailable" "Cannot initialize video stream"
@@ -4393,14 +4493,8 @@ cmd_cgi() {
 	}
 	last_check_cs="$started_cs"
 	last_progress_cs="$started_cs"
-	router_fps="$(get_router_fps)"
-	if ! valid_decimal "$router_fps" 2 ||
-	   [ "$router_fps" -lt 1 ] || [ "$router_fps" -gt 60 ]; then
-		exec 5<&-
-		exec 7<&-
-		http_error "503 Service Unavailable" "Invalid router frame rate"
-	fi
-	segment_frame_limit=$((router_fps * 5))
+	segment_frame_limit=$((router_fps * 20))
+	[ "$segment_frame_limit" -le 300 ] || segment_frame_limit=300
 
 	write_mjpeg_headers "$boundary"
 	relay_marker="$dir/video-drain-ready"

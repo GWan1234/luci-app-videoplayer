@@ -6,6 +6,8 @@ config videoplayer 'main'
 	option media_path '/mnt/sda1/videos'
 	option allow_remote '1'
 	option render_mode 'browser'
+	# Fast favors throughput; Quality preserves the 640x360 renderer path.
+	option router_profile 'fast'
 	# Router CPU renderer FPS: 5, 8, 12, 15, 20, 24, 30, 48, 50, or 60
 	option router_fps '8'
 	option max_depth '8'

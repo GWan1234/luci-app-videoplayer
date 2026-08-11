@@ -30,8 +30,9 @@ MAX_SORT_BYTES=1048576
 MAX_PATH_LENGTH=4096
 MAX_REQUEST_BYTES=16384
 RENDERER_HELPER="/usr/libexec/videoplayer-renderer"
-AUDIO_RING_CHUNKS=32
-AUDIO_BATCH_MAX_CHUNKS=8
+AUDIO_FRAMES_PER_CHUNK=48000
+AUDIO_RING_CHUNKS=8
+AUDIO_BATCH_MAX_CHUNKS=2
 MAX_RENDERER_DURATION_MS=21600000
 
 string_has_control() {
@@ -60,10 +61,13 @@ normalize_decimal() {
 }
 
 load_renderer_media_info() {
-	local token="$1" info tab duration_ms total_frames
+	local token="$1" info tab duration_ms remainder total_frames fps profile
+	local expected_frames
 
 	RENDERER_DURATION_MS=""
 	RENDERER_TOTAL_FRAMES=""
+	RENDERER_FPS=""
+	RENDERER_PROFILE=""
 	valid_token "$token" || return 1
 	info="$("$RENDERER_HELPER" media-info "$token" 2>/dev/null)" || return 1
 	tab="$(printf '\t')"
@@ -72,15 +76,38 @@ load_renderer_media_info() {
 		*) return 1 ;;
 	esac
 	duration_ms="${info%%"$tab"*}"
-	total_frames="${info#*"$tab"}"
-	case "$total_frames" in *"$tab"*) return 1 ;; esac
+	remainder="${info#*"$tab"}"
+	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
+	total_frames="${remainder%%"$tab"*}"
+	remainder="${remainder#*"$tab"}"
+	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
+	fps="${remainder%%"$tab"*}"
+	profile="${remainder#*"$tab"}"
+	case "$profile" in *"$tab"*) return 1 ;; esac
 	duration_ms="$(normalize_decimal "$duration_ms" 2>/dev/null)" || return 1
 	total_frames="$(normalize_decimal "$total_frames" 2>/dev/null)" || return 1
+	fps="$(normalize_decimal "$fps" 2>/dev/null)" || return 1
 	[ "${#duration_ms}" -le 10 ] &&
 		[ "$duration_ms" -le "$MAX_RENDERER_DURATION_MS" ] || return 1
 	[ "${#total_frames}" -le 10 ] || return 1
+	case "$fps" in
+		5|8|12|15|20|24|30|48|50|60) ;;
+		*) return 1 ;;
+	esac
+	case "$profile" in
+		fast|quality) ;;
+		*) return 1 ;;
+	esac
+	if [ "$duration_ms" -eq 0 ]; then
+		expected_frames=0
+	else
+		expected_frames=$(((duration_ms * fps + 999) / 1000))
+	fi
+	[ "$total_frames" -eq "$expected_frames" ] || return 1
 	RENDERER_DURATION_MS="$duration_ms"
 	RENDERER_TOTAL_FRAMES="$total_frames"
+	RENDERER_FPS="$fps"
+	RENDERER_PROFILE="$profile"
 	return 0
 }
 
@@ -235,14 +262,32 @@ get_render_mode() {
 	esac
 }
 
-get_router_fps() {
+get_router_profile() {
 	local value
+
+	value="$(uci -q get videoplayer.main.router_profile 2>/dev/null)" || value=""
+	case "$value" in
+		quality) printf 'quality\n' ;;
+		*) printf 'fast\n' ;;
+	esac
+}
+
+get_router_fps() {
+	local value profile="${1:-}"
 
 	value="$(uci -q get videoplayer.main.router_fps 2>/dev/null)" || value=""
 	case "$value" in
-		5|8|12|15|20|24|30|48|50|60) printf '%s\n' "$value" ;;
-		*) printf '8\n' ;;
+		5|8|12|15|20|24|30|48|50|60) ;;
+		*) value=8 ;;
 	esac
+	case "$profile" in
+		fast|quality) ;;
+		*) profile="$(get_router_profile)" ;;
+	esac
+	if [ "$profile" = "fast" ] && [ "$value" -gt 8 ]; then
+		value=8
+	fi
+	printf '%s\n' "$value"
 }
 
 frame_interval_for_fps() {
@@ -660,7 +705,7 @@ normalize_list_args() {
 
 cmd_get_status() {
 	local configured root valid=0 enabled allow_remote exists=0 readable=0
-	local render_mode router_fps renderer_available=0 renderer_reason
+	local render_mode router_fps router_profile renderer_available=0 renderer_reason
 
 	configured="$(get_configured_media_path)"
 	root="$(canonicalize_media_root "$configured" 2>/dev/null)" && valid=1
@@ -668,7 +713,8 @@ cmd_get_status() {
 	allow_remote="$(uci -q get videoplayer.main.allow_remote 2>/dev/null)" || allow_remote=""
 	[ -n "$allow_remote" ] || allow_remote="1"
 	render_mode="$(get_render_mode)"
-	router_fps="$(get_router_fps)"
+	router_profile="$(get_router_profile)"
+	router_fps="$(get_router_fps "$router_profile")"
 	if [ -x "$RENDERER_HELPER" ]; then
 		if renderer_reason="$("$RENDERER_HELPER" probe 2>/dev/null)"; then
 			renderer_available=1
@@ -690,6 +736,7 @@ cmd_get_status() {
 	json_add_boolean "enabled" "$enabled"
 	json_add_boolean "allow_remote" "$([ "$allow_remote" = "1" ] && printf 1 || printf 0)"
 	json_add_string "render_mode" "$render_mode"
+	json_add_string "router_profile" "$router_profile"
 	json_add_int "router_fps" "$router_fps"
 	json_add_boolean "renderer_available" "$renderer_available"
 	if [ "$renderer_available" -eq 0 ]; then
@@ -936,7 +983,7 @@ cmd_resolve() {
 	local raw="$1" requested_mode="${2:-browser}"
 	local rel root path canonical_rel parent depth max_depth token name mime
 	local render_mode renderer_message renderer_result
-	local has_audio=0 router_fps frame_interval duration_ms=0 total_frames=0
+	local has_audio=0 router_fps router_profile frame_interval duration_ms=0 total_frames=0
 
 	[ "$(get_enabled)" = "1" ] || {
 		json_error "video player disabled"
@@ -1033,6 +1080,12 @@ cmd_resolve() {
 		if load_renderer_media_info "$token"; then
 			duration_ms="$RENDERER_DURATION_MS"
 			total_frames="$RENDERER_TOTAL_FRAMES"
+			router_fps="$RENDERER_FPS"
+			router_profile="$RENDERER_PROFILE"
+		else
+			"$RENDERER_HELPER" stop "$token" >/dev/null 2>&1 || :
+			json_error "router CPU renderer returned invalid media info"
+			return
 		fi
 		if [ "$("$RENDERER_HELPER" has-audio "$token" 2>/dev/null)" = "1" ]; then
 			has_audio=1
@@ -1050,7 +1103,6 @@ cmd_resolve() {
 	json_add_int "size" "$FILE_SIZE"
 	json_add_string "render_mode" "$render_mode"
 	if [ "$render_mode" = "router" ]; then
-		router_fps="$(get_router_fps)"
 		frame_interval="$(frame_interval_for_fps "$router_fps")"
 		json_add_string "stream_url" "/cgi-bin/videoplayer-frame?token=$token"
 		json_add_string "stream_type" "mjpeg-stream"
@@ -1067,11 +1119,12 @@ cmd_resolve() {
 			json_add_string "audio_type" "pcm-s16le-chunks"
 			json_add_int "audio_sample_rate" 48000
 			json_add_int "audio_channels" 2
-			json_add_int "audio_frames_per_chunk" 12000
+			json_add_int "audio_frames_per_chunk" "$AUDIO_FRAMES_PER_CHUNK"
 			json_add_int "audio_batch_max_chunks" "$AUDIO_BATCH_MAX_CHUNKS"
 			json_add_int "audio_ring_chunks" "$AUDIO_RING_CHUNKS"
 		fi
 		json_add_boolean "seekable" 0
+		json_add_string "router_profile" "$router_profile"
 		json_add_int "router_fps" "$router_fps"
 		json_add_int "frame_interval_ms" "$frame_interval"
 	else
@@ -1199,7 +1252,8 @@ cmd_resolve_audio() {
 }
 
 cmd_renderer_status() {
-	local raw="$1" state reason="" duration_ms=0 total_frames=0
+	local raw="$1" state reason="" duration_ms=0 total_frames=0 router_fps=0
+	local router_profile=""
 
 	parse_request "$raw" || {
 		json_error "invalid JSON request"
@@ -1228,6 +1282,8 @@ cmd_renderer_status() {
 	if load_renderer_media_info "$REQ_TOKEN"; then
 		duration_ms="$RENDERER_DURATION_MS"
 		total_frames="$RENDERER_TOTAL_FRAMES"
+		router_fps="$RENDERER_FPS"
+		router_profile="$RENDERER_PROFILE"
 	fi
 
 	json_init
@@ -1236,6 +1292,9 @@ cmd_renderer_status() {
 		json_add_int "duration_ms" "$duration_ms"
 		json_add_int "total_frames" "$total_frames"
 	fi
+	[ "$router_fps" -le 0 ] || json_add_int "router_fps" "$router_fps"
+	[ -z "$router_profile" ] || \
+		json_add_string "router_profile" "$router_profile"
 	[ -z "$reason" ] || json_add_string "reason" "$reason"
 	json_dump
 }

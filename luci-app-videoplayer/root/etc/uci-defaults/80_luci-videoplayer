@@ -24,6 +24,7 @@ ensure_option media_path /mnt/video
 ensure_option allow_remote 1
 ensure_option render_mode browser
 ensure_option router_fps 8
+ensure_option router_profile fast
 ensure_option max_depth 8
 
 [ "$changed" -eq 0 ] || uci commit videoplayer
