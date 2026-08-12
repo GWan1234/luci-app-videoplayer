@@ -230,10 +230,6 @@ function notify(title, content, timeout, className) {
 }
 
 return view.extend({
-	handleSaveApply: null,
-	handleSave: null,
-	handleReset: null,
-
 	load: function () {
 		return Promise.all([
 			uci.load('videoplayer'),
@@ -279,29 +275,55 @@ return view.extend({
 				'visibilitychange', self._visibilityHandler
 			);
 
-		const enabled = uci.get('videoplayer', 'main', 'enabled');
-		const mediaPath = uci.get('videoplayer', 'main', 'media_path') || status.media_path || '/mnt/video';
-		const allowRemote = uci.get('videoplayer', 'main', 'allow_remote');
+		const configuredEnabled = uci.get('videoplayer', 'main', 'enabled');
+		const configuredMediaPath = uci.get('videoplayer', 'main', 'media_path');
+		const configuredAllowRemote = uci.get('videoplayer', 'main', 'allow_remote');
 		const configuredRenderMode = uci.get('videoplayer', 'main', 'render_mode');
 		const configuredRouterProfile = uci.get('videoplayer', 'main', 'router_profile');
 		const configuredRouterFps = uci.get('videoplayer', 'main', 'router_fps');
-		const localEnabled = enabled !== undefined
-			? flagOn(enabled)
+		const formMediaPath = configuredMediaPath !== undefined
+			? String(configuredMediaPath)
+			: (status.media_path || '/mnt/video');
+		const formLocalEnabled = configuredEnabled !== undefined
+			? flagOn(configuredEnabled)
 			: (status.enabled !== undefined ? flagOn(status.enabled) : true);
-		const remoteAllowed = allowRemote !== undefined
-			? flagOn(allowRemote)
+		const formRemoteAllowed = configuredAllowRemote !== undefined
+			? flagOn(configuredAllowRemote)
 			: (status.allow_remote !== undefined ? flagOn(status.allow_remote) : true);
-		const renderMode = normalizeRenderMode(
+		const formRenderMode = normalizeRenderMode(
 			configuredRenderMode !== undefined ? configuredRenderMode : status.render_mode
 		);
-		const routerProfile = normalizeRouterProfile(
+		const formRouterProfile = normalizeRouterProfile(
 			configuredRouterProfile !== undefined
 				? configuredRouterProfile
 				: status.router_profile
 		);
-		const routerFps = normalizeRouterFpsForProfile(
+		const formRouterFps = normalizeRouterFpsForProfile(
 			configuredRouterFps !== undefined ? configuredRouterFps : status.router_fps,
-			routerProfile
+			formRouterProfile
+		);
+		/*
+		 * LuCI Save stages UCI changes without activating them. Keep the form on
+		 * those staged values, while the player continues to reflect the active
+		 * configuration reported by the backend until Save & Apply completes.
+		 */
+		const activeLocalEnabled = status.enabled !== undefined
+			? flagOn(status.enabled)
+			: formLocalEnabled;
+		const activeRemoteAllowed = status.allow_remote !== undefined
+			? flagOn(status.allow_remote)
+			: formRemoteAllowed;
+		const activeRenderMode = normalizeRenderMode(
+			status.render_mode !== undefined ? status.render_mode : formRenderMode
+		);
+		const activeRouterProfile = normalizeRouterProfile(
+			status.router_profile !== undefined
+				? status.router_profile
+				: formRouterProfile
+		);
+		const activeRouterFps = normalizeRouterFpsForProfile(
+			status.router_fps !== undefined ? status.router_fps : formRouterFps,
+			activeRouterProfile
 		);
 		const rendererAvailable = status.renderer_available === undefined
 			? null
@@ -320,26 +342,21 @@ return view.extend({
 		self._currentKind = null;
 		self._currentRenderMode = null;
 		self._cpuSession = null;
-		self._localEnabled = localEnabled;
-		self._allowRemote = remoteAllowed;
-		self._renderMode = renderMode;
-		self._routerProfile = routerProfile;
-		self._routerFps = routerFps;
+		self._localEnabled = activeLocalEnabled;
+		self._allowRemote = activeRemoteAllowed;
+		self._renderMode = activeRenderMode;
+		self._routerProfile = activeRouterProfile;
+		self._routerFps = activeRouterFps;
 		self._rendererAvailable = rendererAvailable;
 		self._canWriteSettings = canWriteSettings;
 		self._statusLoadError = statusResult.error || null;
 		self._status = {
-			media_path: status.media_path || mediaPath,
-			enabled: status.enabled !== undefined ? status.enabled : localEnabled,
-			allow_remote: status.allow_remote !== undefined ? status.allow_remote : remoteAllowed,
-			render_mode: normalizeRenderMode(status.render_mode || renderMode),
-			router_profile: normalizeRouterProfile(
-				status.router_profile || routerProfile
-			),
-			router_fps: normalizeRouterFpsForProfile(
-				status.router_fps || routerFps,
-				status.router_profile || routerProfile
-			),
+			media_path: status.media_path || formMediaPath,
+			enabled: status.enabled !== undefined ? status.enabled : activeLocalEnabled,
+			allow_remote: status.allow_remote !== undefined ? status.allow_remote : activeRemoteAllowed,
+			render_mode: activeRenderMode,
+			router_profile: activeRouterProfile,
+			router_fps: activeRouterFps,
 			renderer_available: status.renderer_available,
 			renderer_reason: status.renderer_reason,
 			media_path_valid: status.media_path_valid,
@@ -477,11 +494,11 @@ return view.extend({
 							}, [
 								E('option', {
 									value: 'browser',
-									selected: renderMode === 'browser' ? 'selected' : null
+									selected: formRenderMode === 'browser' ? 'selected' : null
 								}, _('Browser decoding (recommended)')),
 								E('option', {
 									value: 'router',
-									selected: renderMode === 'router' ? 'selected' : null
+									selected: formRenderMode === 'router' ? 'selected' : null
 								}, _('Router CPU rendering (experimental, browser fallback)'))
 							]),
 							E('div', {
@@ -515,11 +532,11 @@ return view.extend({
 							}, [
 								E('option', {
 									value: 'fast',
-									selected: routerProfile === 'fast' ? 'selected' : null
+									selected: formRouterProfile === 'fast' ? 'selected' : null
 								}, _('Fast — 480×270, JPEG q12 (optimized)')),
 								E('option', {
 									value: 'quality',
-									selected: routerProfile === 'quality' ? 'selected' : null
+									selected: formRouterProfile === 'quality' ? 'selected' : null
 								}, _('Quality — 640×360, JPEG q8'))
 							]),
 							E('div', {
@@ -542,8 +559,8 @@ return view.extend({
 							}, CPU_ROUTER_FPS_OPTIONS.map(function (fps) {
 								return E('option', {
 									value: String(fps),
-									selected: routerFps === fps ? 'selected' : null,
-									disabled: routerProfile === 'fast' && fps > 8
+									selected: formRouterFps === fps ? 'selected' : null,
+									disabled: formRouterProfile === 'fast' && fps > 8
 										? 'disabled'
 										: null
 								}, _('%d FPS').format(fps));
@@ -563,7 +580,7 @@ return view.extend({
 							E('input', {
 								id: 'vp-enabled',
 								type: 'checkbox',
-								checked: localEnabled ? 'checked' : null,
+								checked: formLocalEnabled ? 'checked' : null,
 								disabled: canWriteSettings ? null : 'disabled',
 								'aria-describedby': 'vp-enabled-desc'
 							}),
@@ -583,7 +600,7 @@ return view.extend({
 								id: 'vp-media-path',
 								type: 'text',
 								class: 'cbi-input-text vp-wide',
-								value: mediaPath,
+								value: formMediaPath,
 								placeholder: '/mnt/video',
 								required: 'required',
 								readonly: canWriteSettings ? null : 'readonly',
@@ -612,7 +629,7 @@ return view.extend({
 							E('input', {
 								id: 'vp-allow-remote',
 								type: 'checkbox',
-								checked: remoteAllowed ? 'checked' : null,
+								checked: formRemoteAllowed ? 'checked' : null,
 								disabled: canWriteSettings ? null : 'disabled',
 								'aria-describedby': 'vp-allow-remote-desc'
 							}),
@@ -622,19 +639,10 @@ return view.extend({
 							}, _('If disabled, only local files can be played from this page.'))
 						])
 					]),
-					E('div', { class: 'cbi-page-actions' }, [
-						E('button', {
-							id: 'vp-save-settings',
-							type: 'button',
-							class: 'btn cbi-button cbi-button-save',
-							disabled: canWriteSettings ? null : 'disabled',
-							click: ui.createHandlerFn(self, 'handleSaveSettings')
-						}, _('Save settings')),
-						canWriteSettings ? '' : E('span', {
-							class: 'cbi-value-description',
-							role: 'status'
-						}, _('Settings are read-only for the current LuCI account.'))
-					])
+					canWriteSettings ? '' : E('div', {
+						class: 'cbi-value-description',
+						role: 'status'
+					}, _('Settings are read-only for the current LuCI account.'))
 				])
 			]),
 
@@ -752,7 +760,7 @@ return view.extend({
 								type: 'url',
 								class: 'cbi-input-text vp-wide',
 								placeholder: 'https://example.com/video.mp4',
-								disabled: remoteAllowed ? null : 'disabled',
+								disabled: activeRemoteAllowed ? null : 'disabled',
 								'aria-invalid': 'false',
 								'aria-describedby': 'vp-remote-url-desc vp-remote-url-error',
 								keydown: function (ev) {
@@ -779,7 +787,7 @@ return view.extend({
 							id: 'vp-play-remote-btn',
 							type: 'button',
 							class: 'btn cbi-button cbi-button-apply',
-							disabled: remoteAllowed ? null : 'disabled',
+							disabled: activeRemoteAllowed ? null : 'disabled',
 							click: function (ev) {
 								return self.handlePlayRemote(ev);
 							}
@@ -802,7 +810,7 @@ return view.extend({
 							id: 'vp-root-btn',
 							type: 'button',
 							class: 'btn cbi-button',
-							disabled: localEnabled ? null : 'disabled',
+							disabled: activeLocalEnabled ? null : 'disabled',
 							click: function (ev) {
 								ev.preventDefault();
 								return self._browse('', 0, { focusCwd: true });
@@ -812,7 +820,7 @@ return view.extend({
 							id: 'vp-refresh-btn',
 							type: 'button',
 							class: 'btn cbi-button',
-							disabled: localEnabled ? null : 'disabled',
+							disabled: activeLocalEnabled ? null : 'disabled',
 							click: function (ev) {
 								ev.preventDefault();
 								return self._browse(self._cwd, 0, {
@@ -946,7 +954,7 @@ return view.extend({
 		fpsEl.value = String(normalizeRouterFpsForProfile(fpsEl.value, profile));
 	},
 
-	handleSaveSettings: function () {
+	handleSave: function () {
 		const self = this;
 		const enabledEl = document.getElementById('vp-enabled');
 		const pathEl = document.getElementById('vp-media-path');
@@ -998,28 +1006,8 @@ return view.extend({
 		if (pathEl)
 			pathEl.value = path;
 
-		const previousPath = String(
-			uci.get('videoplayer', 'main', 'media_path') ||
-			(self._status && self._status.media_path) ||
-			'/mnt/video'
-		).replace(/\/+$/, '');
-		const pathChanged = path !== previousPath;
-		const modeChanged = renderMode !== normalizeRenderMode(
-			uci.get('videoplayer', 'main', 'render_mode') || self._renderMode
-		);
-		const previousRouterProfile = normalizeRouterProfile(
-			uci.get('videoplayer', 'main', 'router_profile') || self._routerProfile
-		);
-		const profileChanged = routerProfile !== previousRouterProfile;
-		const fpsChanged = routerFps !== normalizeRouterFpsForProfile(
-			uci.get('videoplayer', 'main', 'router_fps') || self._routerFps,
-			previousRouterProfile
-		);
 		const localEnabled = !!(enabledEl && enabledEl.checked);
 		const remoteAllowed = !!(remoteEl && remoteEl.checked);
-		let statusRefreshError = null;
-
-		self._setSaveBusy(true);
 
 		uci.set('videoplayer', 'main', 'enabled', localEnabled ? '1' : '0');
 		uci.set('videoplayer', 'main', 'media_path', path);
@@ -1029,135 +1017,76 @@ return view.extend({
 		uci.set('videoplayer', 'main', 'router_fps', String(routerFps));
 
 		return uci.save().then(function () {
-			return uci.apply();
-		}).then(function () {
-			self._localEnabled = localEnabled;
-			self._allowRemote = remoteAllowed;
-			self._renderMode = renderMode;
-			self._routerProfile = routerProfile;
-			self._routerFps = routerFps;
-			self._statusLoadError = null;
-			self._status = {
-				media_path: path,
-				enabled: localEnabled,
-				allow_remote: remoteAllowed,
-				render_mode: renderMode,
-				router_profile: routerProfile,
-				router_fps: routerFps,
-				renderer_available: self._rendererAvailable,
-				renderer_reason: self._status && self._status.renderer_reason,
-				media_path_valid: undefined,
-				media_path_exists: undefined,
-				media_path_readable: undefined
-			};
-
-			/* Stop stale work as soon as the new UCI values have been applied. */
-			self._browseRequestId++;
-			self._browseLoading = true;
-			if ((!localEnabled || pathChanged || modeChanged ||
-			     ((profileChanged || fpsChanged) &&
-			      self._currentRenderMode === 'router')) &&
-			    self._currentKind === 'local')
-				self.handleStop();
-			else if (!remoteAllowed && self._currentKind === 'remote')
-				self.handleStop();
-
-			return callStatus().then(function (st) {
-				st = st || {};
-				const refreshedProfile = normalizeRouterProfile(
-					st.router_profile || routerProfile
-				);
-				self._status = {
-					media_path: st.media_path || path,
-					enabled: st.enabled !== undefined ? st.enabled : localEnabled,
-					allow_remote: st.allow_remote !== undefined ? st.allow_remote : remoteAllowed,
-					render_mode: normalizeRenderMode(st.render_mode || renderMode),
-					router_profile: refreshedProfile,
-					router_fps: normalizeRouterFpsForProfile(
-						st.router_fps || routerFps, refreshedProfile
-					),
-					renderer_available: st.renderer_available,
-					renderer_reason: st.renderer_reason,
-					media_path_valid: st.media_path_valid,
-					media_path_exists: st.media_path_exists,
-					media_path_readable: st.media_path_readable
-				};
-				self._localEnabled = st.enabled !== undefined ? flagOn(st.enabled) : localEnabled;
-				self._allowRemote = st.allow_remote !== undefined ? flagOn(st.allow_remote) : remoteAllowed;
-				self._renderMode = normalizeRenderMode(st.render_mode || renderMode);
-				self._routerProfile = refreshedProfile;
-				self._routerFps = normalizeRouterFpsForProfile(
-					st.router_fps || routerFps, refreshedProfile
-				);
-				self._rendererAvailable = st.renderer_available === undefined
-					? null
-					: flagOn(st.renderer_available);
-			}, function (err) {
-				statusRefreshError = err;
-				self._statusLoadError = err;
-			});
-		}).then(function () {
-			if (pathEl)
-				pathEl.value = self._status.media_path || path;
-			if (enabledEl)
-				enabledEl.checked = self._localEnabled;
-			if (remoteEl)
-				remoteEl.checked = self._allowRemote;
-			if (renderModeEl)
-				renderModeEl.value = self._renderMode;
-			if (routerProfileEl)
-				routerProfileEl.value = self._routerProfile;
-			if (routerFpsEl)
-				routerFpsEl.value = String(self._routerFps);
-			self._syncRouterProfileControls();
-
-			if (pathChanged) {
-				self._cwd = '';
-				self._offset = 0;
-			}
-
-			self._browseLoading = false;
-			if ((!self._canBrowseLocal() || pathChanged || modeChanged ||
-			     ((profileChanged || fpsChanged) &&
-			      self._currentRenderMode === 'router')) &&
-			    self._currentKind === 'local')
-				self.handleStop();
-			else if (!self._allowRemote && self._currentKind === 'remote')
-				self.handleStop();
-
-			self._syncRemoteControls();
-			self._syncLocalControls();
-
-			const cwd = document.getElementById('videoplayer-cwd');
-			if (cwd)
-				cwd.textContent = self._formatCwdLabel(self._cwd);
-
-			const line = document.getElementById('videoplayer-status-line');
-			if (line)
-				line.textContent = self._mediaStatusText(self._status);
-			self._updateRendererStatus();
-
-			if (statusRefreshError) {
-				notify(null, E('p', {},
-					_('Settings saved, but status refresh failed: %s').format(errorText(statusRefreshError))),
-				7000, 'warning');
-			}
-			else {
-				notify(null, _('Settings saved'), 3000);
-			}
-
-			if (self._canBrowseLocal())
-				return self._browse(pathChanged ? '' : self._cwd, 0, { focusCwd: pathChanged });
-
-			self._renderLocalUnavailable();
-			return Promise.resolve();
-		}).then(function (result) {
-			self._setSaveBusy(false);
-			return result;
+			/* Active player state changes only after LuCI applies and reloads. */
+			return true;
 		}, function (err) {
-			self._setSaveBusy(false);
 			notify(null, E('p', {}, _('Save failed: %s').format(errorText(err))), 7000, 'error');
+			return false;
 		});
+	},
+
+	handleSaveApply: function (ev, mode) {
+		return this.handleSave(ev).then(function (saved) {
+			if (saved !== true)
+				return false;
+
+			/* Use LuCI's native modal, checked apply and rollback protection. */
+			ui.changes.apply(mode == '0');
+			return true;
+		});
+	},
+
+	handleReset: function () {
+		const enabledEl = document.getElementById('vp-enabled');
+		const pathEl = document.getElementById('vp-media-path');
+		const remoteEl = document.getElementById('vp-allow-remote');
+		const renderModeEl = document.getElementById('vp-render-mode');
+		const routerProfileEl = document.getElementById('vp-router-profile');
+		const routerFpsEl = document.getElementById('vp-router-fps');
+		const stagedEnabled = uci.get('videoplayer', 'main', 'enabled');
+		const stagedPath = uci.get('videoplayer', 'main', 'media_path');
+		const stagedAllowRemote = uci.get('videoplayer', 'main', 'allow_remote');
+		const stagedRenderMode = uci.get('videoplayer', 'main', 'render_mode');
+		const stagedRouterProfile = uci.get('videoplayer', 'main', 'router_profile');
+		const stagedRouterFps = uci.get('videoplayer', 'main', 'router_fps');
+		const stagedProfile = normalizeRouterProfile(
+			stagedRouterProfile !== undefined
+				? stagedRouterProfile
+				: ((this._status && this._status.router_profile) || this._routerProfile)
+		);
+		const stagedFps = normalizeRouterFpsForProfile(
+			stagedRouterFps !== undefined
+				? stagedRouterFps
+				: ((this._status && this._status.router_fps) || this._routerFps),
+			stagedProfile
+		);
+
+		if (enabledEl)
+			enabledEl.checked = flagOn(
+				stagedEnabled !== undefined ? stagedEnabled : this._localEnabled
+			);
+		if (pathEl)
+			pathEl.value = stagedPath !== undefined
+				? String(stagedPath)
+				: ((this._status && this._status.media_path) || '/mnt/video');
+		if (remoteEl)
+			remoteEl.checked = flagOn(
+				stagedAllowRemote !== undefined
+					? stagedAllowRemote
+					: this._allowRemote
+			);
+		if (renderModeEl)
+			renderModeEl.value = normalizeRenderMode(
+				stagedRenderMode !== undefined ? stagedRenderMode : this._renderMode
+			);
+		if (routerProfileEl)
+			routerProfileEl.value = stagedProfile;
+		if (routerFpsEl)
+			routerFpsEl.value = String(stagedFps);
+
+		this._clearFieldError(pathEl, 'vp-media-path-error');
+		this._syncRouterProfileControls();
+		return Promise.resolve();
 	},
 
 	handleStop: function () {
@@ -1397,15 +1326,6 @@ return view.extend({
 				button.classList.remove('spinning');
 			self._syncRemoteControls();
 		});
-	},
-
-	_setSaveBusy: function (busy) {
-		const button = document.getElementById('vp-save-settings');
-		if (!button)
-			return;
-
-		button.disabled = !!busy || !this._canWriteSettings;
-		button.setAttribute('aria-busy', busy ? 'true' : 'false');
 	},
 
 	_setFieldError: function (input, errorId, message) {

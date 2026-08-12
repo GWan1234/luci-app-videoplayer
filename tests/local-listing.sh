@@ -48,10 +48,16 @@ acl = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 grant = acl["luci-app-videoplayer"]
 read_methods = grant["read"]["ubus"]["luci.videoplayer"]
 write_methods = grant["write"]["ubus"]["luci.videoplayer"]
+uci_read_methods = set(grant["read"]["ubus"]["uci"])
+uci_write_methods = set(grant["write"]["ubus"]["uci"])
 assert "list_renderer" not in read_methods, read_methods
 assert "list_renderer" in write_methods, write_methods
 assert "resolve_audio" not in read_methods, read_methods
 assert "resolve_audio" in write_methods, write_methods
+assert {"get", "changes", "configs"} <= uci_read_methods, uci_read_methods
+assert {"set", "apply", "confirm", "rollback"} <= uci_write_methods, uci_write_methods
+assert grant["read"]["uci"] == ["videoplayer"], grant["read"]["uci"]
+assert grant["write"]["uci"] == ["videoplayer"], grant["write"]["uci"]
 PY
 
 uppercase=ABCDEFGHIJKLMNOPQRSTUVWXYZ

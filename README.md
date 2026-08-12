@@ -551,6 +551,11 @@ config videoplayer 'main'
 | `router_fps` | Router CPU output frame rate: `5`, `8` (default), `12`, `15`, `20`, `24`, `30`, `48`, `50`, or `60` (maximum); Fast accepts 5 or 8 and clamps stale higher values to 8, while Quality permits the full list |
 | `max_depth` | Maximum traversal depth for nested directories |
 
+The LuCI page uses the standard OpenWrt configuration footer. **Save** stages
+the edited values as pending UCI changes, **Save & Apply** activates them using
+LuCI's normal checked-apply and rollback flow, and **Reset** discards only form
+edits that have not yet been saved.
+
 The `uci-defaults` script is idempotent: it restores a missing section and adds
 only missing options without overwriting user-defined values.
 `/etc/config/videoplayer` is declared as a conffile, so the package manager

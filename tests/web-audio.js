@@ -58,7 +58,10 @@ const view = {
 };
 const ui = {
 	createHandlerFn: () => () => {},
-	addNotification: () => null
+	addNotification: () => null,
+	changes: {
+		apply: () => {}
+	}
 };
 const uci = {
 	load: () => Promise.resolve(),
@@ -70,6 +73,15 @@ const uci = {
 
 const elements = Object.create(null);
 const domNodes = [];
+const renderedElements = Object.create(null);
+
+function fakeElement(tag, attrs, children) {
+	const node = { tag, attrs: attrs || {}, children };
+
+	if (node.attrs.id)
+		renderedElements[node.attrs.id] = node;
+	return node;
+}
 
 function fakeImageElement() {
 	const attributes = Object.create(null);
@@ -213,7 +225,7 @@ const app = new Function(
 	uci,
 	rpc,
 	request,
-	() => ({}),
+	fakeElement,
 	value => value,
 	{}
 );
@@ -4734,27 +4746,31 @@ async function main() {
 	app._playInVideo = originalPlayInVideo;
 	app._startCpuAudioDrainer = originalStartDrainer;
 
-	/* Fast is a persisted rendering profile, not merely descriptive UI. A stale
-	 * high FPS is clamped in the control and again at save time; Quality retains
-	 * 60 FPS, and changing profile invalidates an active router worker. */
+	/* The raw settings controls use LuCI's native Save / Save & Apply / Reset
+	 * footer contract. Save only stages UCI changes; it must not mutate active
+	 * player state or stop a live renderer before LuCI applies and reloads. */
 	const originalUciGet = uci.get;
 	const originalUciSet = uci.set;
-	const originalGetStatusHandler = rpcHandlers.get_status;
-	const originalCanBrowseForProfile = app._canBrowseLocal;
-	const originalRenderUnavailableForProfile = app._renderLocalUnavailable;
-	const originalSyncRemoteForProfile = app._syncRemoteControls;
-	const originalSyncLocalForProfile = app._syncLocalControls;
-	const originalUpdateRendererForProfile = app._updateRendererStatus;
-	const originalSetSaveBusyForProfile = app._setSaveBusy;
+	const originalUciSave = uci.save;
+	const originalUciApply = uci.apply;
+	const originalChangesApply = ui.changes.apply;
 	const originalClearFieldForProfile = app._clearFieldError;
 	const originalHandleStopForProfile = app.handleStop;
-	const savedSettings = {
+	const stagedSettings = {
 		enabled: '1',
 		media_path: '/mnt/video',
 		allow_remote: '1',
 		render_mode: 'router',
 		router_profile: 'fast',
 		router_fps: '60'
+	};
+	const activeSettings = {
+		enabled: '1',
+		media_path: '/mnt/video',
+		allow_remote: '1',
+		render_mode: 'router',
+		router_profile: 'fast',
+		router_fps: '8'
 	};
 	const profileControl = { value: 'fast' };
 	const fpsControl = {
@@ -4765,24 +4781,31 @@ async function main() {
 		}))
 	};
 	elements['vp-enabled'] = { checked: true };
-	elements['vp-media-path'] = { value: '/mnt/video', setAttribute() {} };
+	elements['vp-media-path'] = {
+		value: '/mnt/video',
+		setAttribute() {},
+		focus() {}
+	};
 	elements['vp-allow-remote'] = { checked: true };
 	elements['vp-render-mode'] = { value: 'router' };
 	elements['vp-router-profile'] = profileControl;
 	elements['vp-router-fps'] = fpsControl;
-	uci.get = (config, section, option) => savedSettings[option];
+	uci.get = (config, section, option) => stagedSettings[option];
 	uci.set = (config, section, option, value) => {
-		savedSettings[option] = String(value);
+		stagedSettings[option] = String(value);
 	};
-	rpcHandlers.get_status = () => ({
-		enabled: savedSettings.enabled,
-		media_path: savedSettings.media_path,
-		allow_remote: savedSettings.allow_remote,
-		render_mode: savedSettings.render_mode,
-		router_profile: savedSettings.router_profile,
-		router_fps: savedSettings.router_fps,
-		renderer_available: 1
-	});
+	let uciSaveCalls = 0;
+	let rawUciApplyCalls = 0;
+	const nativeApplyCalls = [];
+	uci.save = () => {
+		uciSaveCalls++;
+		return Promise.resolve();
+	};
+	uci.apply = () => {
+		rawUciApplyCalls++;
+		return Promise.resolve();
+	};
+	ui.changes.apply = checked => nativeApplyCalls.push(checked);
 	app._canWriteSettings = true;
 	app._rendererAvailable = true;
 	app._renderMode = 'router';
@@ -4793,12 +4816,6 @@ async function main() {
 	app._cwd = '';
 	app._currentKind = null;
 	app._currentRenderMode = null;
-	app._canBrowseLocal = () => false;
-	app._renderLocalUnavailable = () => {};
-	app._syncRemoteControls = () => {};
-	app._syncLocalControls = () => {};
-	app._updateRendererStatus = () => {};
-	app._setSaveBusy = () => {};
 	app._clearFieldError = () => {};
 	let profileStops = 0;
 	app.handleStop = function () {
@@ -4813,34 +4830,163 @@ async function main() {
 			.every(option => option.disabled),
 		'fast profile UI did not clamp and disable stale FPS values above 8');
 	fpsControl.value = '60';
-	await app.handleSaveSettings();
-	check(savedSettings.router_profile === 'fast' &&
-		savedSettings.router_fps === '8' && app._routerFps === 8,
+	check(await app.handleSave() === true,
+		'native Save did not report successful UCI staging');
+	check(stagedSettings.router_profile === 'fast' &&
+		stagedSettings.router_fps === '8' && app._routerFps === 8,
 		'fast profile save persisted a stale FPS above its effective cap');
+	check(uciSaveCalls === 1 && rawUciApplyCalls === 0 &&
+		nativeApplyCalls.length === 0 && profileStops === 0,
+		'native Save applied settings or changed active player state');
 	profileControl.value = 'quality';
 	app.handleRouterProfileChange();
 	fpsControl.value = '60';
 	app._currentKind = 'local';
 	app._currentRenderMode = 'router';
-	await app.handleSaveSettings();
-	check(savedSettings.router_profile === 'quality' &&
-		savedSettings.router_fps === '60' && app._routerFps === 60 &&
+	check(await app.handleSaveApply(null, 0) === true,
+		'native checked Save & Apply did not complete staging');
+	check(stagedSettings.router_profile === 'quality' &&
+		stagedSettings.router_fps === '60' && app._routerFps === 8 &&
 		fpsControl.options.every(option => !option.disabled),
 		'quality profile did not retain and expose its 60 FPS target');
-	check(profileStops === 1,
-		'profile change did not stop exactly one active router session');
+	check(uciSaveCalls === 2 && rawUciApplyCalls === 0 &&
+		nativeApplyCalls.length === 1 && nativeApplyCalls[0] === true &&
+		profileStops === 0,
+		'native checked Save & Apply bypassed LuCI or changed active state early');
+	check(await app.handleSaveApply(null, '1') === true &&
+		nativeApplyCalls.length === 2 && nativeApplyCalls[1] === false,
+		'native unchecked apply mode was not preserved');
+
+	/* Reset discards only unsaved DOM edits and restores the current staged
+	 * values. The active profile remains the backend's Fast/8 pair. */
+	elements['vp-enabled'].checked = false;
+	elements['vp-media-path'].value = '/dirty/path';
+	elements['vp-allow-remote'].checked = false;
+	elements['vp-render-mode'].value = 'browser';
+	profileControl.value = 'fast';
+	fpsControl.value = '5';
+	await app.handleReset();
+	check(elements['vp-enabled'].checked === true &&
+		elements['vp-media-path'].value === '/mnt/video' &&
+		elements['vp-allow-remote'].checked === true &&
+		elements['vp-render-mode'].value === 'router' &&
+		profileControl.value === 'quality' && fpsControl.value === '60' &&
+		app._routerProfile === activeSettings.router_profile &&
+		app._routerFps === Number(activeSettings.router_fps),
+		'native Reset did not restore staged controls without changing runtime');
+
+	/* Validation and save failures must never fall through into Apply. */
+	const appliesBeforeInvalid = nativeApplyCalls.length;
+	const savesBeforeInvalid = uciSaveCalls;
+	elements['vp-media-path'].value = 'relative/path';
+	check(await app.handleSaveApply(null, '0') !== true &&
+		nativeApplyCalls.length === appliesBeforeInvalid &&
+		uciSaveCalls === savesBeforeInvalid,
+		'invalid native Save & Apply still staged or applied settings');
+	elements['vp-media-path'].value = '/mnt/video';
+	uci.save = () => {
+		uciSaveCalls++;
+		return Promise.reject(new Error('expected native save failure'));
+	};
+	check(await app.handleSaveApply(null, '0') === false &&
+		nativeApplyCalls.length === appliesBeforeInvalid,
+		'failed native Save still launched Apply');
+	app._canWriteSettings = false;
+	check(await app.handleSaveApply(null, '0') !== true &&
+		nativeApplyCalls.length === appliesBeforeInvalid,
+		'read-only native Save & Apply launched Apply');
+	app._canWriteSettings = true;
+
+	/* A page reload after Save but before Apply receives staged values through
+	 * UCI and active values through get_status. The form must show the former,
+	 * while player controls and its runtime clock continue using the latter. */
+	Object.assign(stagedSettings, {
+		enabled: '0',
+		media_path: '/mnt/staged',
+		allow_remote: '0',
+		render_mode: 'browser',
+		router_profile: 'quality',
+		router_fps: '60'
+	});
+	Object.assign(activeSettings, {
+		enabled: '1',
+		media_path: '/mnt/active',
+		allow_remote: '1',
+		render_mode: 'router',
+		router_profile: 'fast',
+		router_fps: '8'
+	});
+	Object.keys(renderedElements).forEach(key => delete renderedElements[key]);
+	const originalWindowSetTimeoutForRender = window.setTimeout;
+	const originalWindowAddEventListener = window.addEventListener;
+	const originalWindowRemoveEventListener = window.removeEventListener;
+	const originalDocumentAddEventListener = document.addEventListener;
+	const originalDocumentRemoveEventListener = document.removeEventListener;
+	const originalDetachForRender = app._detachCpuSession;
+	const originalStopBestEffortForRender = app._stopRendererBestEffort;
+	const originalClearVideoForRender = app._clearVideoElement;
+	const originalClearBrowserAudioForRender = app._clearCpuBrowserAudioElement;
+	window.setTimeout = () => 0;
+	window.addEventListener = () => {};
+	window.removeEventListener = () => {};
+	document.addEventListener = () => {};
+	document.removeEventListener = () => {};
+	app._detachCpuSession = () => null;
+	app._stopRendererBestEffort = () => {};
+	app._clearVideoElement = () => {};
+	app._clearCpuBrowserAudioElement = () => {};
+	app.render([ null, {
+		status: Object.assign({
+			renderer_available: 1,
+			media_path_valid: 1,
+			media_path_exists: 1,
+			media_path_readable: 1
+		}, activeSettings),
+		error: null
+	} ]);
+	const selectedSetting = id => {
+		const control = renderedElements[id];
+		const option = control && Array.isArray(control.children)
+			? control.children.find(child => child && child.attrs && child.attrs.selected)
+			: null;
+		return option && option.attrs.value;
+	};
+	check(renderedElements['vp-enabled'].attrs.checked == null &&
+		renderedElements['vp-media-path'].attrs.value === '/mnt/staged' &&
+		renderedElements['vp-allow-remote'].attrs.checked == null &&
+		selectedSetting('vp-render-mode') === 'browser' &&
+		selectedSetting('vp-router-profile') === 'quality' &&
+		selectedSetting('vp-router-fps') === '60',
+		'native settings form did not render staged UCI values');
+	check(app._localEnabled === true && app._allowRemote === true &&
+		app._renderMode === 'router' && app._routerProfile === 'fast' &&
+		app._routerFps === 8 && app._status.media_path === '/mnt/active' &&
+		renderedElements['videoplayer-remote-url'].attrs.disabled == null &&
+		renderedElements['vp-root-btn'].attrs.disabled == null,
+		'staged UCI values changed active player state before Apply');
+	window.setTimeout = originalWindowSetTimeoutForRender;
+	window.addEventListener = originalWindowAddEventListener;
+	window.removeEventListener = originalWindowRemoveEventListener;
+	document.addEventListener = originalDocumentAddEventListener;
+	document.removeEventListener = originalDocumentRemoveEventListener;
+	app._detachCpuSession = originalDetachForRender;
+	app._stopRendererBestEffort = originalStopBestEffortForRender;
+	app._clearVideoElement = originalClearVideoForRender;
+	app._clearCpuBrowserAudioElement = originalClearBrowserAudioForRender;
+
+	check(!source.includes('vp-save-settings') &&
+		!source.includes('handleSaveSettings') &&
+		!source.includes('uci.apply()') &&
+		!source.includes("class: 'cbi-page-actions'") &&
+		typeof app.handleSave === 'function' &&
+		typeof app.handleSaveApply === 'function' &&
+		typeof app.handleReset === 'function',
+		'custom save UI remains or native LuCI handlers are incomplete');
 	uci.get = originalUciGet;
 	uci.set = originalUciSet;
-	if (originalGetStatusHandler)
-		rpcHandlers.get_status = originalGetStatusHandler;
-	else
-		delete rpcHandlers.get_status;
-	app._canBrowseLocal = originalCanBrowseForProfile;
-	app._renderLocalUnavailable = originalRenderUnavailableForProfile;
-	app._syncRemoteControls = originalSyncRemoteForProfile;
-	app._syncLocalControls = originalSyncLocalForProfile;
-	app._updateRendererStatus = originalUpdateRendererForProfile;
-	app._setSaveBusy = originalSetSaveBusyForProfile;
+	uci.save = originalUciSave;
+	uci.apply = originalUciApply;
+	ui.changes.apply = originalChangesApply;
 	app._clearFieldError = originalClearFieldForProfile;
 	app.handleStop = originalHandleStopForProfile;
 	delete elements['vp-enabled'];
