@@ -22,13 +22,13 @@ dist/
 └── aarch64_cortex-a53/
     ├── openwrt-25.12.5-r33051-f5dae5ece4/
     │   ├── luci-app-videoplayer-1.2.0.apk
-    │   ├── luci-videoplayer-codec-runtime-6.1.4-r4.apk
+    │   ├── luci-videoplayer-codec-runtime-6.1.4-r5.apk
     │   ├── BUILD_INFO
     │   ├── PACKAGE_SET.json
     │   └── SHA256SUMS
     └── openwrt-24.10.8-r29233-443ec4032a/
         ├── luci-app-videoplayer_1.2.0_all.ipk
-        ├── luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk
+        ├── luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
         ├── BUILD_INFO
         ├── PACKAGE_SET.json
         └── SHA256SUMS
@@ -60,8 +60,8 @@ external libraries are disabled.
 The build enables native software decoders and the components required for
 H.264-to-continuous-MJPEG video output and AAC-to-48 kHz stereo PCM audio
 output. This includes the `mpjpeg`, raw PCM, and `tee` muxers plus the `apad`
-filter used to end both outputs on the video timeline; H.264, HEVC, VC-1,
-MPEG-4, VP8, VP9, AV1, MJPEG, AAC, AC-3, E-AC-3, DTS, FLAC, MP3, Opus,
+filter used to end both outputs on the video timeline; H.263, H.264, HEVC,
+VC-1, MPEG-4, VP8, VP9, AV1, MJPEG, AAC, AC-3, E-AC-3, DTS, FLAC, MP3, Opus,
 ALAC, PCM S16LE, TrueHD, and Vorbis, subject to what FFmpeg 6.1.4 supports.
 It is not a promise
 to decode every existing or future media format, DRM system, encrypted stream,
@@ -80,9 +80,9 @@ Every matrix entry records:
 
 The format-4 `BUILD_INFO` records `renderer_profile=software-cpu-v1`,
 `execution_backend=software-cpu-v1`, and `software_cpu_only=1`. The installer
-requires all three attestation fields and the exact private binary path, so a
-pre-r4 package or incomplete same-version package is repaired rather than
-accepted as a strict CPU runtime.
+requires all three attestation fields and the exact private binary path. A
+pre-r5 package is upgraded, and an incomplete same-version package is repaired
+rather than accepted as a strict CPU runtime.
 
 Multiple OpenWrt targets can share a userspace package ABI. The representative
 SDK target is therefore build provenance, not an installation restriction.

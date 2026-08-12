@@ -13,7 +13,7 @@ RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
 PACKAGE_NAME="luci-videoplayer-codec-runtime"
 CODEC_VERSION="6.1.4"
-CODEC_RELEASE="4"
+CODEC_RELEASE="5"
 TARGET_PACKAGE_VERSION="$CODEC_VERSION-r$CODEC_RELEASE"
 RENDERER_PROFILE="software-cpu-v1"
 EXECUTION_BACKEND="software-cpu-v1"
@@ -767,7 +767,7 @@ done
 
 UNEXPECTED_DECODERS="$(
 	unexpected_codec_aliases "$DECODERS_REPORT" \
-		"h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis"
+		"h263 h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis"
 )"
 [ -z "$UNEXPECTED_DECODERS" ] ||
 	die "The installed private FFmpeg exposes decoder(s) outside the software allowlist: $UNEXPECTED_DECODERS"
@@ -779,7 +779,7 @@ UNEXPECTED_ENCODERS="$(
 	die "The installed private FFmpeg exposes encoder(s) outside the software allowlist: $UNEXPECTED_ENCODERS"
 
 COMPONENTS_OK="1"
-for VIDEO_DECODER in h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg; do
+for VIDEO_DECODER in h263 h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg; do
 	check_component "$DECODERS_REPORT" \
 		"^[[:space:]]*V[^[:space:]]*[[:space:]]+$VIDEO_DECODER([[:space:]]|$)" \
 		"the native $VIDEO_DECODER video decoder" ||
@@ -822,7 +822,7 @@ printf '%s\n' \
 	"Verified hardware accelerators: none" \
 	"Verified private FFmpeg: $PRIVATE_FFMPEG" \
 	"Verified frame-aligned MJPEG relay: $PRIVATE_RELAY" \
-	"Verified video decoders: h264, hevc, vc1, mpeg4, vp8, vp9, av1, mjpeg" \
+	"Verified video decoders: h263, h264, hevc, vc1, mpeg4, vp8, vp9, av1, mjpeg" \
 	"Verified audio decoders: aac, ac3, eac3, alac, dca, flac, mp3, opus, pcm_s16le, truehd, vorbis" \
 	"Verified video pipeline: mjpeg encoder, mpjpeg stream, image2 compatibility, fps, scale, format" \
 	"Verified audio pipeline: pcm_s16le, s16le, tee, aresample, aformat, apad, asetnsamples"

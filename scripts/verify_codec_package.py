@@ -15,7 +15,7 @@ import codec_matrix
 import verify_packages
 
 PACKAGE_NAME = "luci-videoplayer-codec-runtime"
-PACKAGE_VERSION = "6.1.4-r4"
+PACKAGE_VERSION = "6.1.4-r5"
 FFMPEG_PATH = "usr/libexec/videoplayer-ffmpeg/ffmpeg"
 RELAY_PATH = "usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay"
 BUILD_INFO_PATH = "usr/share/luci-videoplayer-codec-runtime/build-info"
@@ -36,6 +36,7 @@ MAX_SCRIPT_BYTES = 32 * 1024
 BUILD_INFO_KEY = re.compile(r"^[a-z][a-z0-9_]*$")
 SOFTWARE_DECODERS = frozenset(
     {
+        "h263",
         "h264",
         "hevc",
         "vc1",

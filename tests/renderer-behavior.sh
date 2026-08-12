@@ -60,6 +60,7 @@ blocked_probe_ready="$work/blocked-probe.ready"
 blocked_probe_release="$work/blocked-probe.release"
 producer_identity_ready="$work/producer-identity.ready"
 producer_identity_release="$work/producer-identity.release"
+identity_unlink_race_hit="$work/identity-unlink-race.hit"
 
 mkdir -m 0755 -- "$bin" "$work/media"
 
@@ -138,6 +139,7 @@ cleanup() {
 		"${finite_media_worker:-}" "${finite_audio_cgi:-}" \
 		"${long_audio_worker:-}" "${long_audio_ffmpeg:-}" \
 		"${long_audio_cgi:-}" \
+		"${identity_worker:-}" "${identity_ffmpeg:-}" \
 		"${terminal_gap_worker:-}" "${terminal_gap_cgi:-}" \
 		"${relay_trailer_writer:-}" "${relay_marker_writer:-}" \
 		"${relay_partial_writer:-}" "${relay_partial_marker_writer:-}" \
@@ -284,6 +286,11 @@ fi' \
 if [ "${VIDEOPLAYER_TEST_STOP_FAILURE:-0}" = "1" ]; then\
 \treturn 1\
 fi' \
+	-e '/^[[:space:]]*if load_worker_identity "\$token" ffmpeg; then$/i\
+if [ "${VIDEOPLAYER_TEST_IDENTITY_UNLINK_RACE:-0}" = "1" ]; then\
+\trm -f -- "$RUNTIME_DIR/s-$token/ffmpeg"\
+\t: > "$VIDEOPLAYER_TEST_IDENTITY_UNLINK_RACE_HIT"\
+fi' \
 	-e '/^[[:space:]]*# The maintenance marker is now the durable start gate\.$/a\
 if [ "${VIDEOPLAYER_TEST_MAINTENANCE_PAUSE:-0}" = "1" ]; then\
 \t: > "$VIDEOPLAYER_TEST_MAINTENANCE_READY"\
@@ -339,6 +346,8 @@ fi
 # production argv contract; an unsafe path, mode, owner, or stale arity fails.
 grep -Fq 'VIDEOPLAYER_TEST_REQUIRE_NATIVE_RELAY' "$helper" ||
 	fail "disposable renderer did not arm native-relay enforcement"
+grep -Fq 'VIDEOPLAYER_TEST_IDENTITY_UNLINK_RACE' "$helper" ||
+	fail "disposable renderer did not arm identity-unlink race"
 
 # FFmpeg terminates mpjpeg with a bare opening-boundary line. The FIFO writer
 # anchor deliberately remains open until an authenticated terminal marker is
@@ -1136,7 +1145,8 @@ int main(int argc, char **argv)
 	if (has_arg(argc, argv, "-decoders")) {
 		puts(" V..... = Video"); puts(" A..... = Audio");
 		puts(" S..... = Subtitle");
-		puts(" V..... h264 CI stub"); puts(" V..... hevc CI stub");
+		puts(" V..... h263 CI stub"); puts(" V..... h264 CI stub");
+		puts(" V..... hevc CI stub");
 		puts(" V..... vc1 CI stub"); puts(" V..... mpeg4 CI stub");
 		puts(" V..... vp8 CI stub"); puts(" V..... vp9 CI stub");
 		puts(" V..... av1 CI stub"); puts(" V..... mjpeg CI stub");
@@ -2221,6 +2231,7 @@ audio_clean_eof=54545454545454545454545454545454
 long_probe_audio=55555555555555555555555555555555
 blocked_probe=56565656565656565656565656565656
 producer_race=57575757575757575757575757575757
+identity_fail_closed=58585858585858585858585858585858
 finite_audio=36363636363636363636363636363636
 chunker_failure=37373737373737373737373737373737
 finite_media=38383838383838383838383838383838
@@ -3212,6 +3223,71 @@ assert_eq \
 	stopped \
 	"long-audio stop"
 wait_dead "$long_audio_worker"
+
+# A still-present malformed or symlinked process identity is never the benign
+# unlink race covered above. Stop must fail before signalling any child, leave
+# the suspicious entry untouched for diagnosis, and succeed only after the
+# original root-owned identity has been restored.
+assert_eq \
+	"$("$helper" start "$identity_fail_closed" "$media")" \
+	started \
+	"identity fail-closed start"
+identity_dir="$runtime/s-$identity_fail_closed"
+identity_worker="$(session_pid "$identity_fail_closed" worker)"
+identity_ffmpeg="$(session_pid "$identity_fail_closed" ffmpeg)"
+mv -- "$identity_dir/ffmpeg" "$identity_dir/.ffmpeg.identity.good"
+ln -s -- "$work" "$identity_dir/ffmpeg"
+set +e
+identity_symlink_output="$(
+	"$helper" stop "$identity_fail_closed" 2>&1
+)"
+identity_symlink_rc=$?
+set -e
+assert_eq "$identity_symlink_rc" 3 "symlinked identity stop rc"
+assert_eq "$identity_symlink_output" inactive "symlinked identity stop"
+[[ -L "$identity_dir/ffmpeg" ]] ||
+	fail "stop replaced or removed a symlinked process identity"
+kill -0 "$identity_worker" "$identity_ffmpeg" 2>/dev/null ||
+	fail "stop signalled a child before rejecting a symlinked identity"
+rm -f -- "$identity_dir/ffmpeg"
+mv -- "$identity_dir/.ffmpeg.identity.good" "$identity_dir/ffmpeg"
+
+mv -- "$identity_dir/worker" "$identity_dir/.worker.identity.good"
+printf 'malformed identity\n' > "$identity_dir/worker"
+chmod 0600 "$identity_dir/worker"
+set +e
+identity_malformed_output="$(
+	"$helper" stop "$identity_fail_closed" 2>&1
+)"
+identity_malformed_rc=$?
+set -e
+assert_eq "$identity_malformed_rc" 3 "malformed identity stop rc"
+assert_eq "$identity_malformed_output" inactive "malformed identity stop"
+[[ -f "$identity_dir/worker" && ! -L "$identity_dir/worker" ]] ||
+	fail "stop replaced or removed a malformed process identity"
+assert_eq \
+	"$(< "$identity_dir/worker")" \
+	"malformed identity" \
+	"malformed identity preservation"
+kill -0 "$identity_worker" "$identity_ffmpeg" 2>/dev/null ||
+	fail "stop signalled a child before rejecting a malformed identity"
+rm -f -- "$identity_dir/worker"
+mv -- "$identity_dir/.worker.identity.good" "$identity_dir/worker"
+rm -f -- "$identity_unlink_race_hit"
+assert_eq \
+	"$(
+		VIDEOPLAYER_TEST_IDENTITY_UNLINK_RACE=1 \
+		VIDEOPLAYER_TEST_IDENTITY_UNLINK_RACE_HIT="$identity_unlink_race_hit" \
+			"$helper" stop "$identity_fail_closed"
+	)" \
+	stopped \
+	"identity unlink-race stop"
+[[ -f "$identity_unlink_race_hit" ]] ||
+	fail "identity unlink-race hook was not exercised"
+wait_dead "$identity_worker"
+wait_dead "$identity_ffmpeg"
+identity_worker=""
+identity_ffmpeg=""
 
 # Once video reaches EOF, completed PCM chunks remain readable without keeping
 # the original source descriptor or worker alive after terminal drain.

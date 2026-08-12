@@ -79,7 +79,7 @@ do
 done
 
 for component in \
-	H264_DECODER HEVC_DECODER VC1_DECODER MPEG4_DECODER VP8_DECODER \
+	H263_DECODER H264_DECODER HEVC_DECODER VC1_DECODER MPEG4_DECODER VP8_DECODER \
 	VP9_DECODER AV1_DECODER MJPEG_DECODER AAC_DECODER AC3_DECODER \
 	EAC3_DECODER ALAC_DECODER DCA_DECODER FLAC_DECODER MP3_DECODER \
 	OPUS_DECODER PCM_S16LE_DECODER TRUEHD_DECODER VORBIS_DECODER \
@@ -103,7 +103,7 @@ done
 # fail-closed boundary: a newly added FFmpeg codec component, including a
 # future hardware wrapper whose name we do not yet know, must stay disabled.
 allowed_decoders=" \
-H264_DECODER HEVC_DECODER VC1_DECODER MPEG4_DECODER VP8_DECODER \
+H263_DECODER H264_DECODER HEVC_DECODER VC1_DECODER MPEG4_DECODER VP8_DECODER \
 VP9_DECODER AV1_DECODER MJPEG_DECODER AAC_DECODER AC3_DECODER \
 EAC3_DECODER ALAC_DECODER DCA_DECODER FLAC_DECODER MP3_DECODER \
 OPUS_DECODER PCM_S16LE_DECODER TRUEHD_DECODER VORBIS_DECODER "
@@ -371,7 +371,7 @@ unexpected_codec_aliases() (
 # CODEC_REPORT_ALLOWLIST_END
 
 for decoder in \
-	h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg \
+	h263 h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg \
 	aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis
 do
 	has_component "$decoders" "$decoder" ||
@@ -379,7 +379,7 @@ do
 done
 unexpected_decoders="$(
 	unexpected_codec_aliases "$decoders" \
-		"h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis"
+		"h263 h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis"
 )"
 [ -z "$unexpected_decoders" ] ||
 	die "decoder outside the software allowlist was enabled: $unexpected_decoders"

@@ -7,7 +7,7 @@
   },
   "codec": {
     "name": "luci-videoplayer-codec-runtime",
-    "release": 4,
+    "release": 5,
     "source_sha256": "a231e3d5742c44b1cdaebfb98ad7b6200d12763e0b6db9e1e2c5891f2c083a18",
     "version": "6.1.4"
   },

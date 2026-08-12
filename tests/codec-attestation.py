@@ -36,6 +36,46 @@ def make_definition(makefile: str, name: str) -> list[str]:
     return [line.strip() for line in body.splitlines() if line.strip()]
 
 
+def assert_makefile_codec_allowlists(makefile: str) -> None:
+    configure_tokens = [
+        token
+        for line in make_definition(makefile, "Build/Configure")
+        for token in line.split()
+        if token != "\\"
+    ]
+    for component, expected in (
+        ("decoder", verify_codec_package.SOFTWARE_DECODERS),
+        ("encoder", verify_codec_package.SOFTWARE_ENCODERS),
+    ):
+        disable_all = f"--disable-{component}s"
+        enable_all = f"--enable-{component}s"
+        enable_prefix = f"--enable-{component}="
+        assert configure_tokens.count(disable_all) == 1, (
+            f"Build/Configure must contain exactly one {disable_all}"
+        )
+        assert enable_all not in configure_tokens, (
+            f"Build/Configure must not reopen the global {component} set"
+        )
+
+        enabled = [
+            (index, token.removeprefix(enable_prefix))
+            for index, token in enumerate(configure_tokens)
+            if token.startswith(enable_prefix)
+        ]
+        enabled_names = [name for _index, name in enabled]
+        assert len(enabled_names) == len(set(enabled_names)), (
+            f"Build/Configure contains a duplicate {component} enable"
+        )
+        assert frozenset(enabled_names) == expected, (
+            f"Build/Configure {component} allowlist differs from package attestation"
+        )
+
+        disable_index = configure_tokens.index(disable_all)
+        assert all(index > disable_index for index, _name in enabled), (
+            f"Build/Configure enables a {component} before {disable_all}"
+        )
+
+
 def marked_allowlist_block(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     begin = "# CODEC_REPORT_ALLOWLIST_BEGIN\n"
@@ -395,6 +435,7 @@ def main() -> None:
     makefile = (ROOT / "codec-runtime" / "package" / "Makefile").read_text(
         encoding="utf-8"
     )
+    assert_makefile_codec_allowlists(makefile)
     assert makefile.count('"$${renderer_helper}" maintenance-enter') == 2
     assert makefile.count('"$${renderer_helper}" cleanup || {') == 2
     assert makefile.count('"$${renderer_helper}" maintenance-exit') == 2

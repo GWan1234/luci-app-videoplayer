@@ -259,12 +259,12 @@ OpenWrt 25.12+ uses `apk add --allow-untrusted`. Downloads are size-limited to
 protect the router's RAM-backed `/tmp` filesystem.
 
 Release 1.0.0 remains browser-only and deliberately does not attempt to install
-the strict r4 codec runtime: its legacy helper cannot participate in the new
+the strict r5 codec runtime: its legacy helper cannot participate in the new
 fail-closed maintenance transaction. To migrate an existing APK installation
 and enable strict Router mode, use the current-`main` installer below. It
 installs the 1.2.0 maintenance-capable application first and only then performs
 the architecture-specific codec transaction. On an `opkg` router, install the
-current 1.2.0 application IPK and matching r4 codec IPK in that same order using
+current 1.2.0 application IPK and matching r5 codec IPK in that same order using
 the prebuilt-package instructions below; the published 1.0.0 installer cannot
 enable strict Router mode there.
 
@@ -290,10 +290,10 @@ the current head of `main`. The installer checks the head of `main` again
 immediately before replacing the application package. Only after the verified
 1.2.0 maintenance helper is installed does it install or update the matching
 architecture-specific private FFmpeg runtime. This ordering safely migrates
-legacy helpers and prevents the r4 codec package from being changed outside a
+legacy helpers and prevents the r5 codec package from being changed outside a
 strict maintenance transaction. It refuses to proceed while a newer push is
 still being checked or if application verification fails. This path supports only `apk`; use
-the 1.2.0 application-plus-r4 local IPK procedure under
+the 1.2.0 application-plus-r5 local IPK procedure under
 **Installing a Prebuilt Local Package** on OpenWrt versions that still use
 `opkg`. The published-release installer above deliberately leaves those routers
 on browser-only 1.0.0.
@@ -303,7 +303,7 @@ package version, `1.2.0`.
 
 ### Architecture-specific Codec Runtime (APK or IPK)
 
-The generated codec package version is **6.1.4-r4**. The current matrix covers:
+The generated codec package version is **6.1.4-r5**. The current matrix covers:
 
 - OpenWrt `25.12.5` revision `r33051-f5dae5ece4`: 35 APK architectures;
 - OpenWrt `24.10.8` revision `r29233-443ec4032a`: 36 IPK architectures;
@@ -344,7 +344,7 @@ package versions: a missing or older runtime is installed, a matching current
 or newer runtime with compatible build metadata is kept, and a current-version
 runtime with missing or incompatible metadata is reinstalled from the verified
 package. It then confirms the exact native software video-decoder allowlist
-(H.264, HEVC, VC-1, MPEG-4, VP8, VP9, AV1, and MJPEG), the exact audio-decoder
+(H.263, H.264, HEVC, VC-1, MPEG-4, VP8, VP9, AV1, and MJPEG), the exact audio-decoder
 allowlist, the two permitted encoders, an empty hardware-accelerator report,
 and every component required by the continuous MJPEG and PCM renderers.
 
@@ -427,10 +427,10 @@ dist/
 ├── aarch64_cortex-a53/
 │   ├── openwrt-25.12.5-r33051-f5dae5ece4/
 │   │   ├── luci-app-videoplayer-1.2.0.apk
-│   │   └── luci-videoplayer-codec-runtime-6.1.4-r4.apk
+│   │   └── luci-videoplayer-codec-runtime-6.1.4-r5.apk
 │   └── openwrt-24.10.8-r29233-443ec4032a/
 │       ├── luci-app-videoplayer_1.2.0_all.ipk
-│       └── luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk
+│       └── luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
 ├── aarch64_cortex-a72/
 ├── …
 └── x86_64/
@@ -456,11 +456,11 @@ OpenWrt 25.12.5 on `aarch64_cortex-a53`:
 ```sh
 scp -O \
   dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.2.0.apk \
-  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-videoplayer-codec-runtime-6.1.4-r4.apk \
+  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-videoplayer-codec-runtime-6.1.4-r5.apk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 apk add --allow-untrusted /tmp/luci-app-videoplayer-1.2.0.apk
-apk add --allow-untrusted /tmp/luci-videoplayer-codec-runtime-6.1.4-r4.apk
+apk add --allow-untrusted /tmp/luci-videoplayer-codec-runtime-6.1.4-r5.apk
 ```
 
 OpenWrt 24.10.8 on `aarch64_cortex-a53`:
@@ -468,15 +468,15 @@ OpenWrt 24.10.8 on `aarch64_cortex-a53`:
 ```sh
 scp -O \
   dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.2.0_all.ipk \
-  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk \
+  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 opkg install /tmp/luci-app-videoplayer_1.2.0_all.ipk
-opkg install /tmp/luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk
+opkg install /tmp/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
 ```
 
 Keep this order when upgrading an existing installation: the 1.2.0
-application installs the maintenance-capable helper first, then the r4 codec
+application installs the maintenance-capable helper first, then the r5 codec
 package replaces the private FFmpeg while that helper holds the strict
 maintenance gate.
 

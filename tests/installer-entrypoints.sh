@@ -118,7 +118,7 @@ fi
 if grep -Eq 'CODEC_INSTALLER|install-codec-runtime' \
 	"$root/scripts/install-from-github.sh"; then
 	printf '%s\n' \
-		'The browser-only 1.0.0 release installer must not attempt a strict r4 codec transaction.' >&2
+		'The browser-only 1.0.0 release installer must not attempt a strict r5 codec transaction.' >&2
 	exit 1
 fi
 release_help="$(sh "$root/scripts/install-from-github.sh" --help)"

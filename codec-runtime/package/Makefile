@@ -34,7 +34,7 @@ endif
 
 PKG_NAME:=ffmpeg
 PKG_VERSION:=6.1.4
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
 PKG_SOURCE_URL:=https://ffmpeg.org/releases/
@@ -162,6 +162,7 @@ define Build/Configure
 			--enable-pthreads \
 			--disable-runtime-cpudetect \
 			$(CODEC_ARCH_CONFIG) \
+			--enable-decoder=h263 \
 			--enable-decoder=h264 \
 			--enable-decoder=hevc \
 			--enable-decoder=vc1 \

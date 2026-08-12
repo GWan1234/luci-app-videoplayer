@@ -1041,7 +1041,8 @@ probe_selected_software_only() {
 	}
 	if ! printf '%s\n' "$output" | awk '
 		BEGIN {
-			allowed["h264"] = allowed["hevc"] = allowed["vc1"] = 1
+			allowed["h263"] = allowed["h264"] = allowed["hevc"] = 1
+			allowed["vc1"] = 1
 			allowed["mpeg4"] = allowed["vp8"] = allowed["vp9"] = 1
 			allowed["av1"] = allowed["mjpeg"] = allowed["aac"] = 1
 			allowed["ac3"] = allowed["eac3"] = allowed["alac"] = 1
@@ -1629,27 +1630,43 @@ terminate_worker() {
 
 	if [ -e "$RUNTIME_DIR/s-$token/worker" ] ||
 	   [ -L "$RUNTIME_DIR/s-$token/worker" ]; then
-		load_worker_identity "$token" worker || return 1
-		wrapper_pid="$WORKER_PID"
-		wrapper_start="$WORKER_START"
+		if load_worker_identity "$token" worker; then
+			wrapper_pid="$WORKER_PID"
+			wrapper_start="$WORKER_START"
+		else
+			[ ! -e "$RUNTIME_DIR/s-$token/worker" ] &&
+				[ ! -L "$RUNTIME_DIR/s-$token/worker" ] || return 1
+		fi
 	fi
 	if [ -e "$RUNTIME_DIR/s-$token/ffmpeg" ] ||
 	   [ -L "$RUNTIME_DIR/s-$token/ffmpeg" ]; then
-		load_worker_identity "$token" ffmpeg || return 1
-		ffmpeg_pid="$WORKER_PID"
-		ffmpeg_start="$WORKER_START"
+		if load_worker_identity "$token" ffmpeg; then
+			ffmpeg_pid="$WORKER_PID"
+			ffmpeg_start="$WORKER_START"
+		else
+			[ ! -e "$RUNTIME_DIR/s-$token/ffmpeg" ] &&
+				[ ! -L "$RUNTIME_DIR/s-$token/ffmpeg" ] || return 1
+		fi
 	fi
 	if [ -e "$RUNTIME_DIR/s-$token/audio" ] ||
 	   [ -L "$RUNTIME_DIR/s-$token/audio" ]; then
-		load_worker_identity "$token" audio || return 1
-		audio_pid="$WORKER_PID"
-		audio_start="$WORKER_START"
+		if load_worker_identity "$token" audio; then
+			audio_pid="$WORKER_PID"
+			audio_start="$WORKER_START"
+		else
+			[ ! -e "$RUNTIME_DIR/s-$token/audio" ] &&
+				[ ! -L "$RUNTIME_DIR/s-$token/audio" ] || return 1
+		fi
 	fi
 	if [ -e "$RUNTIME_DIR/s-$token/chunker" ] ||
 	   [ -L "$RUNTIME_DIR/s-$token/chunker" ]; then
-		load_worker_identity "$token" chunker || return 1
-		chunker_pid="$WORKER_PID"
-		chunker_start="$WORKER_START"
+		if load_worker_identity "$token" chunker; then
+			chunker_pid="$WORKER_PID"
+			chunker_start="$WORKER_START"
+		else
+			[ ! -e "$RUNTIME_DIR/s-$token/chunker" ] &&
+				[ ! -L "$RUNTIME_DIR/s-$token/chunker" ] || return 1
+		fi
 	fi
 
 	if [ -n "$wrapper_pid" ] &&

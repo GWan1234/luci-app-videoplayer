@@ -474,7 +474,7 @@ if renderer_attestation="$(
 )" && [ "$renderer_attestation" = "$expected_attestation" ]; then
 	echo "Strict Router mode attestation passed: private software CPU runtime."
 else
-	echo "Strict Router mode is unavailable until codec runtime 6.1.4-r4 passes attestation; Browser mode remains available." >&2
+	echo "Strict Router mode is unavailable until codec runtime 6.1.4-r5 passes attestation; Browser mode remains available." >&2
 fi
 
 rm -rf "$stage"
