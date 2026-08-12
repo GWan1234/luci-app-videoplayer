@@ -157,7 +157,7 @@ check_extension_helpers "$stream_harness"
 	source "$stream_harness"
 	STREAM_TEST_RENDER_MODE=
 	# Sourced CGI code invokes this PATH-compatible test double indirectly.
-	# shellcheck disable=SC2329
+	# shellcheck disable=SC2317,SC2329
 	uci() {
 		[[ "$#" -eq 3 && "$1" == "-q" && "$2" == "get" ]] || return 1
 		[ -n "$STREAM_TEST_RENDER_MODE" ] || return 1
