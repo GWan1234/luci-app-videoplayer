@@ -30,8 +30,8 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DEFAULT_DIST = ROOT / ".staging" / "app"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.1.0"
-PKG_DESC = "LuCI video player with browser and router CPU rendering"
+PKG_VERSION = "1.2.0"
+PKG_DESC = "LuCI video player with browser and strict router CPU rendering"
 PKG_LICENSE = "GPL-2.0-or-later"
 PKG_MAINTAINER = "openwrt-video-player contributors"
 PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
@@ -68,6 +68,32 @@ MAX_SOURCE_FILE_BYTES = 24 * 1024 * 1024
 MAX_SOURCE_PAYLOAD_BYTES = 24 * 1024 * 1024
 MAX_DATA_TAR_MEMBERS = 256
 MAX_BUILT_PACKAGE_BYTES = 32 * 1024 * 1024
+
+RENDERER_HELPER = "/usr/libexec/videoplayer-renderer"
+RENDERER_RUNTIME = "/tmp/videoplayer-render-v1"
+RENDERER_CONTROL_LOCK = "/tmp/videoplayer-render-v1.lock"
+RENDERER_WORKER_LOCK = "/tmp/videoplayer-render-v1.worker.lock"
+RENDERER_MAINTENANCE = "/tmp/videoplayer-render-v1.maintenance"
+RENDERER_LEGACY_BACKUP = "/usr/libexec/.videoplayer-renderer.legacy-v1"
+RENDERER_PRIVATE_FFMPEG = "/usr/libexec/videoplayer-ffmpeg/ffmpeg"
+RENDERER_MAINTENANCE_LAYOUT = "maintenance-v1"
+RENDERER_GATE_SHA256 = (
+    "0b727bf9b8d5f7a092f3a20e6b632323667e554c10bf9e7fbaadcc0818fbe30c"
+)
+# Canonical renderer helpers published before the strict maintenance protocol.
+# An unknown executable is never migrated or invoked with legacy semantics.
+RENDERER_LEGACY_SHA256 = (
+    "4feefb96c192aabddb4937e0c844e61af2c526cc0fd6a816c43733b701431da1",
+    "84b24fc3c96bb8588d8d7d3750e0d152290398a48b4401cd3c9c6704745b16f7",
+    "51079dcddfe92a904bd44c5b82075ca31bc88a1b3224c68c3d145b1e6693cd5b",
+    "5d3d64435b4967547bd6e8cefa587acbcf536951da7d6f305d4f29db57ea6579",
+    "032741dea0d77f76ddd81c0c37fd056fb96796afd267799d590eba1566c94b52",
+    "4ef4fa6870423c1ffbdc53412bf25b3a6691d82b162a7b47efca75ce4c251e16",
+    "b13921f99df6888c2689d7f6d2b47d5df3bde0693294bb406cf950a0f94340e6",
+    "39641754d2de11e336d675171d2de79c872acadd01622d2aa7eb5e29a71cf235",
+    "94c496a0f68271af8db299dfbbe91ea5c3954e875eec7f0d6c43e49df2bbfd62",
+    "e000524117e4786c87d720d64ae7165fdb57115eb32c0d4eb6d83267ecf7f426",
+)
 
 
 class PackageBuildError(RuntimeError):
@@ -350,6 +376,237 @@ def build_file_list_content(files: list[tuple[str, Path, int]]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def renderer_maintenance_shell() -> str:
+    legacy_hashes = "|".join(RENDERER_LEGACY_SHA256)
+    return f"""renderer_helper=\"{RENDERER_HELPER}\"
+renderer_runtime=\"{RENDERER_RUNTIME}\"
+renderer_control_lock=\"{RENDERER_CONTROL_LOCK}\"
+renderer_worker_lock=\"{RENDERER_WORKER_LOCK}\"
+renderer_maintenance=\"{RENDERER_MAINTENANCE}\"
+renderer_legacy_backup=\"{RENDERER_LEGACY_BACKUP}\"
+renderer_private_ffmpeg=\"{RENDERER_PRIVATE_FFMPEG}\"
+renderer_gate_sha256=\"{RENDERER_GATE_SHA256}\"
+renderer_legacy_hashes=\"{legacy_hashes}\"
+
+safe_root_executable() {{
+	[ -f \"$1\" ] && [ ! -L \"$1\" ] && [ -x \"$1\" ] &&
+		[ \"$(readlink -f -- \"$1\" 2>/dev/null)\" = \"$1\" ] &&
+		[ \"$(stat -c '%u:%a' -- \"$1\" 2>/dev/null)\" = \"0:755\" ]
+}}
+
+ensure_renderer_lock() {{
+	lock_path=\"$1\"
+	if [ ! -e \"$lock_path\" ] && [ ! -L \"$lock_path\" ]; then
+		(umask 077; set -C; : > \"$lock_path\") 2>/dev/null || :
+	fi
+	[ -f \"$lock_path\" ] && [ ! -L \"$lock_path\" ] &&
+		[ \"$(readlink -f -- \"$lock_path\" 2>/dev/null)\" = \"$lock_path\" ] || return 1
+	chmod 0600 \"$lock_path\" 2>/dev/null || return 1
+	[ \"$(stat -c '%u:%a' -- \"$lock_path\" 2>/dev/null)\" = \"0:600\" ]
+}}
+
+lock_renderer_fd() {{
+	lock_fd=\"$1\"
+	lock_round=0
+	while ! flock -xn \"$lock_fd\" 2>/dev/null; do
+		lock_round=$((lock_round + 1))
+		[ \"$lock_round\" -lt 15 ] || return 1
+		sleep 1
+	done
+}}
+
+maintenance_marker_state() {{
+	[ -e \"$renderer_maintenance\" ] || [ -L \"$renderer_maintenance\" ] || return 1
+	[ -f \"$renderer_maintenance\" ] && [ ! -L \"$renderer_maintenance\" ] &&
+		[ \"$(readlink -f -- \"$renderer_maintenance\" 2>/dev/null)\" = \"$renderer_maintenance\" ] &&
+		[ \"$(stat -c '%u:%a:%s' -- \"$renderer_maintenance\" 2>/dev/null)\" = \"0:600:15\" ] &&
+		[ \"$(cat \"$renderer_maintenance\" 2>/dev/null)\" = \"{RENDERER_MAINTENANCE_LAYOUT}\" ] || return 2
+	return 0
+}}
+
+create_maintenance_marker() {{
+	state=0
+	maintenance_marker_state || state=$?
+	case \"$state\" in
+		0) return 0 ;;
+		1) ;;
+		*) return 1 ;;
+	esac
+	(umask 077; set -C; printf '%s\\n' '{RENDERER_MAINTENANCE_LAYOUT}' > \"$renderer_maintenance\") 2>/dev/null || {{
+		maintenance_marker_state
+		return
+	}}
+	chmod 0600 \"$renderer_maintenance\" 2>/dev/null && maintenance_marker_state
+}}
+
+renderer_process_is_related() {{
+	process_pid=\"$1\"
+	[ -r \"/proc/$process_pid/status\" ] && [ -r \"/proc/$process_pid/cmdline\" ] || return 1
+	[ \"$(sed -n 's/^Uid:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' \"/proc/$process_pid/status\" 2>/dev/null)\" = 0 ] || return 1
+	process_exe=\"$(readlink -f -- \"/proc/$process_pid/exe\" 2>/dev/null)\" || process_exe=\"\"
+	[ \"$process_exe\" = \"$renderer_private_ffmpeg\" ] && return 0
+	process_cmdline=\"$(tr '\\000' '\\n' < \"/proc/$process_pid/cmdline\" 2>/dev/null)\" || return 1
+	printf '%s\\n' \"$process_cmdline\" | grep -Fqx \"$renderer_helper\" && return 0
+	printf '%s\\n' \"$process_cmdline\" | grep -Fqx \"$renderer_legacy_backup\" && return 0
+	case \"$process_cmdline\" in
+		*\"$renderer_runtime/\"*) return 0 ;;
+	esac
+	return 1
+}}
+
+renderer_related_pids() {{
+	for process_dir in /proc/[0-9]*; do
+		process_pid=${{process_dir##*/}}
+		[ \"$process_pid\" = \"$$\" ] && continue
+		renderer_process_is_related \"$process_pid\" && printf '%s\\n' \"$process_pid\"
+	done
+}}
+
+terminate_renderer_processes() {{
+	for signal in TERM KILL; do
+		processes=\"$(renderer_related_pids)\"
+		[ -n \"$processes\" ] || return 0
+		for process_pid in $processes; do
+			kill -\"$signal\" \"$process_pid\" 2>/dev/null || :
+		done
+		for wait_round in 1 2 3 4 5; do
+			sleep 1
+			[ -z \"$(renderer_related_pids)\" ] && return 0
+		done
+	done
+	[ -z \"$(renderer_related_pids)\" ]
+}}
+
+legacy_helper_hash_is_allowed() {{
+	case \"|$renderer_legacy_hashes|\" in
+		*\"|$1|\"*) return 0 ;;
+	esac
+	return 1
+}}
+
+install_renderer_gate() {{
+	gate_tmp=\"${{renderer_helper}}.gate.$$\"
+	rm -f -- \"$gate_tmp\" 2>/dev/null || return 1
+	(
+		umask 077
+		set -C
+		printf '%s\\n' '#!/bin/sh' \
+			\"printf '%s\\n' 'Renderer maintenance migration is active' >&2\" \
+			'exit 1' > \"$gate_tmp\"
+	) 2>/dev/null || return 1
+	chmod 0755 \"$gate_tmp\" || return 1
+	[ \"$(sha256sum \"$gate_tmp\" | awk '{{print $1}}')\" = \"$renderer_gate_sha256\" ] || return 1
+	mv -f -- \"$gate_tmp\" \"$renderer_helper\" || return 1
+	safe_root_executable \"$renderer_helper\" &&
+		[ \"$(sha256sum \"$renderer_helper\" | awk '{{print $1}}')\" = \"$renderer_gate_sha256\" ]
+}}
+
+renderer_enter_legacy() {{
+	if [ -e \"$renderer_legacy_backup\" ] || [ -L \"$renderer_legacy_backup\" ]; then
+		safe_root_executable \"$renderer_legacy_backup\" || return 1
+		legacy_sha=\"$(sha256sum \"$renderer_legacy_backup\" | awk '{{print $1}}')\"
+		legacy_helper_hash_is_allowed \"$legacy_sha\" || return 2
+		if [ ! -e \"$renderer_helper\" ] && [ ! -L \"$renderer_helper\" ]; then
+			install_renderer_gate || return 1
+		else
+			safe_root_executable \"$renderer_helper\" || return 1
+			[ \"$(sha256sum \"$renderer_helper\" | awk '{{print $1}}')\" = \"$renderer_gate_sha256\" ] || return 1
+		fi
+	else
+		safe_root_executable \"$renderer_helper\" || return 1
+		legacy_sha=\"$(sha256sum \"$renderer_helper\" | awk '{{print $1}}')\"
+		legacy_helper_hash_is_allowed \"$legacy_sha\" || return 2
+		[ ! -e \"$renderer_legacy_backup\" ] && [ ! -L \"$renderer_legacy_backup\" ] || return 1
+		mv \"$renderer_helper\" \"$renderer_legacy_backup\" || return 1
+		install_renderer_gate || return 1
+	fi
+	create_maintenance_marker || return 1
+	ensure_renderer_lock \"$renderer_control_lock\" || return 1
+	ensure_renderer_lock \"$renderer_worker_lock\" || return 1
+	terminate_renderer_processes || return 1
+	\"$renderer_legacy_backup\" cleanup || return 1
+	terminate_renderer_processes || return 1
+	exec 9< \"$renderer_control_lock\" || return 1
+	lock_renderer_fd 9 || return 1
+	exec 8< \"$renderer_worker_lock\" || return 1
+	lock_renderer_fd 8 || return 1
+	[ ! -e \"$renderer_runtime\" ] && [ ! -L \"$renderer_runtime\" ] || return 1
+	[ -z \"$(renderer_related_pids)\" ] || return 1
+	return 0
+}}
+
+renderer_enter_without_helper() {{
+	create_maintenance_marker || return 1
+	ensure_renderer_lock \"$renderer_control_lock\" || return 1
+	ensure_renderer_lock \"$renderer_worker_lock\" || return 1
+	terminate_renderer_processes || return 1
+	exec 9< \"$renderer_control_lock\" || return 1
+	lock_renderer_fd 9 || return 1
+	exec 8< \"$renderer_worker_lock\" || return 1
+	lock_renderer_fd 8 || return 1
+	[ ! -e \"$renderer_runtime\" ] && [ ! -L \"$renderer_runtime\" ] &&
+		[ -z \"$(renderer_related_pids)\" ]
+}}
+
+renderer_enter_for_change() {{
+	if [ -e \"$renderer_legacy_backup\" ] || [ -L \"$renderer_legacy_backup\" ]; then
+		renderer_enter_legacy
+		return
+	fi
+	[ -e \"$renderer_helper\" ] || [ -L \"$renderer_helper\" ] || {{
+		renderer_enter_without_helper
+		return
+	}}
+	safe_root_executable \"$renderer_helper\" || return 1
+	output=\"$(
+		\"$renderer_helper\" maintenance-enter 2>/dev/null
+		output_status=$?
+		printf '__VIDEOPLAYER_RC__%s' \"$output_status\"
+	)\"
+	if [ \"$output\" = \"$(printf 'maintenance\\n__VIDEOPLAYER_RC__0')\" ]; then
+		maintenance_marker_state &&
+			\"$renderer_helper\" cleanup &&
+			maintenance_marker_state
+		return
+	fi
+	renderer_enter_legacy
+}}
+
+renderer_resume_after_change() {{
+	safe_root_executable \"$renderer_helper\" || return 1
+	state=0
+	maintenance_marker_state || state=$?
+	case \"$state\" in
+		1)
+			[ ! -e \"$renderer_legacy_backup\" ] && [ ! -L \"$renderer_legacy_backup\" ]
+			return
+			;;
+		0) ;;
+		*) return 1 ;;
+	esac
+	output=\"$(
+		\"$renderer_helper\" maintenance-enter
+		output_status=$?
+		printf '__VIDEOPLAYER_RC__%s' \"$output_status\"
+	)\"
+	[ \"$output\" = \"$(printf 'maintenance\\n__VIDEOPLAYER_RC__0')\" ] &&
+		maintenance_marker_state &&
+		\"$renderer_helper\" cleanup && maintenance_marker_state || return 1
+	rm -f -- \"$renderer_legacy_backup\" 2>/dev/null || return 1
+	output=\"$(
+		\"$renderer_helper\" maintenance-exit
+		output_status=$?
+		printf '__VIDEOPLAYER_RC__%s' \"$output_status\"
+	)\"
+	[ \"$output\" = \"$(printf 'resumed\\n__VIDEOPLAYER_RC__0')\" ] || return 1
+	state=0
+	maintenance_marker_state || state=$?
+	[ \"$state\" -eq 1 ] || return 1
+	return 0
+}}
+"""
+
+
 def postinst_script() -> bytes:
     return f"""#!/bin/sh
 [ "${{IPKG_NO_SCRIPT}}" = "1" ] && exit 0
@@ -357,8 +614,8 @@ def postinst_script() -> bytes:
 . ${{IPKG_INSTROOT}}/lib/functions.sh
 export root="${{IPKG_INSTROOT}}"
 export pkgname="{PKG_NAME}"
-add_group_and_user
-default_postinst
+add_group_and_user || exit 1
+default_postinst || exit 1
 [ -n "${{IPKG_INSTROOT}}" ] || {{
 	chmod 0755 \
 		/www/cgi-bin/videoplayer-stream \
@@ -366,6 +623,11 @@ default_postinst
 		/www/cgi-bin/videoplayer-audio \
 		/usr/libexec/rpcd/luci.videoplayer \
 		/usr/libexec/videoplayer-renderer 2>/dev/null || true
+	{renderer_maintenance_shell()}
+	renderer_resume_after_change || {{
+		echo "The renderer remains safely disabled because maintenance could not be completed." >&2
+		exit 1
+	}}
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 	rm -rf /tmp/luci-modulecache 2>/dev/null || true
 	/etc/init.d/rpcd reload 2>/dev/null || true
@@ -375,17 +637,40 @@ exit 0
 """.encode()
 
 
+def renderer_cleanup_body(action: str) -> bytes:
+    if action not in {"replacing", "removing"}:
+        raise PackageBuildError("Invalid renderer cleanup action")
+    return f"""[ -n "${{IPKG_INSTROOT:-}}" ] || {{
+{renderer_maintenance_shell()}
+	renderer_enter_for_change || {{
+		echo "Could not enter safe renderer maintenance before {action} the application." >&2
+		exit 1
+	}}
+}}
+""".encode()
+
+
+def preinst_script() -> bytes:
+    return b"#!/bin/sh\n" + renderer_cleanup_body("replacing") + b"exit 0\n"
+
+
 def prerm_script() -> bytes:
-    return f"""#!/bin/sh
+    return b"#!/bin/sh\n" + renderer_cleanup_body("removing") + f"""\
 [ -s ${{IPKG_INSTROOT}}/lib/functions.sh ] || exit 0
 . ${{IPKG_INSTROOT}}/lib/functions.sh
 export root="${{IPKG_INSTROOT}}"
 export pkgname="{PKG_NAME}"
-[ -n "${{IPKG_INSTROOT}}" ] ||
-	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
-default_prerm
+default_prerm || exit 1
 exit 0
 """.encode()
+
+
+def preupgrade_script() -> bytes:
+    return (
+        b"#!/bin/sh\nexport PKG_UPGRADE=1\n"
+        + renderer_cleanup_body("replacing")
+        + b"exit 0\n"
+    )
 
 
 def postupgrade_script() -> bytes:
@@ -395,7 +680,6 @@ def postupgrade_script() -> bytes:
 def postrm_script() -> bytes:
     return b"""#!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] || {
-	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
 	cleanup_token_store() (
 		lock_file="/tmp/videoplayer-tokens.lock"
 		token_dir="/tmp/videoplayer-tokens"
@@ -439,7 +723,6 @@ def postrm_script() -> bytes:
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 	rm -rf /tmp/luci-modulecache 2>/dev/null || true
 	cleanup_token_store 2>/dev/null || true
-	rm -f /tmp/videoplayer-render-v1.lock /tmp/videoplayer-render-v1.worker.lock 2>/dev/null || true
 	/etc/init.d/rpcd reload 2>/dev/null || true
 }
 exit 0
@@ -584,14 +867,15 @@ Maintainer: {PKG_MAINTAINER}
 Architecture: {PKG_ARCH_IPK}
 Installed-Size: {installed_size}
 Description:  {PKG_DESC}
- Browser playback and experimental FFmpeg-powered local CPU previews.
- Remote HTTP(S) URLs always remain client-side. Application files are architecture-independent.
+ Browser playback and attested fail-closed software CPU rendering for local media.
+ Remote HTTP(S) URLs are browser-only. Application files are architecture-independent.
 """.encode()
 
     conffiles = ("\n".join(CONFFILES) + "\n").encode("utf-8")
     control_members = [
         ("./control", control, 0o644),
         ("./conffiles", conffiles, 0o644),
+        ("./preinst", preinst_script(), 0o755),
         ("./postinst", postinst_script(), 0o755),
         ("./prerm", prerm_script(), 0o755),
         ("./postrm", postrm_script(), 0o755),
@@ -786,9 +1070,11 @@ def build_apk(
     )
 
     script_payloads = [
+        ("pre-install", preinst_script()),
         ("post-install", postinst_script()),
         ("pre-deinstall", prerm_script()),
         ("post-deinstall", postrm_script()),
+        ("pre-upgrade", preupgrade_script()),
         ("post-upgrade", postupgrade_script()),
     ]
     pkg_hash = build_content_uid(payload, script_payloads)
@@ -906,9 +1192,11 @@ def build_apk(
 
     scripts = adb.put_object(
         {
+            2: adb.put_blob(dict(script_payloads)["pre-install"]),
             3: adb.put_blob(dict(script_payloads)["post-install"]),
             4: adb.put_blob(dict(script_payloads)["pre-deinstall"]),
             5: adb.put_blob(dict(script_payloads)["post-deinstall"]),
+            6: adb.put_blob(dict(script_payloads)["pre-upgrade"]),
             7: adb.put_blob(dict(script_payloads)["post-upgrade"]),
         }
     )

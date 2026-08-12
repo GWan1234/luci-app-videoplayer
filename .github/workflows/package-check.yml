@@ -41,6 +41,7 @@ jobs:
               Path("scripts/verify_codec_package.py"),
               Path("scripts/verify-dist.py"),
               Path("scripts/verify_packages.py"),
+              Path("tests/codec-attestation.py"),
           ):
               compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
@@ -61,6 +62,8 @@ jobs:
           shellcheck -s bash tests/local-listing.sh
           bash -n tests/installer-entrypoints.sh
           shellcheck -s bash tests/installer-entrypoints.sh
+          bash -n tests/app-lifecycle.sh
+          shellcheck -s bash tests/app-lifecycle.sh
           bash -n tests/renderer-behavior.sh
           shellcheck -s bash tests/renderer-behavior.sh
           node --check tests/web-audio.js
@@ -82,6 +85,7 @@ jobs:
           shellcheck -s sh \
             luci-app-videoplayer/root/www/cgi-bin/videoplayer-frame
           python scripts/codec_matrix.py --summary
+          python tests/codec-attestation.py
           [ "$(python scripts/codec_matrix.py --list-architectures | wc -l)" -eq 37 ]
           [ "$(
             python scripts/codec_matrix.py --github-matrix |
@@ -93,13 +97,26 @@ jobs:
           grep -F \
             '$(TARGET_LDFLAGS) -static-libgcc -Wl,-z,relro' \
             codec-runtime/package/Makefile
-          grep -Fx 'format=3' codec-runtime/package/files/build-info.template
+          grep -Fx 'format=4' codec-runtime/package/files/build-info.template
           grep -Fx 'openwrt_release=@OPENWRT_RELEASE@' \
             codec-runtime/package/files/build-info.template
           grep -Fx 'package_format=@PACKAGE_FORMAT@' \
             codec-runtime/package/files/build-info.template
           grep -Fx 'validation_mode=@VALIDATION_MODE@' \
             codec-runtime/package/files/build-info.template
+          grep -Fx 'renderer_profile=software-cpu-v1' \
+            codec-runtime/package/files/build-info.template
+          grep -Fx 'execution_backend=software-cpu-v1' \
+            codec-runtime/package/files/build-info.template
+          grep -Fx 'software_cpu_only=1' \
+            codec-runtime/package/files/build-info.template
+          grep -Fx 'audio_chunk_frames=48000' \
+            codec-runtime/package/files/build-info.template
+          grep -Fx 'audio_chunk_bytes=192000' \
+            codec-runtime/package/files/build-info.template
+          grep -F -- '--disable-decoders' codec-runtime/package/Makefile
+          grep -F -- '--disable-encoders' codec-runtime/package/Makefile
+          grep -F -- '--disable-hwaccels' codec-runtime/package/Makefile
           grep -E \
             '^LUCI_DEPENDS:=.*\+coreutils-timeout([[:space:]]|$)' \
             luci-app-videoplayer/Makefile
@@ -124,6 +141,10 @@ jobs:
       - name: Exercise remote installer entry points
         shell: bash
         run: bash tests/installer-entrypoints.sh "$GITHUB_WORKSPACE"
+
+      - name: Exercise fail-closed application lifecycle
+        shell: bash
+        run: sudo bash tests/app-lifecycle.sh "$GITHUB_WORKSPACE"
 
       - name: Exercise renderer lifecycle
         shell: bash
@@ -200,7 +221,7 @@ jobs:
             'This branch is generated after all package checks pass.' \
             "Packages were built from main commit \`$GITHUB_SHA\`." \
             'Folder names are exact OpenWrt `DISTRIB_ARCH` values.' \
-            'Codec placeholders are filled by the separate codec-snapshot build.' \
+            'This snapshot intentionally contains codec placeholders; complete codec packages are published separately on the `codec-snapshot` branch and selected by the codec installer.' \
             'Do not edit this branch manually.' \
             > .snapshot-publish/README.md
 

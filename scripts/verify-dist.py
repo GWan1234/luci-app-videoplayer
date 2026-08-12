@@ -139,7 +139,7 @@ def verify_build_info(
 ) -> None:
     info = parse_build_info(path)
     expected = {
-        "format": "3",
+        "format": "4",
         "openwrt_release": entry["release"],
         "openwrt_revision": entry["revision"],
         "compatible_arch": entry["arch"],
@@ -150,7 +150,9 @@ def verify_build_info(
         "ffmpeg_version": matrix["codec"]["version"],
         "package_format": entry["format"],
         "validation_mode": entry["validation_mode"],
-        "renderer_profile": "buffered-tee-v1",
+        "renderer_profile": "software-cpu-v1",
+        "execution_backend": "software-cpu-v1",
+        "software_cpu_only": "1",
         "build_patented": "y",
         "network_enabled": "n",
         "avdevice_enabled": "n",
@@ -158,8 +160,8 @@ def verify_build_info(
         "audio_output": "pcm_s16le",
         "audio_sample_rate": "48000",
         "audio_channels": "2",
-        "audio_chunk_frames": "12000",
-        "audio_chunk_bytes": "48000",
+        "audio_chunk_frames": "48000",
+        "audio_chunk_bytes": "192000",
         "private_binary": "/usr/libexec/videoplayer-ffmpeg/ffmpeg",
     }
     require(set(info) == set(expected), f"BUILD_INFO fields differ in {path}")

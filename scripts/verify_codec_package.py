@@ -15,10 +15,12 @@ import codec_matrix
 import verify_packages
 
 PACKAGE_NAME = "luci-videoplayer-codec-runtime"
-PACKAGE_VERSION = "6.1.4-r3"
+PACKAGE_VERSION = "6.1.4-r4"
 FFMPEG_PATH = "usr/libexec/videoplayer-ffmpeg/ffmpeg"
 RELAY_PATH = "usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay"
 BUILD_INFO_PATH = "usr/share/luci-videoplayer-codec-runtime/build-info"
+RENDERER_HELPER_PATH = "/usr/libexec/videoplayer-renderer"
+RENDERER_MAINTENANCE_PATH = "/tmp/videoplayer-render-v1.maintenance"
 APK_LIST_PATH = f"lib/apk/packages/{PACKAGE_NAME}.list"
 
 MODE_FILE = 0o644
@@ -32,6 +34,45 @@ MIN_RELAY_BYTES = 4 * 1024
 MAX_RELAY_BYTES = 1024 * 1024
 MAX_SCRIPT_BYTES = 32 * 1024
 BUILD_INFO_KEY = re.compile(r"^[a-z][a-z0-9_]*$")
+SOFTWARE_DECODERS = frozenset(
+    {
+        "h264",
+        "hevc",
+        "vc1",
+        "mpeg4",
+        "vp8",
+        "vp9",
+        "av1",
+        "mjpeg",
+        "aac",
+        "ac3",
+        "eac3",
+        "alac",
+        "dca",
+        "flac",
+        "mp3",
+        "opus",
+        "pcm_s16le",
+        "truehd",
+        "vorbis",
+    }
+)
+SOFTWARE_ENCODERS = frozenset({"mjpeg", "pcm_s16le"})
+REQUIRED_SOFTWARE_CONFIGURATION = frozenset(
+    {
+        "--disable-autodetect",
+        "--disable-avdevice",
+        "--disable-network",
+        "--disable-indevs",
+        "--disable-outdevs",
+        "--disable-hwaccels",
+        "--disable-vaapi",
+        "--disable-vdpau",
+        "--disable-vulkan",
+        "--disable-decoders",
+        "--disable-encoders",
+    }
+)
 EXPECTED_BUILD_INFO_KEYS = {
     "format",
     "openwrt_release",
@@ -45,6 +86,8 @@ EXPECTED_BUILD_INFO_KEYS = {
     "package_format",
     "validation_mode",
     "renderer_profile",
+    "execution_backend",
+    "software_cpu_only",
     "build_patented",
     "network_enabled",
     "avdevice_enabled",
@@ -259,7 +302,7 @@ def validate_build_info(
     )
     entry = matches[0]
     expected = {
-        "format": "3",
+        "format": "4",
         "openwrt_release": entry["release"],
         "openwrt_revision": entry["revision"],
         "compatible_arch": architecture,
@@ -270,7 +313,9 @@ def validate_build_info(
         "ffmpeg_version": "6.1.4",
         "package_format": package_format,
         "validation_mode": entry["validation_mode"],
-        "renderer_profile": "buffered-tee-v1",
+        "renderer_profile": "software-cpu-v1",
+        "execution_backend": "software-cpu-v1",
+        "software_cpu_only": "1",
         "build_patented": "y",
         "network_enabled": "n",
         "avdevice_enabled": "n",
@@ -278,8 +323,8 @@ def validate_build_info(
         "audio_output": "pcm_s16le",
         "audio_sample_rate": "48000",
         "audio_channels": "2",
-        "audio_chunk_frames": "12000",
-        "audio_chunk_bytes": "48000",
+        "audio_chunk_frames": "48000",
+        "audio_chunk_bytes": "192000",
         "private_binary": f"/{FFMPEG_PATH}",
     }
     for key, value in expected.items():
@@ -432,6 +477,95 @@ def verify_elf(
         require(marker in data, f"{label} ELF is missing marker {marker!r}")
 
 
+def verify_software_configuration(data: bytes) -> None:
+    """Verify the immutable FFmpeg configure string embedded in the ELF."""
+    # FFmpeg's -version output uses this standalone printf format literal. Do
+    # not infer the configuration from the adjacent "configuration:\n" label:
+    # compiler string placement is not an ABI and can change across toolchains.
+    marker = b"%sconfiguration: "
+    require(
+        data.count(marker) == 1,
+        "Private FFmpeg has no unique embedded configuration literal",
+    )
+    start = data.index(marker) + len(marker)
+    end = data.find(b"\x00", start)
+    require(end > start, "Private FFmpeg embedded configuration is malformed")
+    try:
+        configuration = data[start:end].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise CodecPackageVerificationError(
+            "Private FFmpeg embedded configuration is not ASCII"
+        ) from exc
+    options = configuration.split()
+    option_set = set(options)
+    require(
+        REQUIRED_SOFTWARE_CONFIGURATION <= option_set,
+        "Private FFmpeg is missing a software-only configure option",
+    )
+    for forbidden in (
+        "--enable-everything",
+        "--enable-autodetect",
+        "--enable-avdevice",
+        "--enable-network",
+        "--enable-indevs",
+        "--enable-outdevs",
+        "--enable-decoders",
+        "--enable-encoders",
+        "--enable-hwaccels",
+        "--enable-vaapi",
+        "--enable-vdpau",
+        "--enable-vulkan",
+    ):
+        require(
+            forbidden not in option_set,
+            f"Private FFmpeg enables a forbidden backend: {forbidden}",
+        )
+    require(
+        not any(option.startswith("--enable-hwaccel=") for option in options),
+        "Private FFmpeg explicitly enables a hardware accelerator",
+    )
+
+    decoder_options = [
+        option for option in options if option.startswith("--enable-decoder=")
+    ]
+    require(
+        len(decoder_options) == len(set(decoder_options)),
+        "Private FFmpeg repeats an enabled decoder option",
+    )
+    enabled_decoders = {
+        option.removeprefix("--enable-decoder=") for option in decoder_options
+    }
+    require(
+        enabled_decoders == SOFTWARE_DECODERS,
+        "Private FFmpeg decoder allowlist is not software-cpu-v1",
+    )
+    first_enabled_decoder = min(options.index(option) for option in decoder_options)
+    require(
+        options.index("--disable-decoders") < first_enabled_decoder,
+        "Private FFmpeg decoder allowlist is not fail-closed",
+    )
+
+    encoder_options = [
+        option for option in options if option.startswith("--enable-encoder=")
+    ]
+    require(
+        len(encoder_options) == len(set(encoder_options)),
+        "Private FFmpeg repeats an enabled encoder option",
+    )
+    enabled_encoders = {
+        option.removeprefix("--enable-encoder=") for option in encoder_options
+    }
+    require(
+        enabled_encoders == SOFTWARE_ENCODERS,
+        "Private FFmpeg encoder allowlist is not software-cpu-v1",
+    )
+    first_enabled_encoder = min(options.index(option) for option in encoder_options)
+    require(
+        options.index("--disable-encoders") < first_enabled_encoder,
+        "Private FFmpeg encoder allowlist is not fail-closed",
+    )
+
+
 def normalize_script(data: bytes, label: str) -> list[str]:
     require(0 < len(data) <= MAX_SCRIPT_BYTES, f"{label} size is invalid")
     require(b"\x00" not in data and b"\r" not in data, f"{label} is not canonical text")
@@ -464,6 +598,141 @@ def preinst_lines(values: dict[str, str]) -> list[str]:
         ),
         "exit 1",
         "}",
+        *renderer_maintenance_enter_lines("replacing"),
+        "fi",
+        "exit 0",
+    ]
+
+
+def renderer_maintenance_enter_lines(action: str) -> list[str]:
+    require(action in {"replacing", "removing"}, "Invalid maintenance action")
+    return [
+        f'renderer_helper="{RENDERER_HELPER_PATH}"',
+        f'maintenance_marker="{RENDERER_MAINTENANCE_PATH}"',
+        'if [ -e "${renderer_helper}" ] || [ -L "${renderer_helper}" ]; then',
+        '[ -f "${renderer_helper}" ] &&',
+        '[ ! -L "${renderer_helper}" ] &&',
+        '[ -x "${renderer_helper}" ] &&',
+        '[ "$(stat -c \'%u:%a\' "${renderer_helper}" 2>/dev/null)" = "0:755" ] || {',
+        (
+            'echo "Cannot enter renderer maintenance mode before '
+            f"{action} the codec runtime. Install luci-app-videoplayer 1.2.0 "
+            'or newer first." >&2'
+        ),
+        "exit 1",
+        "}",
+        'maintenance_output="$(',
+        '"${renderer_helper}" maintenance-enter',
+        "maintenance_status=$?",
+        "printf '__VIDEOPLAYER_RC__%s' \"${maintenance_status}\"",
+        ')"',
+        "maintenance_expected=\"$(printf 'maintenance\\n__VIDEOPLAYER_RC__0')\"",
+        '[ "${maintenance_output}" = "${maintenance_expected}" ] || {',
+        (
+            'echo "Renderer maintenance mode is unavailable or returned an '
+            "invalid acknowledgement. Install luci-app-videoplayer 1.2.0 or "
+            'newer first; the codec runtime was not changed." >&2'
+        ),
+        "exit 1",
+        "}",
+        '"${renderer_helper}" cleanup || {',
+        (
+            'echo "Could not quiesce the renderer before '
+            f'{action} the codec runtime; maintenance mode remains active." >&2'
+        ),
+        "exit 1",
+        "}",
+        '[ -f "${maintenance_marker}" ] &&',
+        '[ ! -L "${maintenance_marker}" ] &&',
+        '[ "$(stat -c \'%u:%a:%s\' "${maintenance_marker}" 2>/dev/null)" = "0:600:15" ] &&',
+        '[ "$(cat "${maintenance_marker}" 2>/dev/null)" = "maintenance-v1" ] || {',
+        (
+            'echo "Renderer maintenance marker is missing or unsafe after '
+            'cleanup; the codec runtime was not changed." >&2'
+        ),
+        "exit 1",
+        "}",
+        "fi",
+    ]
+
+
+def renderer_maintenance_exit_lines(action: str) -> list[str]:
+    require(action in {"installing", "removing"}, "Invalid resume action")
+    return [
+        f'renderer_helper="{RENDERER_HELPER_PATH}"',
+        f'maintenance_marker="{RENDERER_MAINTENANCE_PATH}"',
+        'if { [ -e "${renderer_helper}" ] || [ -L "${renderer_helper}" ]; } &&',
+        '{ [ -e "${maintenance_marker}" ] || [ -L "${maintenance_marker}" ]; }; then',
+        '[ -f "${renderer_helper}" ] &&',
+        '[ ! -L "${renderer_helper}" ] &&',
+        '[ -x "${renderer_helper}" ] &&',
+        '[ "$(stat -c \'%u:%a\' "${renderer_helper}" 2>/dev/null)" = "0:755" ] || {',
+        (
+            'echo "Cannot safely leave renderer maintenance mode after '
+            f'{action} the codec runtime." >&2'
+        ),
+        "exit 1",
+        "}",
+        '[ -f "${maintenance_marker}" ] &&',
+        '[ ! -L "${maintenance_marker}" ] &&',
+        '[ "$(stat -c \'%u:%a:%s\' "${maintenance_marker}" 2>/dev/null)" = "0:600:15" ] &&',
+        '[ "$(cat "${maintenance_marker}" 2>/dev/null)" = "maintenance-v1" ] || {',
+        (
+            'echo "Renderer maintenance marker is missing or unsafe after '
+            f'{action} the codec runtime; playback remains blocked." >&2'
+        ),
+        "exit 1",
+        "}",
+        'maintenance_output="$(',
+        '"${renderer_helper}" maintenance-exit',
+        "maintenance_status=$?",
+        "printf '__VIDEOPLAYER_RC__%s' \"${maintenance_status}\"",
+        ')"',
+        "maintenance_expected=\"$(printf 'resumed\\n__VIDEOPLAYER_RC__0')\"",
+        '[ "${maintenance_output}" = "${maintenance_expected}" ] || {',
+        (
+            'echo "Could not leave renderer maintenance mode after '
+            f"{action} the codec runtime or received an invalid acknowledgement; "
+            'playback remains blocked." >&2'
+        ),
+        "exit 1",
+        "}",
+        '[ ! -e "${maintenance_marker}" ] && [ ! -L "${maintenance_marker}" ] || {',
+        (
+            'echo "Renderer maintenance marker still exists after resume; '
+            'playback remains blocked." >&2'
+        ),
+        "exit 1",
+        "}",
+        "fi",
+    ]
+
+
+def codec_postinst_lines() -> list[str]:
+    return [
+        "#!/bin/sh",
+        'if [ -z "${IPKG_INSTROOT:-}" ]; then',
+        *renderer_maintenance_exit_lines("installing"),
+        "fi",
+        "exit 0",
+    ]
+
+
+def codec_prerm_lines() -> list[str]:
+    return [
+        "#!/bin/sh",
+        'if [ -z "${IPKG_INSTROOT:-}" ]; then',
+        *renderer_maintenance_enter_lines("removing"),
+        "fi",
+        "exit 0",
+    ]
+
+
+def codec_postrm_lines() -> list[str]:
+    return [
+        "#!/bin/sh",
+        'if [ -z "${IPKG_INSTROOT:-}" ]; then',
+        *renderer_maintenance_exit_lines("removing"),
         "fi",
         "exit 0",
     ]
@@ -498,6 +767,7 @@ def apk_post_install_lines() -> list[str]:
         f'export pkgname="{PACKAGE_NAME}"',
         "add_group_and_user",
         "default_postinst",
+        *codec_postinst_lines()[1:],
     ]
 
 
@@ -509,6 +779,7 @@ def apk_pre_deinstall_lines() -> list[str]:
         'export root="${IPKG_INSTROOT}"',
         f'export pkgname="{PACKAGE_NAME}"',
         "default_prerm",
+        *codec_prerm_lines()[1:],
     ]
 
 
@@ -544,6 +815,7 @@ def verify_payload(
             "Packaged FFmpeg differs from the already validated build binary",
         )
     verify_elf(ffmpeg, architecture)
+    verify_software_configuration(ffmpeg)
     verify_elf(
         relay,
         architecture,
@@ -595,7 +867,16 @@ def verify_ipk(
         max_members=verify_packages.MAX_CONTROL_TAR_MEMBERS,
     )
     require(
-        set(control_members) == {"control", "preinst", "postinst", "prerm"},
+        set(control_members)
+        == {
+            "control",
+            "preinst",
+            "postinst",
+            "postinst-pkg",
+            "prerm",
+            "prerm-pkg",
+            "postrm",
+        },
         "Codec IPK control member set is incorrect",
     )
     require(
@@ -631,7 +912,10 @@ def verify_ipk(
     expected_scripts = {
         "preinst": preinst_lines(build_info_values),
         "postinst": ipk_default_postinst_lines(),
+        "postinst-pkg": codec_postinst_lines(),
         "prerm": ipk_default_prerm_lines(),
+        "prerm-pkg": codec_prerm_lines(),
+        "postrm": codec_postrm_lines(),
     }
     for name, expected_lines in expected_scripts.items():
         body, mode, _ = control_members[name]
@@ -830,6 +1114,7 @@ def verify_apk(
         2: raw_preinst,
         3: post_install,
         4: apk_pre_deinstall_lines(),
+        5: codec_postrm_lines(),
         6: ["#!/bin/sh", "export PKG_UPGRADE=1", *raw_preinst[1:]],
         7: ["#!/bin/sh", "export PKG_UPGRADE=1", *post_install[1:]],
     }
@@ -903,6 +1188,7 @@ def verify_codec_package(
         except verify_packages.PackageVerificationError as exc:
             raise CodecPackageVerificationError(str(exc)) from exc
         verify_elf(expected_binary, architecture)
+        verify_software_configuration(expected_binary)
     try:
         if package_format == "ipk":
             packaged_payloads = verify_ipk(

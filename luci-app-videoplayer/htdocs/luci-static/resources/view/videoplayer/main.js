@@ -10,7 +10,6 @@ const callList    = rpc.declare({ object: 'luci.videoplayer', method: 'list', pa
 const callRendererList = rpc.declare({ object: 'luci.videoplayer', method: 'list_renderer', params: [ 'path', 'offset', 'limit' ] });
 const callResolve = rpc.declare({ object: 'luci.videoplayer', method: 'resolve', params: [ 'path' ] });
 const callStartRenderer = rpc.declare({ object: 'luci.videoplayer', method: 'start_renderer', params: [ 'path' ] });
-const callResolveAudio = rpc.declare({ object: 'luci.videoplayer', method: 'resolve_audio', params: [ 'token' ] });
 const callRendererStatus = rpc.declare({ object: 'luci.videoplayer', method: 'renderer_status', params: [ 'token' ] });
 const callStopRenderer   = rpc.declare({
 	object: 'luci.videoplayer',
@@ -152,6 +151,15 @@ function normalizeRouterFpsForProfile(value, profile) {
 	return normalizeRouterProfile(profile) === 'fast' && fps > 8 ? 8 : fps;
 }
 
+function hasStrictCpuAttestation(value) {
+	return !!value &&
+		value.renderer_backend === 'private-software-cpu' &&
+		value.attestation_marker === 'software-cpu-v1' &&
+		value.hardware_acceleration === false &&
+		value.runtime_attested === true &&
+		value.presentation === 'browser-managed';
+}
+
 function errorText(err) {
 	if (err && err.message)
 		return err.message;
@@ -265,8 +273,6 @@ return view.extend({
 			self._stopRendererBestEffort(previousCpuSession);
 		if (typeof self._clearVideoElement === 'function')
 			self._clearVideoElement();
-		if (typeof self._clearCpuBrowserAudioElement === 'function')
-			self._clearCpuBrowserAudioElement();
 		if (self._pageHideHandler)
 			window.removeEventListener('pagehide', self._pageHideHandler);
 		if (self._visibilityHandler &&
@@ -327,7 +333,7 @@ return view.extend({
 		);
 		const rendererAvailable = status.renderer_available === undefined
 			? null
-			: flagOn(status.renderer_available);
+			: flagOn(status.renderer_available) && hasStrictCpuAttestation(status);
 
 		self._cwd = '';
 		self._offset = 0;
@@ -359,6 +365,11 @@ return view.extend({
 			router_fps: activeRouterFps,
 			renderer_available: status.renderer_available,
 			renderer_reason: status.renderer_reason,
+			renderer_backend: status.renderer_backend,
+			attestation_marker: status.attestation_marker,
+			hardware_acceleration: status.hardware_acceleration,
+			runtime_attested: status.runtime_attested,
+			presentation: status.presentation,
 			media_path_valid: status.media_path_valid,
 			media_path_exists: status.media_path_exists,
 			media_path_readable: status.media_path_readable
@@ -474,7 +485,7 @@ return view.extend({
 
 			E('h2', {}, _('Video Player')),
 			E('div', { class: 'cbi-map-descr' },
-				_('Play videos in LuCI using normal browser decoding or experimental CPU rendering on the router.')),
+				_('Play videos in LuCI using normal browser decoding or attested software-only CPU rendering on the router.')),
 
 			/* Settings */
 			E('h3', {}, _('Settings')),
@@ -499,12 +510,12 @@ return view.extend({
 								E('option', {
 									value: 'router',
 									selected: formRenderMode === 'router' ? 'selected' : null
-								}, _('Router CPU rendering (experimental, browser fallback)'))
+								}, _('Router CPU rendering (strict software-only)'))
 							]),
 							E('div', {
 								id: 'vp-render-mode-desc',
 								class: 'cbi-value-description'
-							}, _('Local files only. The router renders synchronized MJPEG video and PCM audio as quickly as it can. The browser waits for a two-minute buffer (or the whole file when shorter), then draws frames on one persistent canvas while normal-pitch audio provides the playback clock. Rendering continues ahead during playback and pauses for a 30-second refill if the buffer runs dry. This mode has no pause or seeking and may heavily load the router. If synchronized buffering is unavailable, the whole player falls back to browser decoding. Remote URLs always use browser decoding.')),
+							}, _('Local files only. The attested private FFmpeg runtime decodes the source video and audio, scales frames, and creates MJPEG and PCM entirely in software on the router CPU. The browser only presents those router-produced JPEG and PCM outputs. Rendering failures stop playback; the application never switches this mode to browser source decoding. Files without an audio track play silently. Remote URLs require Browser decoding mode. This mode has no pause or seeking and may heavily load the router.')),
 							E('div', {
 								id: 'vp-render-mode-status',
 								class: rendererAvailable === false
@@ -667,12 +678,6 @@ return view.extend({
 							playing: function (ev) { self._handleVideoPlaying(ev); },
 							volumechange: function (ev) { self._handleVolumeChange(ev); }
 						}, _('Your browser does not support HTML5 video.')),
-						E('audio', {
-							id: 'videoplayer-cpu-audio',
-							hidden: 'hidden',
-							preload: 'auto',
-							'aria-hidden': 'true'
-						}),
 						E('img', {
 							id: 'videoplayer-cpu-frame',
 							class: 'videoplayer-cpu-frame',
@@ -710,7 +715,7 @@ return view.extend({
 							E('span', { id: 'vp-cpu-played-time' }, '00:00 / ?')
 						]),
 						E('span', {}, [
-							E('strong', {}, _('Render speed:')), ' ',
+							E('strong', {}, _('Router output speed:')), ' ',
 							E('span', { id: 'vp-cpu-render-speed' }, _('Measuring…'))
 						]),
 						E('span', {}, [
@@ -760,7 +765,9 @@ return view.extend({
 								type: 'url',
 								class: 'cbi-input-text vp-wide',
 								placeholder: 'https://example.com/video.mp4',
-								disabled: activeRemoteAllowed ? null : 'disabled',
+								disabled: activeRemoteAllowed && activeRenderMode === 'browser'
+									? null
+									: 'disabled',
 								'aria-invalid': 'false',
 								'aria-describedby': 'vp-remote-url-desc vp-remote-url-error',
 								keydown: function (ev) {
@@ -773,7 +780,7 @@ return view.extend({
 							E('div', {
 								id: 'vp-remote-url-desc',
 								class: 'cbi-value-description'
-							}, _('Direct link to MP4/WebM. Remote media is always loaded by the browser, even when Router CPU mode is selected; server policy, codec support, or missing Range support may prevent playback.')),
+							}, _('Direct link to MP4/WebM. Remote media is loaded by the browser and is available only while Browser decoding mode is active; server policy, codec support, or missing Range support may prevent playback.')),
 							E('div', {
 								id: 'vp-remote-url-error',
 								class: 'cbi-value-description',
@@ -787,7 +794,9 @@ return view.extend({
 							id: 'vp-play-remote-btn',
 							type: 'button',
 							class: 'btn cbi-button cbi-button-apply',
-							disabled: activeRemoteAllowed ? null : 'disabled',
+							disabled: activeRemoteAllowed && activeRenderMode === 'browser'
+								? null
+								: 'disabled',
 							click: function (ev) {
 								return self.handlePlayRemote(ev);
 							}
@@ -897,7 +906,7 @@ return view.extend({
 			E('div', { class: 'cbi-section-descr', style: 'margin-top:1em;' }, [
 				E('p', {}, [
 					E('strong', {}, _('Notes:')), ' ',
-					_('Prefer H.264 + AAC in MP4 for browser mode. Router CPU mode can decode only codecs enabled in the installed OpenWrt FFmpeg build and automatically falls back to browser decoding when FFmpeg cannot start. Store media on USB if possible.')
+					_('Prefer H.264 + AAC in MP4 for browser mode. Router CPU mode can decode only codecs enabled in the attested private software runtime. If strict CPU playback cannot start or later fails, it stops without changing to browser source decoding; switch modes explicitly if desired. Store media on USB if possible.')
 				])
 			])
 		]);
@@ -979,7 +988,7 @@ return view.extend({
 
 		self._clearFieldError(pathEl, 'vp-media-path-error');
 
-		if (renderMode === 'router' && self._rendererAvailable === false) {
+		if (renderMode === 'router' && self._rendererAvailable !== true) {
 			notify(null, E('p', {},
 				_('Router CPU rendering is unavailable: %s').format(
 					(self._status && self._status.renderer_reason) ||
@@ -1103,7 +1112,6 @@ return view.extend({
 			const self = this;
 			const session = this._cpuSession;
 			const audio = session && session.audio;
-			const browserAudio = session && session.browserAudio;
 			if (audio && audio.active && audio.gain) {
 				const suspended = audio.resumeFailed ||
 					(!audio.bufferPaused && audio.context && audio.context.state &&
@@ -1197,52 +1205,6 @@ return view.extend({
 					5000, 'warning');
 					return false;
 				});
-			}
-			if (browserAudio && browserAudio.active &&
-			    browserAudio.element) {
-				if (!browserAudio.muted && !browserAudio.needsGesture &&
-				    (browserAudio.playing || browserAudio.playPending ||
-				     browserAudio.syncPaused)) {
-					browserAudio.playAttempt =
-						(Number(browserAudio.playAttempt) || 0) + 1;
-					browserAudio.playPending = false;
-					browserAudio.muted = true;
-					browserAudio.element.muted = true;
-					self._updateCpuAudioPresentation(session);
-					notify(null, _('Muted'), 2000);
-					return Promise.resolve();
-				}
-				if (browserAudio.waitingForVideo) {
-					notify(
-						null,
-						session.bufferedPlayback
-							? _('Browser audio will start when buffered playback is ready.')
-							: _('Browser audio will start with the first video frame.'),
-						2000,
-						'info'
-					);
-					return Promise.resolve();
-				}
-				browserAudio.muted = false;
-				browserAudio.needsGesture = false;
-				browserAudio.element.muted = false;
-				if (browserAudio.syncPaused) {
-					self._updateCpuAudioPresentation(session);
-					notify(null, _('Unmuted; audio will resume with video.'), 2000);
-					return Promise.resolve();
-				}
-				browserAudio.playPromise = self._playCpuBrowserAudio(
-					session, browserAudio, true
-				);
-				return browserAudio.playPromise.then(function (started) {
-					if (started)
-						notify(null, _('Unmuted'), 2000);
-				});
-			}
-			if (browserAudio && browserAudio.active &&
-			    browserAudio.resolving) {
-				notify(null, _('Browser audio is still being prepared.'), 2000, 'info');
-				return Promise.resolve();
 			}
 			{
 				notify(null, _('Audio is unavailable for this router-rendered video.'), 3000, 'warning');
@@ -1392,10 +1354,11 @@ return view.extend({
 	_syncRemoteControls: function () {
 		const input = document.getElementById('videoplayer-remote-url');
 		const button = document.getElementById('vp-play-remote-btn');
+		const disabled = !this._allowRemote || this._renderMode === 'router';
 		if (input)
-			input.disabled = !this._allowRemote;
+			input.disabled = disabled;
 		if (button)
-			button.disabled = !this._allowRemote;
+			button.disabled = disabled;
 	},
 
 	_syncLocalControls: function () {
@@ -1424,9 +1387,9 @@ return view.extend({
 
 		if (this._renderMode === 'router' && !this._canWriteSettings) {
 			statusEl.className += ' alert-message warning';
-			statusEl.textContent = _('This read-only LuCI account cannot start the router CPU renderer. Local videos will use browser decoding.');
+			statusEl.textContent = _('This read-only LuCI account cannot start the router CPU renderer. Strict CPU playback will be refused without changing modes.');
 		}
-		else if (this._rendererAvailable === false) {
+		else if (this._renderMode === 'router' && this._rendererAvailable !== true) {
 			statusEl.className += ' alert-message warning';
 			statusEl.textContent = _('Router CPU rendering is unavailable: %s').format(
 				(this._status && this._status.renderer_reason) ||
@@ -1435,8 +1398,8 @@ return view.extend({
 		}
 		else if (this._rendererAvailable === true && this._renderMode === 'router') {
 			statusEl.textContent = this._routerProfile === 'quality'
-				? _('The FFmpeg output pipeline is available. Quality profile uses 640×360 JPEG q8 at a target of %d FPS. Synchronized router-decoded PCM is the primary audio path; browser-decoded original audio is the fallback.').format(this._routerFps)
-				: _('The FFmpeg output pipeline is available. Fast profile uses optimized 480×270 JPEG q12 at a target of %d FPS. Synchronized router-decoded PCM is the primary audio path; browser-decoded original audio is the fallback.').format(this._routerFps);
+				? _('Source processing: attested router CPU (software only). Presentation: browser-managed. Quality uses 640×360 JPEG q8 at a target of %d FPS.').format(this._routerFps)
+				: _('Source processing: attested router CPU (software only). Presentation: browser-managed. Fast uses optimized 480×270 JPEG q12 at a target of %d FPS.').format(this._routerFps);
 		}
 		else {
 			statusEl.textContent = '';
@@ -1891,48 +1854,6 @@ return view.extend({
 		}
 	},
 
-	_clearCpuBrowserAudioElement: function (element) {
-		element = element || document.getElementById('videoplayer-cpu-audio');
-		if (!element)
-			return;
-
-		element.onloadedmetadata = null;
-		element.onplaying = null;
-		element.onpause = null;
-		element.onended = null;
-		element.onerror = null;
-		try { element.pause(); }
-		catch (err) {}
-		element.muted = false;
-		try { element.playbackRate = 1; }
-		catch (err) {}
-		try { element.removeAttribute('src'); }
-		catch (err) { element.src = ''; }
-		try { element.load(); }
-		catch (err) {}
-		if (this._cpuBrowserAudioOwner &&
-		    this._cpuBrowserAudioOwner.element === element)
-			this._cpuBrowserAudioOwner = null;
-	},
-
-	_disposeCpuBrowserAudio: function (browserAudio) {
-		if (!browserAudio)
-			return;
-		browserAudio.active = false;
-		browserAudio.resolving = false;
-		browserAudio.playing = false;
-		browserAudio.ended = true;
-		if (browserAudio.syncPauseClearTimer != null)
-			window.clearTimeout(browserAudio.syncPauseClearTimer);
-		browserAudio.syncPauseClearTimer = null;
-		browserAudio.syncPausePending = false;
-		browserAudio.playAttempt = (Number(browserAudio.playAttempt) || 0) + 1;
-		if (this._cpuBrowserAudioOwner === browserAudio) {
-			this._clearCpuBrowserAudioElement(browserAudio.element);
-			this._cpuBrowserAudioOwner = null;
-		}
-		browserAudio.element = null;
-	},
 
 	_updateCpuAudioPresentation: function (session) {
 		const note = document.getElementById('vp-cpu-player-note');
@@ -1944,20 +1865,13 @@ return view.extend({
 			(pcm.context && pcm.context.state &&
 			 pcm.context.state !== 'running')
 		);
-		const browserAudio = session && session.browserAudio &&
-			session.browserAudio.active
-			? session.browserAudio
-			: null;
-
 		this._syncCpuMuteControl();
 		if (session && session.bufferedPlayback) {
 			if (note) {
 				if (session.bufferState === 'buffering') {
 					note.textContent = pcm
 						? _('The router is rendering video and PCM audio into a browser buffer. Playback starts after two minutes are ready, or after the whole file is rendered when it is shorter.')
-						: (browserAudio
-							? _('The router is rendering a two-minute video buffer while the browser prepares the original audio track. Playback starts when the video buffer is ready, or after the whole file is rendered when it is shorter.')
-							: _('The router is rendering a two-minute video buffer. Playback starts when it is ready, or after the whole file is rendered when it is shorter.'));
+						: _('The router is rendering a two-minute video buffer. This attested source has no audio track, so playback will be silent.');
 				}
 				else if (session.bufferState === 'rebuffering' ||
 				         session.bufferState === 'hidden' ||
@@ -1966,9 +1880,6 @@ return view.extend({
 				}
 				else if (pcm) {
 					note.textContent = _('Video is drawn on a persistent canvas from router-rendered JPEG frames. Router-decoded PCM audio is the master clock and always plays at normal speed and pitch.');
-				}
-				else if (browserAudio) {
-					note.textContent = _('Video is rendered by the router and drawn on a persistent canvas. The original audio track is played by the browser at normal speed as the master clock.');
 				}
 				else {
 					note.textContent = _('Video is rendered ahead by the router and drawn on a persistent canvas. This file has no usable audio track.');
@@ -1982,16 +1893,6 @@ return view.extend({
 					? _('The continuous MJPEG video stream is rendered by the router CPU. PCM audio is ready; press Unmute to allow browser audio output.')
 					: _('The continuous MJPEG video stream is rendered by the router CPU. Audio is decoded to PCM by the router and played by this browser.');
 			}
-			else if (browserAudio) {
-				if (browserAudio.resolving || browserAudio.waitingForVideo) {
-					note.textContent = _('The continuous MJPEG video stream is rendered by the router CPU. Preparing browser-decoded audio…');
-				}
-				else {
-					note.textContent = browserAudio.needsGesture || browserAudio.muted
-						? _('The continuous MJPEG video stream is rendered by the router CPU. Audio is decoded by the browser; press Unmute to enable sound.')
-						: _('The continuous MJPEG video stream is rendered by the router CPU while audio is decoded and played by the browser.');
-				}
-			}
 			else if (session.audioFailureReason) {
 				note.textContent = _('Audio is unavailable: %s').format(
 					session.audioFailureReason
@@ -2004,12 +1905,6 @@ return view.extend({
 		if (pcm) {
 			this._setNowPlaying(
 				_('Router CPU playback: %s (%s profile, target %d FPS, PCM audio)')
-					.format(session.label, session.profile || 'fast', session.fps)
-			);
-		}
-		else if (browserAudio) {
-			this._setNowPlaying(
-				_('Router CPU playback: %s (%s profile, target %d FPS, browser audio)')
 					.format(session.label, session.profile || 'fast', session.fps)
 			);
 		}
@@ -2119,101 +2014,6 @@ return view.extend({
 		) * Math.max(0, rate) / 1000);
 	},
 
-	_positionCpuBrowserAudio: function (session, browserAudio, force) {
-		const element = browserAudio && browserAudio.element;
-		const startedAt = session && session.firstFrameAt;
-		const offsetReceivedAt = browserAudio &&
-			browserAudio.offsetReceivedAt;
-		const mediaOffsetMs = browserAudio &&
-			browserAudio.mediaOffsetMs;
-		const videoTarget = this._cpuVideoTarget(session);
-		let target, drift;
-
-		if (!element)
-			return;
-		if (session && session.bufferedPlayback) {
-			try {
-				element.defaultPlaybackRate = 1;
-				element.playbackRate = 1;
-				if ('preservesPitch' in element)
-					element.preservesPitch = true;
-				if (force)
-					element.currentTime = Math.max(
-						0, Number(session.playedSeconds) || 0
-					);
-			}
-			catch (err) {}
-			return;
-		}
-		if (Number.isFinite(videoTarget)) {
-			target = videoTarget;
-		}
-		else if (session && session.streamTransportMode === 'fetch') {
-			/* The fetch transport starts audio from the first JPEG that was
-			 * actually decoded. A server wall-clock offset would reintroduce the
-			 * very FIFO/browser backlog that this clock is designed to remove. */
-			return;
-		}
-		else if (Number.isFinite(startedAt)) {
-			target = Math.max(
-				0,
-				(Number.isFinite(session.nativeMediaBase)
-					? session.nativeMediaBase
-					: 0) +
-				(Date.now() - startedAt) / 1000
-			);
-		}
-		else if (Number.isFinite(offsetReceivedAt) &&
-		    Number.isFinite(mediaOffsetMs)) {
-			target = Math.max(
-				0,
-				(mediaOffsetMs +
-				 Date.now() - offsetReceivedAt) /
-					1000
-			);
-		}
-		else {
-			return;
-		}
-		if (Number.isFinite(element.duration) && element.duration > 0)
-			target = Math.min(target, Math.max(0, element.duration - 0.05));
-		drift = Number(element.currentTime) - target;
-		try {
-			if (force || !Number.isFinite(element.currentTime) ||
-			    Math.abs(drift) > CPU_AV_HARD_DRIFT_SECONDS) {
-				element.currentTime = target;
-				drift = 0;
-			}
-			/* Never correct synchronization by resampling sound. Pausing or a
-			 * bounded hard seek may be noticeable, but it preserves pitch and is
-			 * preferable to changing voices on every transport jitter sample. */
-			element.defaultPlaybackRate = 1;
-			element.playbackRate = 1;
-			if ('preservesPitch' in element)
-				element.preservesPitch = true;
-		}
-		catch (err) {
-			/* loadedmetadata retries this for browsers that reject early seeks. */
-		}
-	},
-
-	_pauseCpuBrowserAudioForSync: function (session, browserAudio) {
-		if (!this._isCurrentCpuSession(session) || !browserAudio ||
-		    session.browserAudio !== browserAudio || !browserAudio.active ||
-		    !browserAudio.element)
-			return;
-		if (browserAudio.syncPauseClearTimer != null)
-			window.clearTimeout(browserAudio.syncPauseClearTimer);
-		browserAudio.syncPauseClearTimer = null;
-		browserAudio.syncPausePending = true;
-		browserAudio.syncPaused = true;
-		browserAudio.playAttempt =
-			(Number(browserAudio.playAttempt) || 0) + 1;
-		browserAudio.playPending = false;
-		try { browserAudio.element.pause(); }
-		catch (err) {}
-		browserAudio.playing = false;
-	},
 
 	_scheduleCpuAvSync: function (session, delay) {
 		const self = this;
@@ -2229,7 +2029,6 @@ return view.extend({
 	},
 
 	_pollCpuAvSync: function (session) {
-		const browserAudio = session && session.browserAudio;
 		const now = cpuMonotonicNow();
 		const stallMs = this._cpuVideoStallMs(session);
 
@@ -2239,19 +2038,7 @@ return view.extend({
 		const videoStalled = Number.isFinite(session.videoFrameAt) &&
 			now - session.videoFrameAt >= stallMs;
 
-		if (browserAudio && browserAudio.active && browserAudio.element &&
-		    Number.isFinite(session.videoFrameAt)) {
-			if (videoStalled) {
-				if (!browserAudio.syncPaused &&
-				    (browserAudio.playing || browserAudio.playPending)) {
-					this._pauseCpuBrowserAudioForSync(session, browserAudio);
-				}
-			}
-			else {
-				this._positionCpuBrowserAudio(session, browserAudio, false);
-			}
-		}
-		else if (session.audio && session.audio.active &&
+		if (session.audio && session.audio.active &&
 		         Number.isFinite(session.videoMediaTime)) {
 			if (videoStalled) {
 				const audio = session.audio;
@@ -2343,375 +2130,11 @@ return view.extend({
 		return true;
 	},
 
-	_failCpuBrowserAudio: function (session, browserAudio, message) {
-		let pcmActivated = false;
-		let bufferedPosition;
-
-		if (!session || !browserAudio ||
-		    session.browserAudio !== browserAudio)
-			return;
-		if (session.bufferedPlayback &&
-		    (session.bufferState === 'playing' ||
-		     session.bufferState === 'resuming')) {
-			bufferedPosition = this._cpuBufferedPlaybackTime(session);
-			session.playedSeconds = bufferedPosition;
-			session.playClockMediaBase = bufferedPosition;
-			session.playClockContextAt = null;
-			if (session.bufferState === 'playing')
-				session.playClockWallAt = cpuMonotonicNow();
-			else {
-				session.playClockWallAt = null;
-				session.bufferState = 'rebuffering';
-			}
-		}
-		session.browserAudio = null;
-		session.browserAudioFailed = true;
-		session.audioFailureReason = String(
-			message || _('The browser could not play this audio track.')
-		);
-		this._disposeCpuBrowserAudio(browserAudio);
-		if (!this._isCurrentCpuSession(session))
-			return;
-		if (session.finishing) {
-			const finishing = session.finishing;
-			session.finishing = null;
-			if (session.finishTimer != null)
-				window.clearTimeout(session.finishTimer);
-			session.finishTimer = null;
-			this._finishCpuPlayback(
-				session, finishing.message, finishing.isError, true);
-			return;
-		}
-		if (session.bufferedPlayback && session.pendingAudio) {
-			/* A buffered session cannot join fresh sequence-zero PCM to a media
-			 * clock that is already in progress. Continue silently instead. */
-			const pending = session.pendingAudio;
-
-			session.pendingAudio = null;
-			this._disposeCpuAudio(pending);
-			this._startCpuAudioDrainer(
-				session,
-				pending.url,
-				Math.max(0, Number(pending.fetchSequence) || 0),
-				pending.batchMaxChunks
-			);
-		}
-		else {
-			pcmActivated = this._activatePendingCpuAudio(session);
-		}
-		if (!session.browserAudioWarned) {
-			session.browserAudioWarned = true;
-			notify(null, E('p', {},
-				pcmActivated
-					? _('%s Using router-decoded PCM audio instead.')
-						.format(session.audioFailureReason)
-					: session.audioFailureReason),
-			7000, pcmActivated ? 'info' : 'warning');
-		}
-		this._updateCpuAudioPresentation(session);
-		if (session.bufferedPlayback) {
-			this._maybeStartCpuBufferedPlayback(session);
-			this._scheduleCpuBufferedPresentation(session, 0);
-		}
-	},
-
-	_playCpuBrowserAudio: function (session, browserAudio, fromGesture) {
-		const self = this;
-		const element = browserAudio && browserAudio.element;
-		const attempt = browserAudio
-			? (Number(browserAudio.playAttempt) || 0) + 1
-			: 0;
-		let playResult;
-
-		if (!self._isCurrentCpuSession(session) || !browserAudio ||
-		    session.browserAudio !== browserAudio || !browserAudio.active ||
-		    !element)
-			return Promise.resolve(false);
-		browserAudio.playAttempt = attempt;
-		browserAudio.playPending = true;
-		self._positionCpuBrowserAudio(session, browserAudio);
-		const attemptIsCurrent = function () {
-			return self._isCurrentCpuSession(session) &&
-				session.browserAudio === browserAudio &&
-				browserAudio.active &&
-				browserAudio.playAttempt === attempt;
-		};
-		try {
-			playResult = element.play();
-		}
-		catch (err) {
-			playResult = Promise.reject(err);
-		}
-		return Promise.resolve(playResult).then(function () {
-			if (!attemptIsCurrent())
-				return false;
-			browserAudio.playPending = false;
-			browserAudio.playing = true;
-			browserAudio.resolving = false;
-			if (fromGesture) {
-				browserAudio.needsGesture = false;
-				browserAudio.muted = false;
-				element.muted = false;
-			}
-			self._updateCpuAudioPresentation(session);
-			return true;
-		}, function (err) {
-			if (!attemptIsCurrent())
-				return false;
-			browserAudio.playPending = false;
-			browserAudio.playing = false;
-			browserAudio.needsGesture = true;
-			browserAudio.muted = true;
-			element.muted = true;
-			self._updateCpuAudioPresentation(session);
-
-			if (fromGesture) {
-				notify(null, E('p', {},
-					_('The browser still blocked audio playback: %s')
-						.format(errorText(err))),
-				5000, 'warning');
-				return false;
-			}
-
-			/* Muted media is allowed to start in browsers that block delayed
-			 * audible playback. Keeping its clock running lets the user's
-			 * later Unmute click enable sound without restarting the video. */
-			if (!attemptIsCurrent())
-				return false;
-			browserAudio.playPending = true;
-			try {
-				playResult = element.play();
-			}
-			catch (mutedError) {
-				playResult = Promise.reject(mutedError);
-			}
-			return Promise.resolve(playResult).then(function () {
-				if (!attemptIsCurrent())
-					return null;
-				browserAudio.playPending = false;
-				browserAudio.playing = true;
-				return true;
-			}, function () {
-				if (!attemptIsCurrent())
-					return null;
-				browserAudio.playPending = false;
-				browserAudio.playing = false;
-				return false;
-			}).then(function (mutedStarted) {
-				if (attemptIsCurrent() && mutedStarted !== null &&
-				    !session.browserAudioPrompted) {
-					session.browserAudioPrompted = true;
-					notify(null,
-						mutedStarted
-							? _('Browser audio is ready. Press Unmute to enable sound.')
-							: _('Automatic audio playback was blocked. Press Unmute to start it.'),
-						5000, mutedStarted ? 'info' : 'warning');
-				}
-				return false;
-			});
-		});
-	},
-
-	_startCpuBrowserAudioFallback: function (session, message) {
-		const self = this;
-		let browserAudio;
-
-		if (!self._isCurrentCpuSession(session) || session.finishing)
-			return Promise.resolve(false);
-		if (session.browserAudio && session.browserAudio.active)
-			return session.browserAudio.promise || Promise.resolve(true);
-
-		browserAudio = {
-			active: true,
-			resolving: true,
-			waitingForVideo: false,
-			playing: false,
-			playPending: false,
-			playAttempt: 0,
-			playPromise: null,
-			ended: false,
-			muted: false,
-			needsGesture: false,
-			syncPaused: false,
-			syncPausePending: false,
-			syncPauseClearTimer: null,
-			mediaOffsetMs: null,
-			offsetReceivedAt: null,
-			element: null,
-			promise: null
-		};
-		session.browserAudio = browserAudio;
-		session.audioFailureReason = String(
-			message || _('Router-decoded audio is unavailable.')
-		);
-		self._updateCpuAudioPresentation(session);
-
-		browserAudio.promise = callResolveAudio(session.token).then(function (res) {
-			const url = String(res && res.stream_url || '');
-			const element = document.getElementById('videoplayer-cpu-audio');
-			const urlMatch = url.match(
-				/^\/cgi-bin\/videoplayer-stream\?renderer=([0-9a-f]{32})&audio=([0-9a-f]{32})$/
-			);
-			const mediaOffsetMs = Number(res && res.media_offset_ms);
-
-			if (!self._isCurrentCpuSession(session) ||
-			    session.browserAudio !== browserAudio || !browserAudio.active)
-				return false;
-			if (!res || res.error)
-				throw new Error(String(res && res.error || _('Unable to create an audio stream.')));
-			if (normalizeRenderMode(res.render_mode) !== 'browser' ||
-			    res.stream_type !== 'html5-video' ||
-			    !urlMatch ||
-			    urlMatch[1] !== session.token ||
-			    urlMatch[2] === session.token ||
-			    !Number.isInteger(mediaOffsetMs) ||
-			    mediaOffsetMs < 0 ||
-			    mediaOffsetMs > CPU_MAX_MEDIA_OFFSET_MS)
-				throw new Error(_('The router returned an invalid browser-audio stream.'));
-			if (!element || typeof element.play !== 'function')
-				throw new Error(_('This browser has no usable audio element.'));
-
-			self._clearCpuBrowserAudioElement(element);
-			self._cpuBrowserAudioOwner = browserAudio;
-			browserAudio.element = element;
-			browserAudio.resolving = false;
-			browserAudio.mediaOffsetMs = mediaOffsetMs;
-			browserAudio.offsetReceivedAt = Date.now();
-			element.preload = 'auto';
-			element.muted = false;
-			try {
-				element.defaultPlaybackRate = 1;
-				element.playbackRate = 1;
-				if ('preservesPitch' in element)
-					element.preservesPitch = true;
-			}
-			catch (err) {}
-			element.onloadedmetadata = function () {
-				if (self._isCurrentCpuSession(session) &&
-				    session.browserAudio === browserAudio)
-					self._positionCpuBrowserAudio(session, browserAudio);
-			};
-			element.onplaying = function () {
-				if (!self._isCurrentCpuSession(session) ||
-				    session.browserAudio !== browserAudio)
-					return;
-				if (browserAudio.syncPaused || document.hidden) {
-					self._pauseCpuBrowserAudioForSync(session, browserAudio);
-					self._updateCpuAudioPresentation(session);
-					return;
-				}
-				if (browserAudio.syncPausePending) {
-					if (browserAudio.syncPauseClearTimer != null)
-						window.clearTimeout(browserAudio.syncPauseClearTimer);
-					browserAudio.syncPauseClearTimer = window.setTimeout(function () {
-						browserAudio.syncPauseClearTimer = null;
-						browserAudio.syncPausePending = false;
-					}, CPU_AV_SYNC_INTERVAL_MS);
-				}
-				browserAudio.playing = true;
-				self._updateCpuAudioPresentation(session);
-			};
-			element.onpause = function () {
-				if (!self._isCurrentCpuSession(session) ||
-				    session.browserAudio !== browserAudio ||
-				    browserAudio.ended)
-					return;
-				if (browserAudio.syncPausePending || browserAudio.syncPaused) {
-					browserAudio.syncPausePending = false;
-					if (browserAudio.syncPauseClearTimer != null)
-						window.clearTimeout(browserAudio.syncPauseClearTimer);
-					browserAudio.syncPauseClearTimer = null;
-					browserAudio.playing = false;
-					self._updateCpuAudioPresentation(session);
-					return;
-				}
-				browserAudio.playAttempt =
-					(Number(browserAudio.playAttempt) || 0) + 1;
-				browserAudio.playPending = false;
-				browserAudio.playing = false;
-				browserAudio.needsGesture = true;
-				self._updateCpuAudioPresentation(session);
-			};
-			element.onended = function () {
-				if (!self._isCurrentCpuSession(session) ||
-				    session.browserAudio !== browserAudio)
-					return;
-				browserAudio.ended = true;
-				browserAudio.playing = false;
-				if (session.bufferedPlayback &&
-				    session.bufferState === 'playing') {
-					session.playedSeconds = Math.max(
-						Number(session.playedSeconds) || 0,
-						Number(element.currentTime) || 0
-					);
-					session.playClockMediaBase = session.playedSeconds;
-					session.playClockWallAt = cpuMonotonicNow();
-				}
-				session.browserAudio = null;
-				self._disposeCpuBrowserAudio(browserAudio);
-				if (session.bufferedPlayback) {
-					self._updateCpuAudioPresentation(session);
-					self._scheduleCpuBufferedPresentation(session, 0);
-					return;
-				}
-				if (session.finishing) {
-					const finishing = session.finishing;
-					session.finishing = null;
-					if (session.finishTimer != null)
-						window.clearTimeout(session.finishTimer);
-					session.finishTimer = null;
-					self._finishCpuPlayback(
-						session, finishing.message, finishing.isError, true);
-				}
-				else {
-					self._updateCpuAudioPresentation(session);
-				}
-			};
-			element.onerror = function () {
-				self._failCpuBrowserAudio(
-					session,
-					browserAudio,
-					_('The browser could not decode the audio track; video continues silently.')
-				);
-			};
-			element.src = url;
-			try { element.load(); }
-			catch (err) {}
-			self._positionCpuBrowserAudio(session, browserAudio);
-			browserAudio.waitingForVideo = session.bufferedPlayback
-				? (document.hidden || session.bufferState === 'buffering' ||
-				   session.bufferState === 'rebuffering' ||
-				   session.bufferState === 'hidden')
-				: (document.hidden || !session.firstFrameSeen ||
-				   (session.streamTransportMode === 'fetch' &&
-				    !Number.isFinite(session.videoPlaybackRate)));
-			self._updateCpuAudioPresentation(session);
-			if (session.bufferedPlayback)
-				self._maybeStartCpuBufferedPlayback(session);
-			if (!browserAudio.waitingForVideo && !browserAudio.playPending &&
-			    !browserAudio.playing)
-				browserAudio.playPromise = self._playCpuBrowserAudio(
-					session, browserAudio, false
-				);
-			return true;
-		}).catch(function (err) {
-			if (self._isCurrentCpuSession(session) &&
-			    session.browserAudio === browserAudio && browserAudio.active)
-				self._failCpuBrowserAudio(
-					session,
-					browserAudio,
-					_('Browser audio fallback failed: %s').format(errorText(err))
-				);
-			return false;
-		});
-		return browserAudio.promise;
-	},
 
 	_syncCpuMuteControl: function () {
 		const button = document.getElementById('vp-mute-btn');
 		const session = this._cpuSession;
 		const audio = session && session.audio;
-		const browserAudio = session && session.browserAudio;
 
 		if (!button)
 			return;
@@ -2730,21 +2153,6 @@ return view.extend({
 				: '';
 			return;
 		}
-		if (browserAudio && browserAudio.active) {
-			const muted = browserAudio.muted || browserAudio.needsGesture;
-			button.textContent = muted ? _('Unmute') : _('Mute');
-			button.setAttribute('aria-pressed', muted ? 'true' : 'false');
-			button.disabled = browserAudio.resolving ||
-				browserAudio.waitingForVideo || !browserAudio.element;
-			button.title = browserAudio.resolving
-				? _('Preparing browser audio…')
-				: (browserAudio.waitingForVideo
-					? (session && session.bufferedPlayback
-						? _('Browser audio will start when buffered playback is ready.')
-						: _('Browser audio will start with the first video frame.'))
-					: (muted ? _('Press Unmute to enable browser audio.') : ''));
-			return;
-		}
 		{
 			button.textContent = _('Mute');
 			button.setAttribute('aria-pressed', 'false');
@@ -2753,263 +2161,25 @@ return view.extend({
 		}
 	},
 
-	_disposeCpuAudioDrainer: function (drainer) {
-		if (!drainer)
-			return;
-		drainer.active = false;
-		drainer.generation = (Number(drainer.generation) || 0) + 1;
-		if (drainer.timer != null)
-			window.clearTimeout(drainer.timer);
-		drainer.timer = null;
-		drainer.inFlight = false;
-	},
-
-	_scheduleCpuAudioDrainPoll: function (session, delay) {
-		const self = this;
-		const drainer = session && session.audioDrainer;
-
-		if (!self._isCurrentCpuSession(session) || !drainer ||
-		    !drainer.active || drainer.producerEnded)
-			return;
-		if (drainer.timer != null)
-			window.clearTimeout(drainer.timer);
-		drainer.timer = window.setTimeout(function () {
-			drainer.timer = null;
-			self._pollCpuAudioDrainer(session);
-		}, Math.max(0, Number(delay) || 0));
-	},
-
-	_startCpuAudioDrainer: function (session, url, sequence, batchMaxChunks) {
-		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback ||
-		    !url)
-			return false;
-		if (session.audioDrainer && session.audioDrainer.active)
-			return true;
-		const drainer = {
-			active: true,
-			url: url,
-			fetchSequence: Math.max(0, Number(sequence) || 0),
-			batchMaxChunks: Math.max(
-				1, Math.min(
-					CPU_AUDIO_BATCH_MAX_CHUNKS,
-					Number(batchMaxChunks) || 1
-				)
-			),
-			generation: 0,
-			timer: null,
-			inFlight: false,
-			producerEnded: false,
-			errors: 0,
-			busyStartedAt: null
-		};
-		session.audioDrainer = drainer;
-		this._scheduleCpuAudioDrainPoll(session, 0);
-		return true;
-	},
-
-	_pollCpuAudioDrainer: function (session) {
-		const self = this;
-		const drainer = session && session.audioDrainer;
-		const generation = drainer ? Number(drainer.generation) || 0 : 0;
-		const sequence = drainer && Number(drainer.fetchSequence);
-		const count = drainer
-			? Math.max(1, Math.min(
-				CPU_AUDIO_BATCH_MAX_CHUNKS,
-				Number(drainer.batchMaxChunks) || 1
-			))
-			: 1;
-
-		if (!self._isCurrentCpuSession(session) || !drainer ||
-		    !drainer.active || drainer.producerEnded || drainer.inFlight)
-			return Promise.resolve();
-		if (!Number.isSafeInteger(sequence) || sequence < 0) {
-			self._failCpuBufferedPlayback(
-				session, _('The router PCM acknowledgement cursor is invalid.')
-			);
-			return Promise.resolve();
-		}
-		drainer.inFlight = true;
-		return request.get(drainer.url, {
-			responseType: 'blob',
-			timeout: CPU_AUDIO_REQUEST_TIMEOUT_MS,
-			cache: true,
-			query: { chunk: String(sequence), count: String(count) }
-		}).then(function (res) {
-			if (!self._isCurrentCpuSession(session) ||
-			    session.audioDrainer !== drainer || !drainer.active ||
-			    drainer.generation !== generation)
-				return { done: true };
-			if (res.status === 202) {
-				drainer.busyStartedAt = null;
-				drainer.errors = 0;
-				return {
-					retry: true,
-					delay: self._nextCpuAudioNotReadyDelay(drainer)
-				};
-			}
-			if (res.status === 204) {
-				drainer.busyStartedAt = null;
-				drainer.notReadyDelay = null;
-				drainer.producerEnded = true;
-				drainer.active = false;
-				return { done: true };
-			}
-			if (res.status === 409 && String(
-				res.headers && res.headers.get('X-Videoplayer-Audio-State') || ''
-			).toLowerCase() === 'unavailable') {
-				drainer.busyStartedAt = null;
-				drainer.notReadyDelay = null;
-				/* This authenticated state is emitted only after the worker has
-				 * replaced the failed PCM chunker with its own direct FIFO sink. */
-				drainer.producerEnded = true;
-				drainer.active = false;
-				return { done: true };
-			}
-			if (res.status === 409) {
-				drainer.notReadyDelay = null;
-				const now = Date.now();
-
-				if (!Number.isFinite(drainer.busyStartedAt))
-					drainer.busyStartedAt = now;
-				/* A disposed Web Audio request cannot always be aborted. Its
-				 * download may still own audio.lock when the discard drainer
-				 * starts, so generic lock-busy 409s remain retryable for longer
-				 * than that request's complete timeout. Persistent 409 still
-				 * fails closed after this bounded overlap window. */
-				if (now - drainer.busyStartedAt < CPU_AUDIO_BUSY_RETRY_MS) {
-					drainer.errors = 0;
-					return { retry: true, delay: 100 };
-				}
-				throw new Error(_('The router PCM acknowledgement stream remained busy.'));
-			}
-			if (res.status === 404 || res.status === 410)
-				throw new Error(_('The router PCM acknowledgement stream lost its next chunk.'));
-			if (!res.ok || res.status !== 200)
-				throw new Error(
-					_('Audio drain request failed with HTTP %d').format(res.status)
-				);
-			drainer.busyStartedAt = null;
-			drainer.notReadyDelay = null;
-
-			const get = function (name) {
-				return String(res.headers.get(name) || '');
-			};
-			const responseSequenceText = get('X-Videoplayer-Audio-Sequence');
-			const responseCountText = get('X-Videoplayer-Audio-Chunk-Count') || '1';
-			const framesText = get('X-Videoplayer-Audio-Frames-Per-Chunk') ||
-				get('X-Videoplayer-Audio-Frames');
-			const totalFramesText = get('X-Videoplayer-Audio-Total-Frames');
-			const responseSequence = Number(responseSequenceText);
-			const responseCount = Number(responseCountText);
-			const contentLength = Number(get('Content-Length'));
-			if (get('Content-Type').split(';', 1)[0].trim().toLowerCase() !==
-					'application/octet-stream' ||
-			    get('X-Videoplayer-Audio-Format').toLowerCase() !== 's16le' ||
-			    !/^(0|[1-9][0-9]{0,7})$/.test(responseSequenceText) ||
-			    responseSequence !== sequence ||
-			    !/^[1-2]$/.test(responseCountText) || responseCount > count ||
-			    Number(get('X-Videoplayer-Audio-Sample-Rate')) !==
-				CPU_AUDIO_SAMPLE_RATE ||
-			    Number(get('X-Videoplayer-Audio-Channels')) !==
-				CPU_AUDIO_CHANNELS ||
-			    Number(framesText) !== CPU_AUDIO_FRAMES_PER_CHUNK ||
-			    Number(totalFramesText) !==
-				responseCount * CPU_AUDIO_FRAMES_PER_CHUNK ||
-			    contentLength !== responseCount * CPU_AUDIO_CHUNK_BYTES)
-				throw new Error(_('The router returned invalid PCM drain metadata.'));
-			const blob = res.blob();
-			if (!blob || blob.size !== contentLength)
-				throw new Error(_('The router returned an invalid PCM drain batch.'));
-			return blobToArrayBuffer(blob).then(function (arrayBuffer) {
-				if (!(arrayBuffer instanceof ArrayBuffer) ||
-				    arrayBuffer.byteLength !== contentLength)
-					throw new Error(_('The router returned an invalid PCM drain batch.'));
-				if (!self._isCurrentCpuSession(session) ||
-				    session.audioDrainer !== drainer || !drainer.active ||
-				    drainer.generation !== generation)
-					return { done: true };
-				drainer.fetchSequence += responseCount;
-				drainer.errors = 0;
-				return { retry: true, delay: 0 };
-			});
-		}).then(function (result) {
-			if (!result || result.done ||
-			    !self._isCurrentCpuSession(session) ||
-			    session.audioDrainer !== drainer || !drainer.active ||
-			    drainer.generation !== generation)
-				return;
-			self._scheduleCpuAudioDrainPoll(session, result.delay || 0);
-		}).catch(function (err) {
-			if (!self._isCurrentCpuSession(session) ||
-			    session.audioDrainer !== drainer || !drainer.active ||
-			    drainer.generation !== generation)
-				return;
-			drainer.errors++;
-			if (drainer.errors < 3) {
-				self._scheduleCpuAudioDrainPoll(
-					session, Math.min(1000, 100 * Math.pow(2, drainer.errors))
-				);
-				return;
-			}
-			self._failCpuBufferedPlayback(
-				session,
-				_('Unable to acknowledge router PCM while browser audio is active: %s')
-					.format(errorText(err))
-			);
-		}).finally(function () {
-			drainer.inFlight = false;
-		});
-	},
 
 	_disableCpuAudio: function (session, message, backendDraining) {
 		const audio = session && session.audio;
-		const finishing = session && session.finishing;
-		let bufferedPosition;
 
 		if (!audio)
 			return Promise.resolve(false);
-		if (session.bufferedPlayback) {
-			bufferedPosition = this._cpuBufferedPlaybackTime(session);
-			session.playedSeconds = bufferedPosition;
-			session.playClockMediaBase = bufferedPosition;
-			session.playClockContextAt = null;
-			session.playClockWallAt = null;
-			if (session.bufferState === 'playing' ||
-			    session.bufferState === 'resuming')
-				session.bufferState = 'rebuffering';
-		}
 		session.audio = null;
 		this._disposeCpuAudio(audio);
-		if (session.bufferedPlayback && !backendDraining)
-			this._startCpuAudioDrainer(
-				session,
-				audio.url,
-				Math.max(0, Number(audio.fetchSequence) || 0),
-				audio.batchMaxChunks
-			);
 		session.audioFailureReason = String(
 			message || _('Router-decoded PCM audio is unavailable.')
 		);
-		if (this._isCurrentCpuSession(session)) {
-			if (finishing) {
-				if (session.finishTimer != null)
-					window.clearTimeout(session.finishTimer);
-				session.finishTimer = null;
-				session.finishing = null;
-				this._finishCpuPlayback(
-					session, finishing.message, finishing.isError, true);
-				return Promise.resolve(false);
-			}
-			if (message && !session.audioWarned) {
-				session.audioWarned = true;
-				notify(null, E('p', {}, message), 5000, 'warning');
-			}
-			if (!session.browserAudioFailed)
-				return this._startCpuBrowserAudioFallback(
-					session, session.audioFailureReason
-				);
-			this._updateCpuAudioPresentation(session);
-		}
+		if (!this._isCurrentCpuSession(session))
+			return Promise.resolve(false);
+		if (session.bufferedPlayback)
+			this._failCpuBufferedPlayback(session, session.audioFailureReason);
+		else
+			this._finishCpuPlayback(
+				session, session.audioFailureReason, true, true
+			);
 		return Promise.resolve(false);
 	},
 
@@ -3096,13 +2266,6 @@ return view.extend({
 				if (session.audio.ended)
 					this._finishCpuAudioDrain(session, session.audio);
 			}
-			if (session.browserAudio && session.browserAudio.active &&
-			    (session.browserAudio.playing ||
-			     session.browserAudio.playPending)) {
-				this._pauseCpuBrowserAudioForSync(
-					session, session.browserAudio
-				);
-			}
 			return;
 		}
 		if (Number.isFinite(session.streamHiddenAt))
@@ -3128,23 +2291,6 @@ return view.extend({
 			         hiddenFor > CPU_AV_HIDDEN_HOLD_MS) {
 				this._rebaseCpuAudio(session, session.audio);
 			}
-		}
-		if (session.browserAudio && session.browserAudio.active &&
-		    (session.browserAudio.syncPaused ||
-		     session.browserAudio.waitingForVideo) &&
-		    ((session.streamTransportMode === 'native-mjpeg' &&
-		      session.firstFrameSeen) ||
-		     (Number.isFinite(session.videoFrameAt) &&
-		      cpuMonotonicNow() - session.videoFrameAt <
-			this._cpuVideoStallMs(session)))) {
-			this._positionCpuBrowserAudio(
-				session, session.browserAudio, true
-			);
-			session.browserAudio.waitingForVideo = false;
-			session.browserAudio.syncPaused = false;
-			session.browserAudio.playPromise = this._playCpuBrowserAudio(
-				session, session.browserAudio, false
-			);
 		}
 		if (session.streamTransportMode === 'fetch')
 			this._scheduleCpuAvSync(session, 0);
@@ -3788,22 +2934,7 @@ return view.extend({
 			session.firstFrameAt = session.streamLastFrameAt;
 		}
 
-		if (session.browserAudio && session.browserAudio.active) {
-			const browserAudio = session.browserAudio;
-			this._positionCpuBrowserAudio(
-				session, browserAudio, firstFrame || browserAudio.syncPaused
-			);
-			if (!document.hidden &&
-			    Number.isFinite(session.videoPlaybackRate) &&
-			    (browserAudio.waitingForVideo || browserAudio.syncPaused)) {
-				browserAudio.waitingForVideo = false;
-				browserAudio.syncPaused = false;
-				browserAudio.playPromise = this._playCpuBrowserAudio(
-					session, browserAudio, false
-				);
-			}
-		}
-		else if (session.pendingAudio &&
+		if (session.pendingAudio &&
 		         Number.isFinite(session.videoPlaybackRate)) {
 			this._activatePendingCpuAudio(session);
 		}
@@ -3824,7 +2955,6 @@ return view.extend({
 
 	_cpuBufferedPlaybackTime: function (session) {
 		const audio = session && session.audio;
-		const browserAudio = session && session.browserAudio;
 		let elapsed = 0;
 
 		if (!session || !session.bufferedPlayback)
@@ -3836,10 +2966,6 @@ return view.extend({
 				0,
 				Number(audio.context.currentTime) - session.playClockContextAt
 			);
-		}
-		else if (browserAudio && browserAudio.active && browserAudio.element &&
-		         Number.isFinite(Number(browserAudio.element.currentTime))) {
-			return Math.max(0, Number(browserAudio.element.currentTime));
 		}
 		else if (Number.isFinite(session.playClockWallAt)) {
 			elapsed = Math.max(
@@ -4118,7 +3244,6 @@ return view.extend({
 	_pauseCpuBufferedClock: function (session) {
 		const self = this;
 		const audio = session && session.audio;
-		const browserAudio = session && session.browserAudio;
 		let suspendGeneration;
 
 		if (audio && audio.active && audio.context) {
@@ -4164,10 +3289,6 @@ return view.extend({
 				return false;
 			});
 		}
-		if (browserAudio && browserAudio.active && browserAudio.element) {
-			browserAudio.syncPaused = true;
-			this._pauseCpuBrowserAudioForSync(session, browserAudio);
-		}
 	},
 
 	_enterCpuBufferedRebuffer: function (session, hidden) {
@@ -4198,7 +3319,6 @@ return view.extend({
 	_resumeCpuBufferedPlayback: function (session) {
 		const self = this;
 		const audio = session && session.audio;
-		const browserAudio = session && session.browserAudio;
 		let resumeGeneration;
 
 		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
@@ -4273,21 +3393,7 @@ return view.extend({
 			});
 			return;
 		}
-		if (browserAudio && browserAudio.active && browserAudio.element) {
-			browserAudio.syncPaused = false;
-			browserAudio.waitingForVideo = false;
-			try {
-				browserAudio.element.playbackRate = 1;
-				browserAudio.element.currentTime = session.playedSeconds;
-			}
-			catch (err) {}
-			browserAudio.playPromise = self._playCpuBrowserAudio(
-				session, browserAudio, false
-			);
-		}
-		else {
-			session.playClockWallAt = cpuMonotonicNow();
-		}
+		session.playClockWallAt = cpuMonotonicNow();
 		session.bufferState = 'playing';
 		self._updateCpuAudioPresentation(session);
 		self._scheduleCpuBufferedPresentation(session, 0);
@@ -4296,7 +3402,6 @@ return view.extend({
 	_startCpuBufferedPlayback: function (session) {
 		const self = this;
 		const audio = session && session.audio;
-		const browserAudio = session && session.browserAudio;
 
 		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
 		    session.bufferState !== 'buffering' || document.hidden)
@@ -4307,8 +3412,6 @@ return view.extend({
 			self._syncCpuMuteControl();
 			return;
 		}
-		if (!audio && browserAudio && browserAudio.resolving)
-			return;
 		session.playedSeconds = 0;
 		session.playClockMediaBase = 0;
 		session.videoPlaybackRate = 1;
@@ -4320,18 +3423,6 @@ return view.extend({
 			session.playClockContextAt = audio.nextPlayTime;
 			if (!self._fillCpuBufferedAudioQueue(session))
 				return;
-		}
-		else if (browserAudio && browserAudio.active && browserAudio.element) {
-			browserAudio.waitingForVideo = false;
-			browserAudio.syncPaused = false;
-			try {
-				browserAudio.element.currentTime = 0;
-				browserAudio.element.playbackRate = 1;
-			}
-			catch (err) {}
-			browserAudio.playPromise = self._playCpuBrowserAudio(
-				session, browserAudio, false
-			);
 		}
 		else {
 			session.playClockWallAt = cpuMonotonicNow();
@@ -4350,7 +3441,6 @@ return view.extend({
 	_maybeStartCpuBufferedPlayback: function (session) {
 		const available = this._cpuBufferedAvailableUntil(session);
 		const audio = session && session.audio;
-		const browserAudio = session && session.browserAudio;
 		const tolerance = Math.max(
 			1 / Math.max(1, Number(session && session.fps) || 1),
 			CPU_AV_BUFFER_TOLERANCE_SECONDS
@@ -4370,8 +3460,6 @@ return view.extend({
 		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback)
 			return;
 		if (session.pendingAudio && !session.audio)
-			return;
-		if (!audio && browserAudio && browserAudio.resolving)
 			return;
 		if (audio && audio.active && audio.resumeFailed)
 			return;
@@ -4570,48 +3658,21 @@ return view.extend({
 	},
 
 	_failCpuBufferedPlayback: function (session, message) {
-		const self = this;
-
-		if (!self._isCurrentCpuSession(session) || !session.bufferedPlayback ||
-		    session.bufferFallbackPending)
+		if (!this._isCurrentCpuSession(session) || !session.bufferedPlayback ||
+		    session.bufferFailurePending)
 			return;
-		session.bufferFallbackPending = true;
-		const relPath = session.relPath;
-		const label = session.label;
-		const generation = session.generation;
-		const stopped = self._detachCpuSession(true);
-		self._stopRendererBestEffort(stopped);
-		self._setPlayerSurface('none');
-		if (!relPath) {
-			self._setNowPlaying(message);
-			notify(null, E('p', {}, message), 8000, 'error');
-			return;
-		}
+		session.bufferFailurePending = true;
+		const stopped = this._detachCpuSession(true);
+		this._stopRendererBestEffort(stopped);
+		this._currentKind = null;
+		this._currentRenderMode = null;
+		this._currentSrc = null;
+		this._currentLabel = '';
+		this._setPlayerSurface('none');
+		this._setNowPlaying(message);
 		notify(null, E('p', {},
-			_('%s Using browser decoding instead; fallback starts muted.')
-				.format(message)), 9000, 'warning');
-		callResolve(relPath).then(function (res) {
-			if (generation !== self._playGeneration || !res || res.error ||
-			    !res.stream_url)
-				throw new Error(String(res && res.error ||
-					_('The streamer did not return a playback URL.')));
-			return self._playInVideo(
-				res.stream_url, label, generation, 'local', true
-			);
-		}).catch(function (err) {
-			if (generation !== self._playGeneration)
-				return;
-			self._currentKind = null;
-			self._currentRenderMode = null;
-			self._currentSrc = null;
-			self._setPlayerSurface('none');
-			self._setNowPlaying(
-				_('Unable to play %s: %s').format(label, errorText(err))
-			);
-			notify(null, E('p', {},
-				_('Browser fallback failed: %s').format(errorText(err))),
-			8000, 'error');
-		});
+			_('%s Switch to Browser decoding mode manually if you want browser source decoding.')
+				.format(message)), 9000, 'error');
 	},
 
 	_finalizeCpuBufferedVideoDrain: function (session) {
@@ -4699,6 +3760,7 @@ return view.extend({
 	_startCpuFetchStream: function (session, attempt, requestUrl) {
 		const self = this;
 		const expectedBoundary = 'videoplayer-' + session.token;
+		let fetchPromise;
 
 		attempt.streamId = String(attempt.streamId || '');
 		if (!/^[0-9]{1,16}(?:-[0-9]{1,16})?$/.test(attempt.streamId)) {
@@ -4717,13 +3779,23 @@ return view.extend({
 			session.videoTerminalDrainCandidateId = attempt.streamId;
 			session.videoTerminalDrainBodyClean = false;
 		}
-		attempt.controller = new window.AbortController();
-		attempt.fetchPromise = window.fetch(requestUrl, {
-			method: 'GET',
-			credentials: 'same-origin',
-			cache: 'no-store',
-			signal: attempt.controller.signal
-		}).then(function (response) {
+		try {
+			attempt.controller = new window.AbortController();
+			fetchPromise = window.fetch(requestUrl, {
+				method: 'GET',
+				credentials: 'same-origin',
+				cache: 'no-store',
+				signal: attempt.controller.signal
+			});
+			if (!fetchPromise || typeof fetchPromise.then !== 'function')
+				throw new Error(_('The browser did not start the router video request.'));
+		}
+		catch (err) {
+			attempt.failureReason = errorText(err);
+			self._handleCpuStreamFailure(session, attempt);
+			return;
+		}
+		attempt.fetchPromise = fetchPromise.then(function (response) {
 			const contentType = String(
 				response && response.headers &&
 				response.headers.get('Content-Type') || ''
@@ -4957,14 +4029,6 @@ return view.extend({
 			this._disposeCpuAudio(session.pendingAudio);
 			session.pendingAudio = null;
 		}
-		if (session.browserAudio) {
-			this._disposeCpuBrowserAudio(session.browserAudio);
-			session.browserAudio = null;
-		}
-		if (session.audioDrainer) {
-			this._disposeCpuAudioDrainer(session.audioDrainer);
-			session.audioDrainer = null;
-		}
 	},
 
 	_detachCpuSession: function (clearFrame) {
@@ -4992,7 +4056,6 @@ return view.extend({
 		const session = this._detachCpuSession(true);
 		this._stopRendererBestEffort(session);
 		this._clearVideoElement();
-		this._clearCpuBrowserAudioElement();
 		this._currentSrc = null;
 		this._currentKind = null;
 		this._currentRenderMode = null;
@@ -5009,7 +4072,6 @@ return view.extend({
 
 		this._stopRendererBestEffort(session);
 		this._clearVideoElement();
-		this._clearCpuBrowserAudioElement();
 		this._currentSrc = null;
 		this._currentRenderMode = null;
 		this._setPlayerSurface('none');
@@ -5122,21 +4184,6 @@ return view.extend({
 		if (!session.firstFrameSeen) {
 			session.firstFrameSeen = true;
 			session.firstFrameAt = session.streamLastFrameAt;
-			if (session.browserAudio &&
-			    session.browserAudio.active &&
-			    session.browserAudio.waitingForVideo) {
-				if (document.hidden) {
-					session.browserAudio.syncPaused = true;
-				}
-				else {
-					session.browserAudio.waitingForVideo = false;
-					session.browserAudio.syncPaused = false;
-					session.browserAudio.playPromise =
-						this._playCpuBrowserAudio(
-							session, session.browserAudio, false
-						);
-				}
-			}
 		}
 		this._setPlayerSurface('cpu');
 		this._updateCpuAudioPresentation(session);
@@ -5307,11 +4354,11 @@ return view.extend({
 			if (!session.bufferedPlayback &&
 			    (attempt.fetchUnsupported || session.streamFetchErrors >= 2)) {
 				session.fetchDisabled = true;
-				if (!session.fetchFallbackWarned) {
-					session.fetchFallbackWarned = true;
+				if (!session.fetchUnsupportedWarned) {
+					session.fetchUnsupportedWarned = true;
 					notify(null, E('p', {},
-						_('This browser cannot parse the router MJPEG stream directly. Falling back to native MJPEG playback; precise frame-clock audio synchronization may be unavailable.')),
-					6000, 'warning');
+						_('This browser cannot parse the strict router MJPEG stream. CPU playback will stop without switching source decoding to the browser.')),
+					6000, 'error');
 				}
 			}
 		}
@@ -5452,7 +4499,7 @@ return view.extend({
 			document.getElementById('videoplayer-cpu-frame')
 		);
 		const parent = visible && visible.parentNode;
-		let attempt, frame, requestUrl, previousTransport, nativeBase, streamId;
+		let attempt, requestUrl, streamId;
 
 		if (!self._isCurrentCpuSession(session) || session.finishing ||
 		    (session.bufferedPlayback && session.videoProducerDrained) ||
@@ -5532,128 +4579,20 @@ return view.extend({
 			self._scheduleCpuStreamProbe(session, attempt);
 			return;
 		}
-		if (session.bufferedPlayback) {
+		if (session.bufferedPlayback)
 			self._failCpuBufferedPlayback(
 				session,
-				_('This browser cannot read the continuous router stream required for synchronized buffered playback.')
+				_('This browser cannot read the router-rendered stream required for strict CPU playback.')
 			);
-			return;
-		}
-
-		previousTransport = session.streamTransportMode;
-		nativeBase = self._cpuVideoTarget(session, cpuMonotonicNow());
-		session.streamTransportMode = 'native-mjpeg';
-		if (previousTransport !== 'native-mjpeg') {
-			/* Fetch supplies exact frame sequence timestamps; native multipart
-			 * <img> does not. Retain only the last displayed media position as the
-			 * native epoch, and discard the stale fetch clock before browser audio
-			 * is allowed to start. */
-			session.nativeMediaBase = Number.isFinite(nativeBase)
-				? nativeBase
-				: (Number.isFinite(session.videoMediaTime)
-					? session.videoMediaTime
-					: 0);
-			session.videoMediaTime = null;
-			session.videoFrameAt = null;
-			session.videoPlaybackRate = null;
-			session.videoRateAnchorMedia = null;
-			session.videoRateAnchorAt = null;
-			session.firstFrameSeen = false;
-			session.firstFrameAt = null;
-			session.streamLastFrameAt = null;
-			if (session.streamVisibleAttempt &&
-			    session.streamVisibleAttempt.mode === 'fetch') {
-				const oldFetchAttempt = session.streamVisibleAttempt;
-
-				self._disposeCpuFetchAttempt(oldFetchAttempt, session);
-				session.streamVisibleAttempt = null;
-				if (session.streamProbeAttempt === oldFetchAttempt) {
-					if (session.streamProbeTimer != null)
-						window.clearTimeout(session.streamProbeTimer);
-					session.streamProbeTimer = null;
-					session.streamProbeAttempt = null;
-				}
-			}
-			if (session.streamRefreshTimer != null)
-				window.clearTimeout(session.streamRefreshTimer);
-			session.streamRefreshTimer = null;
-			session.streamNextHandoffAt = null;
-			if (session.avSyncTimer != null)
-				window.clearTimeout(session.avSyncTimer);
-			session.avSyncTimer = null;
-			if (session.browserAudio && session.browserAudio.active) {
-				session.browserAudio.waitingForVideo = true;
-				if (session.browserAudio.element)
-					self._pauseCpuBrowserAudioForSync(
-						session, session.browserAudio
-					);
-			}
-		}
-		/* Native multipart <img> playback exposes no per-frame sequence or PTS.
-		 * Running PCM at chunk=live/1x here would recreate the original audio-ahead
-		 * bug on a slow router. Use the protected browser track for this emergency
-		 * transport; exact PCM synchronization remains a fetch-stream feature. */
-		if (session.audio && session.audio.active) {
-			self._disableCpuAudio(
+		else
+			self._finishCpuPlayback(
 				session,
-				_('Precise PCM synchronization is unavailable in native MJPEG fallback mode.')
+				_('This browser cannot read the router-rendered stream required for strict CPU playback.'),
+				true,
+				true
 			);
-		}
-		else if (session.pendingAudio) {
-			const pending = session.pendingAudio;
+		return;
 
-			session.pendingAudio = null;
-			self._disposeCpuAudio(pending);
-			self._startCpuBrowserAudioFallback(
-				session,
-				_('Precise PCM synchronization is unavailable in native MJPEG fallback mode.')
-			);
-		}
-		frame = document.createElement('img');
-		frame.className = 'videoplayer-cpu-frame';
-		frame.hidden = true;
-		frame.setAttribute('aria-hidden', 'true');
-		frame.setAttribute('alt', _('Continuous router-rendered video stream'));
-		parent.insertBefore(frame, visible.nextSibling || null);
-		attempt = {
-			id: session.streamAttempt,
-			mode: 'native-mjpeg',
-			node: frame,
-			openedAt: Date.now(),
-			ready: false,
-			ended: false,
-			closeObserved: false
-		};
-		session.streamPending = attempt;
-		frame.onload = function () {
-			if (!self._isCurrentCpuSession(session) || session.finishing)
-				return;
-			if (session.streamPending === attempt && !attempt.ready) {
-				self._markCpuStreamStarted(session, attempt);
-				return;
-			}
-			/* Some browsers emit load only when a finite MJPEG response
-			 * closes. Others emit it for individual parts, so only a late,
-			 * once-per-attempt event may accelerate the bounded handoff. */
-			if (session.streamVisibleAttempt === attempt &&
-			    attempt.ready && !attempt.closeObserved &&
-			    Date.now() - attempt.openedAt >=
-			    session.streamSegmentMs - 1500) {
-				attempt.closeObserved = true;
-				if (session.streamRefreshTimer != null)
-					window.clearTimeout(session.streamRefreshTimer);
-				session.streamRefreshTimer = null;
-				session.streamNextHandoffAt =
-					Date.now() + CPU_STREAM_HANDOFF_GRACE_MS;
-				self._scheduleCpuStreamReconnect(
-					session, CPU_STREAM_HANDOFF_GRACE_MS);
-			}
-		};
-		frame.onerror = function () {
-			self._handleCpuStreamFailure(session, attempt);
-		};
-		frame.src = requestUrl;
-		self._scheduleCpuStreamProbe(session, attempt);
 	},
 
 	_scheduleCpuStreamStatus: function (session, delay) {
@@ -5696,6 +4635,15 @@ return view.extend({
 
 			if (!self._isCurrentCpuSession(session) || session.finishing)
 				return;
+			if (!hasStrictCpuAttestation(res)) {
+				const message = _('The router renderer status lost its software-only CPU attestation.');
+
+				if (session.bufferedPlayback)
+					self._failCpuBufferedPlayback(session, message);
+				else
+					self._finishCpuPlayback(session, message, true, true);
+				return;
+			}
 			session.streamStatusErrors = 0;
 			session.streamStatusWarned = false;
 			if (session.bufferedPlayback)
@@ -5804,13 +4752,14 @@ return view.extend({
 			if (!self._isCurrentCpuSession(session) || session.finishing)
 				return;
 			session.streamStatusErrors++;
-			if (session.streamStatusErrors >= 3 &&
-			    !session.streamStatusWarned) {
-				session.streamStatusWarned = true;
-				notify(null, E('p', {},
-					_('Unable to verify the router video stream: %s')
-						.format(errorText(err))),
-				6000, 'warning');
+			if (session.streamStatusErrors >= 3) {
+				const message = _('Unable to verify the strict router CPU renderer: %s')
+					.format(errorText(err));
+
+				if (session.bufferedPlayback)
+					self._failCpuBufferedPlayback(session, message);
+				else
+					self._finishCpuPlayback(session, message, true, true);
 			}
 		}).finally(function () {
 			const runAgain = session.streamStatusAgain;
@@ -5818,9 +4767,8 @@ return view.extend({
 			session.streamStatusInFlight = false;
 			session.streamStatusAgain = false;
 			/* Keep authenticated status-touch polling alive throughout buffered
-			 * playback, even after the producer drain is complete. The ended worker
-			 * then retains only its validated source fd for protected browser-audio
-			 * Range requests and releases it on finish/Stop or lease expiry. */
+			 * playback, even after the producer drain is complete, until finish,
+			 * Stop, or lease expiry releases the attested renderer session. */
 			if (self._isCurrentCpuSession(session) && !session.finishing)
 				self._scheduleCpuStreamStatus(
 					session,
@@ -5844,27 +4792,9 @@ return view.extend({
 		    session.firstFrameSeen && Number.isFinite(session.videoMediaTime)) {
 			this._activatePendingCpuAudio(session);
 		}
-		if (!isError && !force && session.browserAudio &&
-		    session.browserAudio.active &&
-		    session.browserAudio.waitingForVideo &&
-		    session.browserAudio.element &&
-		    Number.isFinite(session.videoPlaybackRate)) {
-			session.browserAudio.waitingForVideo = false;
-			session.browserAudio.syncPaused = false;
-			session.browserAudio.playPromise = this._playCpuBrowserAudio(
-				session, session.browserAudio, false
-			);
-		}
-
 		if (!isError && !force &&
-		    ((session.audio &&
-		      (session.audio.active || (session.audio.sources || []).length)) ||
-		     (session.browserAudio && session.browserAudio.active &&
-		      !session.browserAudio.ended &&
-		      (session.browserAudio.playing ||
-		       session.browserAudio.playPending ||
-		       session.browserAudio.resolving ||
-		       session.browserAudio.waitingForVideo)))) {
+		    session.audio &&
+		    (session.audio.active || (session.audio.sources || []).length)) {
 			if (!session.finishing) {
 				const self = this;
 				session.finishing = {
@@ -6111,7 +5041,7 @@ return view.extend({
 				audio.notReadyDelay = null;
 				return self._disableCpuAudio(
 					session,
-					_('Router-decoded PCM audio became unavailable; using protected browser audio while router-rendered video continues.'),
+					_('Router-decoded PCM audio became unavailable. Strict CPU playback was stopped.'),
 					true
 				).then(function () { return { done: true }; });
 			}
@@ -6452,6 +5382,7 @@ return view.extend({
 		const streamUrl = String(res.stream_url || '');
 		const segmentSeconds = Number(res.stream_segment_seconds);
 		const hasAudio = flagOn(res.has_audio);
+		const audioState = String(res.audio_state || '');
 		const audioUrl = String(res.audio_url || '');
 		const routerProfile = normalizeRouterProfile(
 			res.router_profile || self._routerProfile
@@ -6463,6 +5394,9 @@ return view.extend({
 			Number(res.audio_sample_rate) === CPU_AUDIO_SAMPLE_RATE &&
 			Number(res.audio_channels) === CPU_AUDIO_CHANNELS &&
 			Number(res.audio_frames_per_chunk) === CPU_AUDIO_FRAMES_PER_CHUNK;
+		const audioContractValid =
+			(audioState === 'ready' && audioMetadataValid) ||
+			(audioState === 'absent' && !hasAudio && !audioUrl);
 		const requireBufferedPlayback = !!String(relPath || '');
 		let bufferedUnavailableReason = '';
 		let canvas = null;
@@ -6474,6 +5408,8 @@ return view.extend({
 		    normalizeRenderMode(res.render_mode) !== 'router' ||
 		    res.stream_type !== 'mjpeg-stream' ||
 		    res.mime !== 'multipart/x-mixed-replace' ||
+		    !hasStrictCpuAttestation(res) ||
+		    !audioContractValid ||
 		    !Number.isInteger(segmentSeconds) ||
 		    segmentSeconds < 10 ||
 		    segmentSeconds > 55) {
@@ -6496,15 +5432,15 @@ return view.extend({
 			callStopRenderer(token).catch(function () {});
 			return Promise.resolve();
 		}
-		if (!audioMetadataValid) {
+		if (audioState === 'absent') {
 			self._disposeCpuAudio(pendingAudio);
 			pendingAudio = null;
 		}
 		else if (pendingAudio) {
 			pendingAudio.url = audioUrl;
 		}
-		if (requireBufferedPlayback && hasAudio && !audioMetadataValid)
-			bufferedUnavailableReason = _('The router returned invalid PCM metadata required for synchronized buffering.');
+		if (audioState === 'ready' && !pendingAudio)
+			bufferedUnavailableReason = _('This browser cannot create the Web Audio output required for router-decoded PCM.');
 		else if (requireBufferedPlayback) {
 			canvas = document.getElementById('videoplayer-cpu-canvas');
 			try {
@@ -6520,32 +5456,15 @@ return view.extend({
 		if (bufferedUnavailableReason) {
 			self._disposeCpuAudio(pendingAudio);
 			callStopRenderer(token).catch(function () {});
+			self._currentKind = null;
+			self._currentRenderMode = null;
+			self._currentSrc = null;
+			self._setPlayerSurface('none');
+			self._setNowPlaying(bufferedUnavailableReason);
 			notify(null, E('p', {},
-				_('%s Using browser decoding instead; fallback starts muted.')
-					.format(bufferedUnavailableReason)),
-			9000, 'warning');
-			return callResolve(relPath).then(function (fallback) {
-				if (generation !== self._playGeneration || !fallback ||
-				    fallback.error || !fallback.stream_url)
-					throw new Error(String(fallback && fallback.error ||
-						_('The streamer did not return a playback URL.')));
-				return self._playInVideo(
-					fallback.stream_url, label, generation, 'local', true
-				);
-			}).catch(function (err) {
-				if (generation !== self._playGeneration)
-					return;
-				self._currentKind = null;
-				self._currentRenderMode = null;
-				self._currentSrc = null;
-				self._setPlayerSurface('none');
-				self._setNowPlaying(
-					_('Unable to play %s: %s').format(label, errorText(err))
-				);
-				notify(null, E('p', {},
-					_('Browser fallback failed: %s').format(errorText(err))),
-				7000, 'error');
-			});
+				_('%s Switch to Browser decoding mode manually if desired.')
+					.format(bufferedUnavailableReason)), 9000, 'error');
+			return Promise.resolve(false);
 		}
 
 		if (canvas && canvasContext) {
@@ -6557,6 +5476,11 @@ return view.extend({
 
 		const session = {
 			token: token,
+			rendererBackend: res.renderer_backend,
+			attestationMarker: res.attestation_marker,
+			hardwareAcceleration: res.hardware_acceleration,
+			runtimeAttested: res.runtime_attested,
+			presentation: res.presentation,
 			streamUrl: streamUrl,
 			streamSegmentMs: segmentSeconds * 1000,
 			generation: generation,
@@ -6609,7 +5533,7 @@ return view.extend({
 			presentationTimer: null,
 			presentationTimerType: null,
 			counterUpdatedAt: null,
-			bufferFallbackPending: false,
+			bufferFailurePending: false,
 			audioBatchMaxChunks: Math.max(
 				1,
 				Math.min(
@@ -6633,7 +5557,7 @@ return view.extend({
 			streamWarned: false,
 			streamFetchErrors: 0,
 			fetchDisabled: false,
-			fetchFallbackWarned: false,
+			fetchUnsupportedWarned: false,
 			streamProbeTimer: null,
 			streamProbeAttempt: null,
 			streamRefreshTimer: null,
@@ -6654,11 +5578,6 @@ return view.extend({
 			pendingAudio: pendingAudio,
 			audioWarned: false,
 			audioFailureReason: '',
-			audioDrainer: null,
-			browserAudio: null,
-			browserAudioFailed: false,
-			browserAudioWarned: false,
-			browserAudioPrompted: false,
 			finishing: null,
 			finishTimer: null
 		};
@@ -6667,10 +5586,6 @@ return view.extend({
 		self._currentRenderMode = 'router';
 		self._currentLabel = label;
 		self._currentSrc = streamUrl;
-		if (session.bufferedPlayback && audioMetadataValid && !pendingAudio)
-			self._startCpuAudioDrainer(
-				session, audioUrl, 0, session.audioBatchMaxChunks
-			);
 		self._setPlayerSurface(
 			session.bufferedPlayback ? 'cpu-buffered' : 'cpu'
 		);
@@ -6696,22 +5611,18 @@ return view.extend({
 			return Promise.resolve(true);
 		}
 
-		let fallbackReason;
-		if (!hasAudio)
-			fallbackReason = _('Router FFmpeg could not provide a usable PCM audio track.');
-		else if (!audioMetadataValid)
-			fallbackReason = _('The router returned invalid PCM audio metadata.');
-		else
-			fallbackReason = _('This browser could not start the PCM Web Audio output.');
-		return self._startCpuBrowserAudioFallback(session, fallbackReason);
+		/* audio_state=absent is an attested video-only source, not an audio
+		 * failure. It is the only strict CPU session allowed to play silently. */
+		self._updateCpuAudioPresentation(session);
+		return Promise.resolve(true);
 	},
 
 	_playLocal: function (relPath, name) {
 		const self = this;
 		relPath = String(relPath || '').replace(/^\/+/, '');
-		let useRouter = self._renderMode === 'router' && self._canWriteSettings;
-		let unavailableReason = '';
+		const useRouter = self._renderMode === 'router';
 		let pendingAudio = null;
+		let preparedRendererToken = '';
 
 		if (self._localResolvePending) {
 			notify(null, _('Another local video is still being prepared.'), 3000, 'warning');
@@ -6734,17 +5645,21 @@ return view.extend({
 			notify(null, E('p', {}, _('No file path for playback')), 6000, 'error');
 			return Promise.resolve();
 		}
-		if (useRouter && self._rendererAvailable === false) {
-			unavailableReason = String(
-				(self._status && self._status.renderer_reason) ||
-				_('FFmpeg capability check failed')
-			);
-			useRouter = false;
-		}
 		if (self._renderMode === 'router' && !self._canWriteSettings) {
-			notify(null,
-				_('Router CPU rendering requires write permission. Using browser decoding for this account.'),
-				5000, 'warning');
+			notify(null, E('p', {},
+				_('Router CPU rendering requires write permission. Playback was not started; switch to Browser decoding mode to play with this account.')),
+			7000, 'error');
+			return Promise.resolve();
+		}
+		if (useRouter && self._rendererAvailable !== true) {
+			const unavailableReason = String(
+				(self._status && self._status.renderer_reason) ||
+				_('the private software-only runtime did not pass attestation')
+			);
+			notify(null, E('p', {},
+				_('Router CPU rendering is unavailable: %s. Playback was not started; switch to Browser decoding mode manually if desired.')
+					.format(unavailableReason)), 8000, 'error');
+			return Promise.resolve();
 		}
 
 		const label = name || relPath;
@@ -6766,41 +5681,27 @@ return view.extend({
 			self._disposeCpuAudio(pendingAudio);
 			pendingAudio = null;
 		};
-		const fallbackToBrowser = function (routerError) {
-			routerError = String(routerError || _('Unknown router renderer error'));
-			discardPendingAudio();
-			if (generation !== self._playGeneration || !self._canBrowseLocal())
-				return { error: routerError };
+		const stopReturnedRenderer = function (res) {
+			const returnedToken = String(res && res.session_token || '');
 
-			return callResolve(relPath).then(function (fallback) {
-				fallback = fallback || {};
-				fallback.router_fallback_reason = routerError;
-				return fallback;
-			}, function (err) {
-				return {
-					error: errorText(err),
-					router_fallback_reason: routerError
-				};
-			});
+			if (useRouter && /^[0-9a-f]{32}$/.test(returnedToken))
+				callStopRenderer(returnedToken).catch(function () {});
 		};
 		const preparation = useRouter
 			? callStartRenderer(relPath).then(function (res) {
 				res = res || {};
-				if (!res.error)
-					return res;
-				return fallbackToBrowser(res.error);
+				return res;
 			}, function (err) {
-				return fallbackToBrowser(errorText(err));
+				return { error: errorText(err) };
 			})
 			: callResolve(relPath).then(function (res) {
-				res = res || {};
-				if (unavailableReason)
-					res.router_fallback_reason = unavailableReason;
-				return res;
+				return res || {};
 			});
 
 		return preparation.then(function (res) {
 			res = res || {};
+			if (useRouter && /^[0-9a-f]{32}$/.test(String(res.session_token || '')))
+				preparedRendererToken = String(res.session_token);
 			if (generation !== self._playGeneration || !self._canBrowseLocal()) {
 				discardPendingAudio();
 				if (/^[0-9a-f]{32}$/.test(String(res.session_token || '')))
@@ -6810,23 +5711,21 @@ return view.extend({
 
 			if (res.error) {
 				discardPendingAudio();
-				const preparationError = res.router_fallback_reason
-					? _('Router CPU renderer failed: %s Browser fallback also failed: %s')
-						.format(res.router_fallback_reason, res.error)
-					: res.error;
+				stopReturnedRenderer(res);
 				self._currentKind = null;
 				self._currentRenderMode = null;
 				self._currentSrc = null;
 				self._setPlayerSurface('none');
 				self._setNowPlaying(_('Unable to prepare local video: %s').format(label));
 				notify(null, E('p', {},
-					_('Unable to prepare local video: %s').format(preparationError)),
+					_('Unable to prepare local video: %s').format(res.error)),
 				7000, 'error');
 				return;
 			}
 
 			if (!res.stream_url) {
 				discardPendingAudio();
+				stopReturnedRenderer(res);
 				self._currentKind = null;
 				self._currentRenderMode = null;
 				self._currentSrc = null;
@@ -6836,17 +5735,9 @@ return view.extend({
 				return;
 			}
 
-			if (res.router_fallback_reason) {
-				notify(null, E('p', {},
-					_('Router CPU renderer could not play %s: %s. Using browser decoding instead; fallback starts muted.')
-						.format(label, res.router_fallback_reason)),
-				9000, 'warning');
-			}
-
 			/* stream_url is an opaque, ACL-protected token URL. Router mode
 			 * only appends a strictly numeric multipart reconnect nonce. */
-			if (normalizeRenderMode(res.render_mode) === 'router' ||
-			    res.stream_type === 'mjpeg-stream') {
+			if (useRouter) {
 				const audio = pendingAudio;
 				if (self._pendingCpuAudio === audio)
 					self._pendingCpuAudio = null;
@@ -6861,10 +5752,19 @@ return view.extend({
 				label,
 				generation,
 				'local',
-				!!res.router_fallback_reason
+				false
 			);
 		}).catch(function (err) {
+			let stoppedSession = null;
+
 			discardPendingAudio();
+			if (useRouter && self._cpuSession &&
+			    self._cpuSession.generation === generation) {
+				stoppedSession = self._detachCpuSession(true);
+				self._stopRendererBestEffort(stoppedSession);
+			}
+			if (!stoppedSession && /^[0-9a-f]{32}$/.test(preparedRendererToken))
+				callStopRenderer(preparedRendererToken).catch(function () {});
 			if (generation !== self._playGeneration)
 				return;
 
@@ -6891,6 +5791,12 @@ return view.extend({
 
 		if (!self._allowRemote) {
 			notify(null, E('p', {}, _('Remote playback is disabled')), 5000, 'warning');
+			return Promise.resolve();
+		}
+		if (self._renderMode === 'router') {
+			const message = _('Remote URLs cannot be opened in strict Router CPU rendering mode. Switch to Browser decoding mode and apply the setting first.');
+			self._setFieldError(input, 'vp-remote-url-error', message);
+			notify(null, E('p', {}, message), 7000, 'error');
 			return Promise.resolve();
 		}
 

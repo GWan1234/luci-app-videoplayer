@@ -34,7 +34,7 @@ endif
 
 PKG_NAME:=ffmpeg
 PKG_VERSION:=6.1.4
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
 PKG_SOURCE_URL:=https://ffmpeg.org/releases/
@@ -149,6 +149,8 @@ define Build/Configure
 			--disable-vaapi \
 			--disable-vdpau \
 			--disable-vulkan \
+			--disable-decoders \
+			--disable-encoders \
 			--disable-x86asm \
 			--disable-zlib \
 			--disable-bzlib \
@@ -160,18 +162,14 @@ define Build/Configure
 			--enable-pthreads \
 			--disable-runtime-cpudetect \
 			$(CODEC_ARCH_CONFIG) \
-			--disable-decoder=h263_v4l2m2m \
-			--disable-decoder=h264_v4l2m2m \
-			--disable-decoder=hevc_v4l2m2m \
-			--disable-decoder=mpeg1_v4l2m2m \
-			--disable-decoder=mpeg2_v4l2m2m \
-			--disable-decoder=mpeg4_v4l2m2m \
-			--disable-decoder=vc1_v4l2m2m \
-			--disable-decoder=vp8_v4l2m2m \
-			--disable-decoder=vp9_v4l2m2m \
 			--enable-decoder=h264 \
 			--enable-decoder=hevc \
 			--enable-decoder=vc1 \
+			--enable-decoder=mpeg4 \
+			--enable-decoder=vp8 \
+			--enable-decoder=vp9 \
+			--enable-decoder=av1 \
+			--enable-decoder=mjpeg \
 			--enable-decoder=aac \
 			--enable-decoder=ac3 \
 			--enable-decoder=eac3 \
@@ -183,6 +181,7 @@ define Build/Configure
 			--enable-decoder=pcm_s16le \
 			--enable-decoder=truehd \
 			--enable-decoder=vorbis \
+			--enable-encoder=mjpeg \
 			--enable-encoder=pcm_s16le \
 			--enable-muxer=mpjpeg \
 			--enable-muxer=pcm_s16le \
@@ -234,6 +233,157 @@ if [ -z "$${IPKG_INSTROOT:-}" ]; then
 		echo "This codec runtime requires OpenWrt $(CODEC_OPENWRT_RELEASE) $(CODEC_OPENWRT_REVISION), architecture $(CODEC_COMPATIBLE_ARCH)." >&2
 		exit 1
 	}
+	renderer_helper="/usr/libexec/videoplayer-renderer"
+	maintenance_marker="/tmp/videoplayer-render-v1.maintenance"
+	if [ -e "$${renderer_helper}" ] || [ -L "$${renderer_helper}" ]; then
+		[ -f "$${renderer_helper}" ] &&
+			[ ! -L "$${renderer_helper}" ] &&
+			[ -x "$${renderer_helper}" ] &&
+			[ "$$(stat -c '%u:%a' "$${renderer_helper}" 2>/dev/null)" = "0:755" ] || {
+				echo "Cannot enter renderer maintenance mode before replacing the codec runtime. Install luci-app-videoplayer 1.2.0 or newer first." >&2
+				exit 1
+			}
+		maintenance_output="$$(
+			"$${renderer_helper}" maintenance-enter
+			maintenance_status=$$?
+			printf '__VIDEOPLAYER_RC__%s' "$${maintenance_status}"
+		)"
+		maintenance_expected="$$(printf 'maintenance\n__VIDEOPLAYER_RC__0')"
+		[ "$${maintenance_output}" = "$${maintenance_expected}" ] || {
+			echo "Renderer maintenance mode is unavailable or returned an invalid acknowledgement. Install luci-app-videoplayer 1.2.0 or newer first; the codec runtime was not changed." >&2
+			exit 1
+		}
+		"$${renderer_helper}" cleanup || {
+			echo "Could not quiesce the renderer before replacing the codec runtime; maintenance mode remains active." >&2
+			exit 1
+		}
+		[ -f "$${maintenance_marker}" ] &&
+			[ ! -L "$${maintenance_marker}" ] &&
+			[ "$$(stat -c '%u:%a:%s' "$${maintenance_marker}" 2>/dev/null)" = "0:600:15" ] &&
+			[ "$$(cat "$${maintenance_marker}" 2>/dev/null)" = "maintenance-v1" ] || {
+				echo "Renderer maintenance marker is missing or unsafe after cleanup; the codec runtime was not changed." >&2
+				exit 1
+			}
+	fi
+fi
+exit 0
+endef
+
+define Package/luci-videoplayer-codec-runtime/postinst
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT:-}" ]; then
+	renderer_helper="/usr/libexec/videoplayer-renderer"
+	maintenance_marker="/tmp/videoplayer-render-v1.maintenance"
+	if { [ -e "$${renderer_helper}" ] || [ -L "$${renderer_helper}" ]; } &&
+		{ [ -e "$${maintenance_marker}" ] || [ -L "$${maintenance_marker}" ]; }; then
+		[ -f "$${renderer_helper}" ] &&
+			[ ! -L "$${renderer_helper}" ] &&
+			[ -x "$${renderer_helper}" ] &&
+			[ "$$(stat -c '%u:%a' "$${renderer_helper}" 2>/dev/null)" = "0:755" ] || {
+				echo "Cannot safely leave renderer maintenance mode after installing the codec runtime." >&2
+				exit 1
+			}
+		[ -f "$${maintenance_marker}" ] &&
+			[ ! -L "$${maintenance_marker}" ] &&
+			[ "$$(stat -c '%u:%a:%s' "$${maintenance_marker}" 2>/dev/null)" = "0:600:15" ] &&
+			[ "$$(cat "$${maintenance_marker}" 2>/dev/null)" = "maintenance-v1" ] || {
+				echo "Renderer maintenance marker is missing or unsafe after installing the codec runtime; playback remains blocked." >&2
+				exit 1
+			}
+		maintenance_output="$$(
+			"$${renderer_helper}" maintenance-exit
+			maintenance_status=$$?
+			printf '__VIDEOPLAYER_RC__%s' "$${maintenance_status}"
+		)"
+		maintenance_expected="$$(printf 'resumed\n__VIDEOPLAYER_RC__0')"
+		[ "$${maintenance_output}" = "$${maintenance_expected}" ] || {
+			echo "Could not leave renderer maintenance mode after installing the codec runtime or received an invalid acknowledgement; playback remains blocked." >&2
+			exit 1
+		}
+		[ ! -e "$${maintenance_marker}" ] && [ ! -L "$${maintenance_marker}" ] || {
+			echo "Renderer maintenance marker still exists after resume; playback remains blocked." >&2
+			exit 1
+		}
+	fi
+fi
+exit 0
+endef
+
+define Package/luci-videoplayer-codec-runtime/prerm
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT:-}" ]; then
+	renderer_helper="/usr/libexec/videoplayer-renderer"
+	maintenance_marker="/tmp/videoplayer-render-v1.maintenance"
+	if [ -e "$${renderer_helper}" ] || [ -L "$${renderer_helper}" ]; then
+		[ -f "$${renderer_helper}" ] &&
+			[ ! -L "$${renderer_helper}" ] &&
+			[ -x "$${renderer_helper}" ] &&
+			[ "$$(stat -c '%u:%a' "$${renderer_helper}" 2>/dev/null)" = "0:755" ] || {
+				echo "Cannot enter renderer maintenance mode before removing the codec runtime. Install luci-app-videoplayer 1.2.0 or newer first." >&2
+				exit 1
+			}
+		maintenance_output="$$(
+			"$${renderer_helper}" maintenance-enter
+			maintenance_status=$$?
+			printf '__VIDEOPLAYER_RC__%s' "$${maintenance_status}"
+		)"
+		maintenance_expected="$$(printf 'maintenance\n__VIDEOPLAYER_RC__0')"
+		[ "$${maintenance_output}" = "$${maintenance_expected}" ] || {
+			echo "Renderer maintenance mode is unavailable or returned an invalid acknowledgement. Install luci-app-videoplayer 1.2.0 or newer first; the codec runtime was not changed." >&2
+			exit 1
+		}
+		"$${renderer_helper}" cleanup || {
+			echo "Could not quiesce the renderer before removing the codec runtime; maintenance mode remains active." >&2
+			exit 1
+		}
+		[ -f "$${maintenance_marker}" ] &&
+			[ ! -L "$${maintenance_marker}" ] &&
+			[ "$$(stat -c '%u:%a:%s' "$${maintenance_marker}" 2>/dev/null)" = "0:600:15" ] &&
+			[ "$$(cat "$${maintenance_marker}" 2>/dev/null)" = "maintenance-v1" ] || {
+				echo "Renderer maintenance marker is missing or unsafe after cleanup; the codec runtime was not changed." >&2
+				exit 1
+			}
+	fi
+fi
+exit 0
+endef
+
+define Package/luci-videoplayer-codec-runtime/postrm
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT:-}" ]; then
+	renderer_helper="/usr/libexec/videoplayer-renderer"
+	maintenance_marker="/tmp/videoplayer-render-v1.maintenance"
+	if { [ -e "$${renderer_helper}" ] || [ -L "$${renderer_helper}" ]; } &&
+		{ [ -e "$${maintenance_marker}" ] || [ -L "$${maintenance_marker}" ]; }; then
+		[ -f "$${renderer_helper}" ] &&
+			[ ! -L "$${renderer_helper}" ] &&
+			[ -x "$${renderer_helper}" ] &&
+			[ "$$(stat -c '%u:%a' "$${renderer_helper}" 2>/dev/null)" = "0:755" ] || {
+				echo "Cannot safely leave renderer maintenance mode after removing the codec runtime." >&2
+				exit 1
+			}
+		[ -f "$${maintenance_marker}" ] &&
+			[ ! -L "$${maintenance_marker}" ] &&
+			[ "$$(stat -c '%u:%a:%s' "$${maintenance_marker}" 2>/dev/null)" = "0:600:15" ] &&
+			[ "$$(cat "$${maintenance_marker}" 2>/dev/null)" = "maintenance-v1" ] || {
+				echo "Renderer maintenance marker is missing or unsafe after removing the codec runtime; playback remains blocked." >&2
+				exit 1
+			}
+		maintenance_output="$$(
+			"$${renderer_helper}" maintenance-exit
+			maintenance_status=$$?
+			printf '__VIDEOPLAYER_RC__%s' "$${maintenance_status}"
+		)"
+		maintenance_expected="$$(printf 'resumed\n__VIDEOPLAYER_RC__0')"
+		[ "$${maintenance_output}" = "$${maintenance_expected}" ] || {
+			echo "Could not leave renderer maintenance mode after removing the codec runtime or received an invalid acknowledgement; playback remains blocked." >&2
+			exit 1
+		}
+		[ ! -e "$${maintenance_marker}" ] && [ ! -L "$${maintenance_marker}" ] || {
+			echo "Renderer maintenance marker still exists after resume; playback remains blocked." >&2
+			exit 1
+		}
+	fi
 fi
 exit 0
 endef

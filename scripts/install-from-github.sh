@@ -7,18 +7,11 @@ set -eu
 
 RELEASE_VERSION="1.0.0"
 RELEASE_BASE_URL="https://github.com/communism420/luci-app-videoplayer/releases/download/$RELEASE_VERSION"
-RAW_BASE_URL="https://raw.githubusercontent.com/communism420/luci-app-videoplayer"
-MAIN_BRANCH="main"
-
 APK_FILE="luci-app-videoplayer-$RELEASE_VERSION.apk"
 APK_SHA256="1748d7c763da95f2e4ac6a1c75d304042584ac309f836c1722962e511542f34d"
 IPK_FILE="luci-app-videoplayer_${RELEASE_VERSION}_all.ipk"
 IPK_SHA256="045ac25a604175c9a793e4a50509ccad4155dd46d81ef1deac360479aa40aa24"
-CODEC_INSTALLER_OBJECT="scripts/install-codec-runtime.sh"
-CODEC_INSTALLER_SHA256="314adaa8f713b5b5979a65139ad006c5af35ea7d1570072c21d922992ead814b"
-
 # POSIX ulimit -f counts 512-byte blocks.
-MAX_INSTALLER_BLOCKS="128"
 MAX_PACKAGE_BLOCKS="8192"
 DOWNLOAD_TIMEOUT_SECONDS="30"
 DOWNLOAD_DEADLINE_SECONDS="180"
@@ -134,8 +127,8 @@ case "$#" in
 				printf '%s\n' \
 					"Usage: sh install-from-github.sh" \
 					"" \
-					"Downloads and verifies the required files, installs or updates the matching" \
-					"private FFmpeg runtime, then installs luci-app-videoplayer $RELEASE_VERSION on OpenWrt."
+					"Downloads, verifies, and installs the browser-only luci-app-videoplayer" \
+					"$RELEASE_VERSION package on OpenWrt. It does not install the strict CPU runtime."
 				exit 0
 				;;
 			*)
@@ -199,22 +192,6 @@ trap 'exit 143' TERM
 PACKAGE_PATH="$WORK_DIR/$PACKAGE_FILE"
 PACKAGE_URL="$RELEASE_BASE_URL/$PACKAGE_FILE"
 CHECKSUM_FILE="$WORK_DIR/SHA256SUMS"
-CODEC_INSTALLER_PATH="$WORK_DIR/install-codec-runtime.sh"
-CODEC_INSTALLER_URL="$RAW_BASE_URL/$MAIN_BRANCH/$CODEC_INSTALLER_OBJECT"
-
-printf '%s\n' \
-	"Downloading the architecture-specific FFmpeg installer..."
-if ! download_file \
-	"$CODEC_INSTALLER_URL" \
-	"$CODEC_INSTALLER_PATH" \
-	"$MAX_INSTALLER_BLOCKS"; then
-	die "Could not download $CODEC_INSTALLER_URL"
-fi
-verify_sha256 \
-	"$CODEC_INSTALLER_SHA256" \
-	"$CODEC_INSTALLER_PATH" \
-	"FFmpeg installer"
-
 printf 'Downloading %s from GitHub Release %s...\n' \
 	"$PACKAGE_FILE" "$RELEASE_VERSION"
 if ! download_file \
@@ -227,12 +204,6 @@ fi
 printf '%s  %s\n' "$PACKAGE_SHA256" "$PACKAGE_PATH" > "$CHECKSUM_FILE"
 if ! sha256sum -c "$CHECKSUM_FILE"; then
 	die "The downloaded package failed SHA-256 verification."
-fi
-
-printf '%s\n' \
-	"Installing or updating the architecture-specific FFmpeg runtime first..."
-if ! /bin/sh "$CODEC_INSTALLER_PATH"; then
-	die "The architecture-specific FFmpeg installation or update failed."
 fi
 
 printf 'Installing %s with %s...\n' "$PACKAGE_FILE" "$PACKAGE_MANAGER"

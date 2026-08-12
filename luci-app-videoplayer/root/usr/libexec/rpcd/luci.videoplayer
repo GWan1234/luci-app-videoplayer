@@ -6,7 +6,7 @@
 #
 # ubus/rpcd backend for luci-app-videoplayer
 # Methods: get_status, list, list_renderer, resolve, start_renderer,
-#          resolve_audio, renderer_status, stop_renderer
+#          renderer_status, stop_renderer
 
 . /usr/share/libubox/jshn.sh
 
@@ -34,6 +34,27 @@ AUDIO_FRAMES_PER_CHUNK=48000
 AUDIO_RING_CHUNKS=8
 AUDIO_BATCH_MAX_CHUNKS=2
 MAX_RENDERER_DURATION_MS=21600000
+RENDERER_BACKEND="private-software-cpu"
+RENDERER_ATTESTATION_MARKER="software-cpu-v1"
+RENDERER_HWACCEL="none"
+
+load_renderer_attestation() {
+	local attestation tab expected
+
+	[ -x "$RENDERER_HELPER" ] || return 1
+	attestation="$("$RENDERER_HELPER" attest 2>/dev/null)" || return 1
+	tab="$(printf '\t')"
+	expected="$RENDERER_BACKEND${tab}$RENDERER_ATTESTATION_MARKER${tab}$RENDERER_HWACCEL"
+	[ "$attestation" = "$expected" ]
+}
+
+json_add_renderer_attestation() {
+	json_add_string "renderer_backend" "$RENDERER_BACKEND"
+	json_add_string "attestation_marker" "$RENDERER_ATTESTATION_MARKER"
+	json_add_boolean "hardware_acceleration" 0
+	json_add_boolean "runtime_attested" 1
+	json_add_string "presentation" "browser-managed"
+}
 
 string_has_control() {
 	printf '%s' "$1" | grep -q '[[:cntrl:]]'
@@ -62,6 +83,7 @@ normalize_decimal() {
 
 load_renderer_media_info() {
 	local token="$1" info tab duration_ms remainder total_frames fps profile
+	local backend marker hwaccel
 	local expected_frames
 
 	RENDERER_DURATION_MS=""
@@ -82,8 +104,17 @@ load_renderer_media_info() {
 	remainder="${remainder#*"$tab"}"
 	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
 	fps="${remainder%%"$tab"*}"
-	profile="${remainder#*"$tab"}"
-	case "$profile" in *"$tab"*) return 1 ;; esac
+	remainder="${remainder#*"$tab"}"
+	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
+	profile="${remainder%%"$tab"*}"
+	remainder="${remainder#*"$tab"}"
+	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
+	backend="${remainder%%"$tab"*}"
+	remainder="${remainder#*"$tab"}"
+	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
+	marker="${remainder%%"$tab"*}"
+	hwaccel="${remainder#*"$tab"}"
+	case "$hwaccel" in *"$tab"*) return 1 ;; esac
 	duration_ms="$(normalize_decimal "$duration_ms" 2>/dev/null)" || return 1
 	total_frames="$(normalize_decimal "$total_frames" 2>/dev/null)" || return 1
 	fps="$(normalize_decimal "$fps" 2>/dev/null)" || return 1
@@ -98,6 +129,9 @@ load_renderer_media_info() {
 		fast|quality) ;;
 		*) return 1 ;;
 	esac
+	[ "$backend" = "$RENDERER_BACKEND" ] || return 1
+	[ "$marker" = "$RENDERER_ATTESTATION_MARKER" ] || return 1
+	[ "$hwaccel" = "$RENDERER_HWACCEL" ] || return 1
 	if [ "$duration_ms" -eq 0 ]; then
 		expected_frames=0
 	else
@@ -716,8 +750,15 @@ cmd_get_status() {
 	router_profile="$(get_router_profile)"
 	router_fps="$(get_router_fps "$router_profile")"
 	if [ -x "$RENDERER_HELPER" ]; then
-		if renderer_reason="$("$RENDERER_HELPER" probe 2>/dev/null)"; then
+		if load_renderer_attestation; then
 			renderer_available=1
+			renderer_reason=""
+		else
+			renderer_reason="$("$RENDERER_HELPER" probe 2>&1)" || :
+			if string_has_control "$renderer_reason" ||
+			   [ "${#renderer_reason}" -gt 160 ]; then
+				renderer_reason=""
+			fi
 		fi
 	else
 		renderer_reason="renderer helper is not installed"
@@ -739,7 +780,9 @@ cmd_get_status() {
 	json_add_string "router_profile" "$router_profile"
 	json_add_int "router_fps" "$router_fps"
 	json_add_boolean "renderer_available" "$renderer_available"
-	if [ "$renderer_available" -eq 0 ]; then
+	if [ "$renderer_available" -eq 1 ]; then
+		json_add_renderer_attestation
+	else
 		json_add_string "renderer_reason" "$renderer_reason"
 	fi
 	json_add_boolean "media_path_exists" "$exists"
@@ -983,14 +1026,19 @@ cmd_resolve() {
 	local raw="$1" requested_mode="${2:-browser}"
 	local rel root path canonical_rel parent depth max_depth token name mime
 	local render_mode renderer_message renderer_result
-	local has_audio=0 router_fps router_profile frame_interval duration_ms=0 total_frames=0
+	local has_audio=0 audio_state="" router_fps router_profile frame_interval duration_ms=0 total_frames=0
 
 	[ "$(get_enabled)" = "1" ] || {
 		json_error "video player disabled"
 		return
 	}
 	case "$requested_mode" in
-		browser) ;;
+		browser)
+			[ "$(get_render_mode)" = "browser" ] || {
+				json_error "browser source decoding is not selected"
+				return
+			}
+			;;
 		router)
 			[ "$(get_render_mode)" = "router" ] || {
 				json_error "router CPU rendering is not selected"
@@ -1067,6 +1115,10 @@ cmd_resolve() {
 			json_error "router CPU renderer is not installed"
 			return
 		}
+		load_renderer_attestation || {
+			json_error "private software-only CPU runtime attestation failed"
+			return
+		}
 		renderer_message="$("$RENDERER_HELPER" start "$token" "$path" 2>&1)"
 		renderer_result=$?
 		if [ "$renderer_result" -ne 0 ]; then
@@ -1087,9 +1139,17 @@ cmd_resolve() {
 			json_error "router CPU renderer returned invalid media info"
 			return
 		fi
-		if [ "$("$RENDERER_HELPER" has-audio "$token" 2>/dev/null)" = "1" ]; then
-			has_audio=1
-		fi
+		audio_state="$("$RENDERER_HELPER" audio-state "$token" 2>/dev/null)" ||
+			audio_state="error"
+		case "$audio_state" in
+			ready) has_audio=1 ;;
+			absent) has_audio=0 ;;
+			*)
+				"$RENDERER_HELPER" stop "$token" >/dev/null 2>&1 || :
+				json_error "router CPU renderer could not attest the source audio state"
+				return
+				;;
+		esac
 	else
 		token="$(create_token "$path")" || {
 			json_error "cannot create stream token"
@@ -1109,11 +1169,13 @@ cmd_resolve() {
 		json_add_string "session_token" "$token"
 		json_add_string "mime" "multipart/x-mixed-replace"
 		json_add_int "stream_segment_seconds" 45
+		json_add_renderer_attestation
 		if [ "$duration_ms" -gt 0 ]; then
 			json_add_int "duration_ms" "$duration_ms"
 			json_add_int "total_frames" "$total_frames"
 		fi
 		json_add_boolean "has_audio" "$has_audio"
+		json_add_string "audio_state" "$audio_state"
 		if [ "$has_audio" -eq 1 ]; then
 			json_add_string "audio_url" "/cgi-bin/videoplayer-audio?token=$token"
 			json_add_string "audio_type" "pcm-s16le-chunks"
@@ -1138,121 +1200,9 @@ cmd_resolve() {
 	json_dump
 }
 
-cmd_resolve_audio() {
-	local raw="$1" renderer_token root path canonical_rel parent
-	local depth max_depth name mime proposed_audio_token audio_token position_ms
-
-	[ "$(get_enabled)" = "1" ] || {
-		json_error "video player disabled"
-		return
-	}
-	[ "$(get_render_mode)" = "router" ] || {
-		json_error "router CPU rendering is not selected"
-		return
-	}
-	parse_request "$raw" || {
-		json_error "invalid JSON request"
-		return
-	}
-	renderer_token="$REQ_TOKEN"
-	valid_token "$renderer_token" || {
-		json_error "renderer token required or invalid"
-		return
-	}
-	[ -x "$RENDERER_HELPER" ] || {
-		json_error "router CPU renderer is not installed"
-		return
-	}
-
-	path="$("$RENDERER_HELPER" source "$renderer_token" 2>/dev/null)" || {
-		json_error "renderer session is inactive or its source is unavailable"
-		return
-	}
-	if [ -z "$path" ] || [ "${#path}" -gt "$MAX_PATH_LENGTH" ]; then
-		json_error "renderer returned an invalid source"
-		return
-	fi
-	string_has_control "$path" && {
-		json_error "renderer returned an invalid source"
-		return
-	}
-
-	root="$(get_media_root 2>/dev/null)" || {
-		json_error "media path is invalid or inaccessible"
-		return
-	}
-	path_is_within_root "$root" "$path" || {
-		json_error "renderer source is outside the media directory"
-		return
-	}
-	canonical_rel="$(relative_from_root "$root" "$path")"
-	validate_relative_path "$canonical_rel" || {
-		json_error "renderer returned an invalid source"
-		return
-	}
-
-	parent="${canonical_rel%/*}"
-	[ "$parent" != "$canonical_rel" ] || parent=""
-	depth="$(path_depth "$parent")"
-	max_depth="$(get_max_depth)"
-	[ "$depth" -le "$max_depth" ] || {
-		json_error "maximum directory depth exceeded"
-		return
-	}
-	name="${path##*/}"
-	mime="$(mime_for "$path")"
-	proposed_audio_token="$(generate_random_token)" || {
-		json_error "cannot generate a browser-audio capability"
-		return
-	}
-	audio_token="$(
-		"$RENDERER_HELPER" authorize-browser-audio \
-			"$renderer_token" "$proposed_audio_token" 2>/dev/null
-	)" || {
-		json_error "renderer session ended before browser audio was authorized"
-		return
-	}
-	if ! valid_token "$audio_token" ||
-	   [ "$audio_token" = "$renderer_token" ]; then
-		json_error "renderer returned an invalid browser-audio capability"
-		return
-	fi
-	position_ms="$(
-		"$RENDERER_HELPER" position-ms \
-			"$renderer_token" "$audio_token" 2>/dev/null
-	)" || {
-		json_error "renderer playback position is unavailable"
-		return
-	}
-	case "$position_ms" in
-		''|*[!0-9]*)
-			json_error "renderer returned an invalid playback position"
-			return
-			;;
-	esac
-	if [ "${#position_ms}" -gt 12 ] ||
-	   [ "$position_ms" -gt $((TOKEN_TTL * 1000 + 5000)) ]; then
-		json_error "renderer returned an invalid playback position"
-		return
-	fi
-
-	json_init
-	json_add_string "name" "$name"
-	json_add_string "path" "$canonical_rel"
-	json_add_string "render_mode" "browser"
-	json_add_string "stream_url" \
-		"/cgi-bin/videoplayer-stream?renderer=$renderer_token&audio=$audio_token"
-	json_add_string "stream_type" "html5-video"
-	json_add_string "mime" "$mime"
-	json_add_boolean "has_audio" 1
-	json_add_boolean "seekable" 1
-	json_add_int "media_offset_ms" "$position_ms"
-	json_add_int "expires_in" "$TOKEN_TTL"
-	json_dump
-}
-
 cmd_renderer_status() {
 	local raw="$1" state reason="" duration_ms=0 total_frames=0 router_fps=0
+	local attested=0
 	local router_profile=""
 
 	parse_request "$raw" || {
@@ -1279,15 +1229,20 @@ cmd_renderer_status() {
 			reason=""
 		fi
 	fi
-	if load_renderer_media_info "$REQ_TOKEN"; then
+	if load_renderer_attestation && load_renderer_media_info "$REQ_TOKEN"; then
+		attested=1
 		duration_ms="$RENDERER_DURATION_MS"
 		total_frames="$RENDERER_TOTAL_FRAMES"
 		router_fps="$RENDERER_FPS"
 		router_profile="$RENDERER_PROFILE"
+	else
+		state="error"
+		[ -n "$reason" ] || reason="renderer session attestation is invalid"
 	fi
 
 	json_init
 	json_add_string "state" "$state"
+	[ "$attested" -eq 0 ] || json_add_renderer_attestation
 	if [ "$duration_ms" -gt 0 ]; then
 		json_add_int "duration_ms" "$duration_ms"
 		json_add_int "total_frames" "$total_frames"
@@ -1346,9 +1301,6 @@ case "$1" in
 		json_add_object "start_renderer"
 			json_add_string "path" "String"
 		json_close_object
-		json_add_object "resolve_audio"
-			json_add_string "token" "String"
-		json_close_object
 		json_add_object "renderer_status"
 			json_add_string "token" "String"
 		json_close_object
@@ -1381,7 +1333,6 @@ case "$1" in
 			list_renderer) cmd_list "$input" router ;;
 			resolve) cmd_resolve "$input" browser ;;
 			start_renderer) cmd_resolve "$input" router ;;
-			resolve_audio) cmd_resolve_audio "$input" ;;
 			renderer_status) cmd_renderer_status "$input" ;;
 			stop_renderer) cmd_stop_renderer "$input" ;;
 			*) json_error "unknown method" ;;

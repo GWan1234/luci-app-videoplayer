@@ -53,7 +53,7 @@ uci_write_methods = set(grant["write"]["ubus"]["uci"])
 assert "list_renderer" not in read_methods, read_methods
 assert "list_renderer" in write_methods, write_methods
 assert "resolve_audio" not in read_methods, read_methods
-assert "resolve_audio" in write_methods, write_methods
+assert "resolve_audio" not in write_methods, write_methods
 assert {"get", "changes", "configs"} <= uci_read_methods, uci_read_methods
 assert {"set", "apply", "confirm", "rollback"} <= uci_write_methods, uci_write_methods
 assert grant["read"]["uci"] == ["videoplayer"], grant["read"]["uci"]
@@ -148,6 +148,27 @@ check_extension_helpers() {
 
 check_extension_helpers "$rpc_harness"
 check_extension_helpers "$stream_harness"
+
+(
+	# The original-file CGI must share the rpcd/frontend safe default: only an
+	# exact Router setting selects Router mode; missing or malformed values stay
+	# in Browser mode.
+	# shellcheck disable=SC1090
+	source "$stream_harness"
+	STREAM_TEST_RENDER_MODE=
+	# Sourced CGI code invokes this PATH-compatible test double indirectly.
+	# shellcheck disable=SC2329
+	uci() {
+		[[ "$#" -eq 3 && "$1" == "-q" && "$2" == "get" ]] || return 1
+		[ -n "$STREAM_TEST_RENDER_MODE" ] || return 1
+		printf '%s\n' "$STREAM_TEST_RENDER_MODE"
+	}
+	assert_eq "$(get_render_mode)" "browser" "missing CGI render-mode default"
+	STREAM_TEST_RENDER_MODE=invalid
+	assert_eq "$(get_render_mode)" "browser" "invalid CGI render-mode default"
+	STREAM_TEST_RENDER_MODE=router
+	assert_eq "$(get_render_mode)" "router" "explicit CGI Router mode"
+)
 
 media="$work/media"
 mkdir -- "$media" "$media/Sub Folder"
@@ -253,34 +274,21 @@ renderer_stub="$work/videoplayer-renderer"
 cat > "$renderer_stub" <<'SH'
 #!/bin/sh
 case "${1:-}" in
+	attest)
+		[ "$#" -eq 1 ] || exit 2
+		printf 'private-software-cpu\tsoftware-cpu-v1\tnone\n'
+		;;
 	start)
 		[ "$#" -eq 3 ] || exit 2
 		printf 'started\n'
 		;;
-	has-audio)
+	audio-state)
 		[ "$#" -eq 2 ] || exit 2
-		printf '1\n'
+		printf 'ready\n'
 		;;
 	media-info)
 		[ "$#" -eq 2 ] || exit 2
-		printf '0\t0\t60\tquality\n'
-		;;
-	source)
-		[ "$#" -eq 2 ] || exit 2
-		[ -n "${VIDEOPLAYER_TEST_AUDIO_SOURCE:-}" ] || exit 1
-		printf '%s\n' "$VIDEOPLAYER_TEST_AUDIO_SOURCE"
-		;;
-	authorize-browser-audio)
-		[ "$#" -eq 3 ] || exit 2
-		[ "$2" = "22222222222222222222222222222222" ] || exit 1
-		[ "$3" = "44444444444444444444444444444444" ] || exit 1
-		printf '%s\n' "$3"
-		;;
-	position-ms)
-		[ "$#" -eq 3 ] || exit 2
-		[ "$2" = "22222222222222222222222222222222" ] || exit 1
-		[ "$3" = "44444444444444444444444444444444" ] || exit 1
-		printf '1750\n'
+		printf '0\t0\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone\n'
 		;;
 	*) exit 2 ;;
 esac
@@ -304,8 +312,9 @@ parse_request() {
 get_enabled() {
 	printf '1\n'
 }
+VIDEOPLAYER_TEST_RENDER_MODE=router
 get_render_mode() {
-	printf 'router\n'
+	printf '%s\n' "$VIDEOPLAYER_TEST_RENDER_MODE"
 }
 get_media_root() {
 	printf '%s\n' "$media"
@@ -343,8 +352,9 @@ json_add_boolean() {
 json_dump() {
 	printf '{}\n'
 }
+RESOLVE_ERROR=
 json_error() {
-	fail "cmd_resolve returned an error: $1"
+	RESOLVE_ERROR="$1"
 }
 
 stream_token_marker="$work/stream-token-created"
@@ -385,6 +395,8 @@ for invalid_router_fps in 31 61; do
 done
 VIDEOPLAYER_TEST_ROUTER_FPS=60
 cmd_resolve '{}' router >/dev/null
+[[ -z "$RESOLVE_ERROR" ]] ||
+	fail "router resolve returned an error: $RESOLVE_ERROR"
 [[ ! -e "$stream_token_marker" ]] ||
 	fail "router mode allocated a browser stream token"
 [[ -e "$renderer_token_marker" ]] ||
@@ -400,6 +412,17 @@ assert_eq "${json_fields[audio_url]:-}" \
 assert_eq "${json_fields[audio_type]:-}" "pcm-s16le-chunks" \
 	"router audio type"
 assert_eq "${json_fields[has_audio]:-}" "1" "router audio flag"
+assert_eq "${json_fields[audio_state]:-}" "ready" "router audio state"
+assert_eq "${json_fields[renderer_backend]:-}" "private-software-cpu" \
+	"router attested backend"
+assert_eq "${json_fields[attestation_marker]:-}" "software-cpu-v1" \
+	"router attestation marker"
+assert_eq "${json_fields[hardware_acceleration]:-}" "0" \
+	"router hardware acceleration flag"
+assert_eq "${json_fields[runtime_attested]:-}" "1" \
+	"router runtime attestation flag"
+assert_eq "${json_fields[presentation]:-}" "browser-managed" \
+	"router presentation boundary"
 assert_eq "${json_fields[audio_sample_rate]:-}" "48000" \
 	"router audio sample rate"
 assert_eq "${json_fields[audio_channels]:-}" "2" "router audio channels"
@@ -432,41 +455,35 @@ generate_random_token() {
 	return 1
 }
 rm -f -- "$renderer_token_marker"
+rm -f -- "$stream_token_marker"
+RESOLVE_ERROR=
 cmd_resolve '{}' browser >/dev/null
+assert_eq "$RESOLVE_ERROR" "browser source decoding is not selected" \
+	"browser resolve while Router mode is active"
+[[ ! -e "$stream_token_marker" ]] ||
+	fail "Router mode allowed a browser source token"
+
+VIDEOPLAYER_TEST_RENDER_MODE=browser
+RESOLVE_ERROR=
+cmd_resolve '{}' browser >/dev/null
+[[ -z "$RESOLVE_ERROR" ]] ||
+	fail "browser resolve returned an error: $RESOLVE_ERROR"
 [[ ! -e "$renderer_token_marker" ]] ||
 	fail "browser mode allocated a renderer token"
 [[ -e "$stream_token_marker" ]] ||
 	fail "browser mode did not allocate a stream token"
 
-# Browser-audio fallback mints a distinct nonce bound to the active renderer
-# and deliberately accepts extensionless files exposed only by CPU mode.
-export VIDEOPLAYER_TEST_AUDIO_SOURCE="$media/no-extension"
-rm -f -- "$stream_token_marker" "$renderer_token_marker"
-create_token() {
-	: > "$stream_token_marker"
-	return 1
-}
-generate_random_token() {
-	: > "$renderer_token_marker"
-	printf '44444444444444444444444444444444\n'
-}
-cmd_resolve_audio '{}' >/dev/null
-[[ ! -e "$stream_token_marker" ]] ||
-	fail "browser-audio fallback allocated a long-lived path token"
-[[ -e "$renderer_token_marker" ]] ||
-	fail "browser-audio fallback did not allocate a distinct capability"
-assert_eq "${json_fields[path]:-}" "no-extension" \
-	"browser-audio canonical path"
-assert_eq "${json_fields[render_mode]:-}" "browser" \
-	"browser-audio render mode"
-assert_eq "${json_fields[stream_type]:-}" "html5-video" \
-	"browser-audio stream type"
-assert_eq "${json_fields[stream_url]:-}" \
-	"/cgi-bin/videoplayer-stream?renderer=22222222222222222222222222222222&audio=44444444444444444444444444444444" \
-	"browser-audio stream URL"
-assert_eq "${json_fields[media_offset_ms]:-}" "1750" \
-	"browser-audio playback offset"
-assert_eq "${json_fields[mime]:-}" "application/octet-stream" \
-	"extensionless browser-audio MIME"
+! grep -Fq 'cmd_resolve_audio' "$rpc_backend" ||
+	fail "strict CPU rpcd backend still contains resolve_audio"
+! grep -Fq 'resolve_audio)' "$rpc_backend" ||
+	fail "strict CPU rpcd dispatch still exposes resolve_audio"
+# This is an exact source-code literal; the test must not expand REQ_TOKEN.
+# shellcheck disable=SC2016
+grep -Fq 'if load_renderer_attestation && load_renderer_media_info "$REQ_TOKEN"; then' \
+	"$rpc_backend" ||
+	fail "renderer status does not re-attest the live private runtime"
+grep -Fq 'http_err "409 Conflict" "Browser source decoding is not selected"' \
+	"$stream_backend" ||
+	fail "original-file CGI is not gated by active Browser mode"
 
 printf 'local-listing-test: ok\n'

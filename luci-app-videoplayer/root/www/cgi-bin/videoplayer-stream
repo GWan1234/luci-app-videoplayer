@@ -10,7 +10,6 @@ VIDEO_EXTS="3g2 3gp 264 265 asf avi divx f4v flv h264 h265 hevc m2ts m2v m4v mkv
 TOKEN_DIR="/tmp/videoplayer-tokens"
 TOKEN_LAYOUT_MARKER="$TOKEN_DIR/.bucket-v1"
 TOKEN_BUCKET_HEX=3
-RENDERER_HELPER="/usr/libexec/videoplayer-renderer"
 MAX_PATH_LENGTH=4096
 MAX_RANGE_DIGITS=18
 
@@ -340,10 +339,10 @@ case "$REQUEST_METHOD" in
 esac
 
 [ "$(get_enabled)" = "1" ] || http_err "403 Forbidden" "Video player disabled"
+[ "$(get_render_mode)" = "browser" ] ||
+	http_err "409 Conflict" "Browser source decoding is not selected"
 
 token=""
-renderer=""
-audio=""
 query="${QUERY_STRING:-}"
 case "$query" in
 	token=*)
@@ -352,158 +351,37 @@ case "$query" in
 		esac
 		token="${query#token=}"
 		;;
-	renderer=*\&audio=*)
-		first="${query%%&*}"
-		second="${query#*&}"
-		case "$second" in
-			audio=*) ;;
-			*) http_err "400 Bad Request" "Invalid stream query" ;;
-		esac
-		case "$second" in
-			*'&'*) http_err "400 Bad Request" "Invalid stream query" ;;
-		esac
-		renderer="${first#renderer=}"
-		audio="${second#audio=}"
-		;;
 	*) http_err "400 Bad Request" "Invalid stream query" ;;
 esac
 
 root="$(get_media_root 2>/dev/null)" ||
 	http_err "503 Service Unavailable" "Media path is invalid or inaccessible"
 
-renderer_bound=0
-if [ -n "$token" ]; then
-	valid_token "$token" ||
-		http_err "403 Forbidden" "Invalid or expired stream token"
-	load_token "$token" ||
-		http_err "403 Forbidden" "Invalid or expired stream token"
-	[ -f "$TOKEN_PATH" ] || http_err "404 Not Found" "Media file is missing"
-	canonical="$(readlink -f -- "$TOKEN_PATH" 2>/dev/null)" ||
-		http_err "403 Forbidden" "Invalid media path"
-	[ "$canonical" = "$TOKEN_PATH" ] ||
-		http_err "403 Forbidden" "Media path changed"
-	path_is_within_root "$root" "$canonical" ||
-		http_err "403 Forbidden" "Media path is outside the configured root"
-	is_allowed_ext "$canonical" ||
-		http_err "415 Unsupported Media Type" "Unsupported file type"
+valid_token "$token" ||
+	http_err "403 Forbidden" "Invalid or expired stream token"
+load_token "$token" ||
+	http_err "403 Forbidden" "Invalid or expired stream token"
+[ -f "$TOKEN_PATH" ] || http_err "404 Not Found" "Media file is missing"
+canonical="$(readlink -f -- "$TOKEN_PATH" 2>/dev/null)" ||
+	http_err "403 Forbidden" "Invalid media path"
+[ "$canonical" = "$TOKEN_PATH" ] ||
+	http_err "403 Forbidden" "Media path changed"
+path_is_within_root "$root" "$canonical" ||
+	http_err "403 Forbidden" "Media path is outside the configured root"
+is_allowed_ext "$canonical" ||
+	http_err "415 Unsupported Media Type" "Unsupported file type"
 
-	# Keep the validated file open for the whole response. Re-check the opened
-	# descriptor to close the readlink/open race before sending any bytes.
-	exec 3< "$canonical" || http_err "404 Not Found" "Media file is missing"
-else
-	valid_token "$renderer" ||
-		http_err "403 Forbidden" "Invalid or inactive renderer capability"
-	valid_token "$audio" ||
-		http_err "403 Forbidden" "Invalid browser-audio capability"
-	[ "$(get_render_mode 2>/dev/null)" = "router" ] ||
-		http_err "409 Conflict" "Router CPU rendering is not selected"
-	[ -x "$RENDERER_HELPER" ] ||
-		http_err "503 Service Unavailable" "Router CPU renderer is unavailable"
-	source_info="$(
-		"$RENDERER_HELPER" source-info "$renderer" "$audio" \
-			3<&- 2>/dev/null
-	)" || http_err "403 Forbidden" "Invalid or inactive audio capability"
-	old_ifs="$IFS"
-	IFS="$(printf '\t')"
-	set -f
-	# Intentional split on the helper's tab-separated, control-free record.
-	# shellcheck disable=SC2086
-	set -- $source_info
-	set +f
-	IFS="$old_ifs"
-	[ "$#" -eq 3 ] ||
-		http_err "403 Forbidden" "Invalid renderer source metadata"
-	canonical="$1"
-	source_fd="$2"
-	source_identity="$3"
-	if [ -z "$canonical" ] ||
-	   [ "${#canonical}" -gt "$MAX_PATH_LENGTH" ]; then
-		http_err "403 Forbidden" "Invalid renderer source"
-	fi
-	string_has_control "$canonical" &&
-		http_err "403 Forbidden" "Invalid renderer source"
-	case "$canonical" in
-		/*) ;;
-		*) http_err "403 Forbidden" "Invalid renderer source" ;;
-	esac
-	path_is_within_root "$root" "$canonical" ||
-		http_err "403 Forbidden" "Renderer source is outside the configured root"
-	case "$source_fd" in
-		/proc/*/fd/3)
-			source_pid="${source_fd#/proc/}"
-			source_pid="${source_pid%/fd/3}"
-			;;
-		*) http_err "403 Forbidden" "Invalid renderer source descriptor" ;;
-	esac
-	case "$source_pid" in
-		''|*[!0-9]*)
-			http_err "403 Forbidden" "Invalid renderer source descriptor"
-			;;
-	esac
-	if [ "${#source_pid}" -gt 10 ] || [ "$source_pid" -le 1 ]; then
-		http_err "403 Forbidden" "Invalid renderer source descriptor"
-	fi
-	identity_device="${source_identity%%:*}"
-	identity_tail="${source_identity#*:}"
-	identity_inode="${identity_tail%%:*}"
-	identity_size="${identity_tail#*:}"
-	case "$identity_size" in
-		*:*|'') http_err "403 Forbidden" "Invalid renderer source identity" ;;
-	esac
-	for identity_part in "$identity_device" "$identity_inode" "$identity_size"; do
-		case "$identity_part" in
-			''|*[!0-9]*)
-				http_err "403 Forbidden" "Invalid renderer source identity"
-				;;
-		esac
-		[ "${#identity_part}" -le 20 ] ||
-			http_err "403 Forbidden" "Invalid renderer source identity"
-	done
-	if [ "${#identity_size}" -gt "$MAX_RANGE_DIGITS" ] ||
-	   [ "$identity_size" -le 0 ]; then
-		http_err "403 Forbidden" "Invalid renderer source identity"
-	fi
-	exec 3< "$source_fd" ||
-		http_err "403 Forbidden" "Renderer source is no longer available"
-	[ "$(stat -L -c '%F' -- /proc/self/fd/3 2>/dev/null)" = \
-		"regular file" ] || {
-			exec 3<&-
-			http_err "403 Forbidden" "Opened renderer source is not a regular file"
-		}
-	opened_identity="$(
-		stat -L -c '%d:%i:%s' -- /proc/self/fd/3 2>/dev/null
-	)" || {
-		exec 3<&-
-		http_err "403 Forbidden" "Cannot validate opened renderer source"
-	}
-	[ "$opened_identity" = "$source_identity" ] || {
-		exec 3<&-
-		http_err "403 Forbidden" "Renderer source changed during validation"
-	}
-	source_info_after="$(
-		"$RENDERER_HELPER" source-info "$renderer" "$audio" \
-			3<&- 2>/dev/null
-	)" || {
-		exec 3<&-
-		http_err "403 Forbidden" "Renderer session ended during validation"
-	}
-	[ "$source_info_after" = "$source_info" ] || {
-		exec 3<&-
-		http_err "403 Forbidden" "Renderer source changed during validation"
-	}
-	renderer_bound=1
-fi
-
-if [ "$renderer_bound" -eq 0 ]; then
-	opened="$(readlink -f -- /proc/self/fd/3 2>/dev/null)" || {
-		exec 3<&-
-		http_err "403 Forbidden" "Cannot validate opened media file"
-	}
-	if [ "$opened" != "$canonical" ] ||
-	   ! path_is_within_root "$root" "$opened"; then
-		exec 3<&-
-		http_err "403 Forbidden" "Media file changed during validation"
-	fi
+# Keep the validated file open for the whole response. Re-check the opened
+# descriptor to close the readlink/open race before sending any bytes.
+exec 3< "$canonical" || http_err "404 Not Found" "Media file is missing"
+opened="$(readlink -f -- /proc/self/fd/3 2>/dev/null)" || {
+	exec 3<&-
+	http_err "403 Forbidden" "Cannot validate opened media file"
+}
+if [ "$opened" != "$canonical" ] ||
+   ! path_is_within_root "$root" "$opened"; then
+	exec 3<&-
+	http_err "403 Forbidden" "Media file changed during validation"
 fi
 
 metadata="$(stat -L -c '%F:%s' -- /proc/self/fd/3 2>/dev/null)" || {
@@ -523,10 +401,6 @@ case "$size" in
 		http_err "500 Internal Server Error" "Invalid media size"
 		;;
 esac
-if [ "$renderer_bound" -eq 1 ] && [ "$size" != "$identity_size" ]; then
-	exec 3<&-
-	http_err "403 Forbidden" "Renderer source size changed during validation"
-fi
 [ "${#size}" -le "$MAX_RANGE_DIGITS" ] || {
 	exec 3<&-
 	http_err "500 Internal Server Error" "Media file is too large"
@@ -562,11 +436,7 @@ printf 'Content-Length: %s\r\n' "$length"
 if [ "$status" = "206 Partial Content" ]; then
 	printf 'Content-Range: bytes %s-%s/%s\r\n' "$start" "$end" "$size"
 fi
-if [ "$renderer_bound" -eq 1 ]; then
-	printf 'Cache-Control: no-store\r\n'
-else
-	printf 'Cache-Control: private, max-age=300\r\n'
-fi
+printf 'Cache-Control: private, max-age=300\r\n'
 printf 'X-Content-Type-Options: nosniff\r\n'
 printf 'Referrer-Policy: no-referrer\r\n'
 printf '\r\n'

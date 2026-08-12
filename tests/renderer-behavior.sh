@@ -37,6 +37,7 @@ grep -Fq "\$(TARGET_LDFLAGS) -static-libgcc -Wl,-z,relro" \
 work="$(mktemp -d /tmp/videoplayer-renderer-ci.XXXXXX)"
 bin="$work/bin"
 runtime="$work/runtime"
+maintenance_file="$runtime.maintenance"
 helper="$bin/videoplayer-renderer"
 stream_helper="$bin/videoplayer-stream"
 stream_token_dir="$work/stream-tokens"
@@ -46,11 +47,19 @@ rpc_call_log="$work/rpc-renderer.calls"
 private_exec_dir="$work/private-libexec/videoplayer-ffmpeg"
 private_lib_dir="$work/private-lib/videoplayer-ffmpeg"
 private_ffmpeg="$private_exec_dir/ffmpeg"
+private_info_dir="$work/private-share/luci-videoplayer-codec-runtime"
+private_build_info="$private_info_dir/build-info"
 host_relay="$bin/videoplayer-mjpeg-relay"
 audio_capacity_race_ready="$work/audio-capacity-race.ready"
 audio_capacity_race_release="$work/audio-capacity-race.release"
 audio_capacity_race_once="$work/audio-capacity-race.once"
 audio_capacity_race_arm="$work/audio-capacity-race.arm"
+maintenance_pause_ready="$work/maintenance-pause.ready"
+maintenance_pause_release="$work/maintenance-pause.release"
+blocked_probe_ready="$work/blocked-probe.ready"
+blocked_probe_release="$work/blocked-probe.release"
+producer_identity_ready="$work/producer-identity.ready"
+producer_identity_release="$work/producer-identity.release"
 
 mkdir -m 0755 -- "$bin" "$work/media"
 
@@ -77,6 +86,12 @@ export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_READY="$audio_capacity_race_ready"
 export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_RELEASE="$audio_capacity_race_release"
 export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ONCE="$audio_capacity_race_once"
 export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_ARM="$audio_capacity_race_arm"
+export VIDEOPLAYER_TEST_MAINTENANCE_READY="$maintenance_pause_ready"
+export VIDEOPLAYER_TEST_MAINTENANCE_RELEASE="$maintenance_pause_release"
+export VIDEOPLAYER_TEST_BLOCKED_PROBE_READY="$blocked_probe_ready"
+export VIDEOPLAYER_TEST_BLOCKED_PROBE_RELEASE="$blocked_probe_release"
+export VIDEOPLAYER_TEST_PRODUCER_IDENTITY_READY="$producer_identity_ready"
+export VIDEOPLAYER_TEST_PRODUCER_IDENTITY_RELEASE="$producer_identity_release"
 
 terminate_owned_pid() {
 	local pid="${1:-}" cmdline
@@ -105,7 +120,14 @@ cleanup() {
 
 	[[ -n "${audio_capacity_race_release:-}" ]] &&
 		: > "$audio_capacity_race_release"
-	[[ -x "$helper" ]] && "$helper" cleanup >/dev/null 2>&1
+	[[ -n "${blocked_probe_release:-}" ]] &&
+		: > "$blocked_probe_release"
+	[[ -n "${producer_identity_release:-}" ]] &&
+		: > "$producer_identity_release"
+	if [[ -x "$helper" ]]; then
+		"$helper" maintenance-enter >/dev/null 2>&1 || true
+		"$helper" cleanup >/dev/null 2>&1 || true
+	fi
 
 	for pid in \
 		"${ring_fill_pid:-}" \
@@ -125,6 +147,12 @@ cleanup() {
 		"${chunker_failure_worker:-}" "${chunker_failure_ffmpeg:-}" \
 		"${chunker_failure_chunker:-}" "${chunker_failure_cgi:-}" \
 		"${chunker_failure_video_cgi:-}" \
+		"${audio_clean_eof_video_cgi:-}" \
+		"${maintenance_enter_pid:-}" \
+		"${blocked_probe_start_pid:-}" "${blocked_probe_worker:-}" \
+		"${blocked_probe_ffmpeg:-}" \
+		"${producer_race_start_pid:-}" "${producer_race_worker:-}" \
+		"${producer_race_ffmpeg:-}" \
 		"${lease_touch_worker:-}" "${lease_expire_worker:-}"
 	do
 		terminate_owned_pid "$pid"
@@ -151,12 +179,16 @@ grep -Fq 'export PATH="/usr/sbin:/usr/bin:/sbin:/bin"' "$source_helper" ||
 	fail "unexpected PATH declaration"
 grep -Fq '/tmp/videoplayer-render-v1' "$source_helper" ||
 	fail "unexpected runtime declaration"
+grep -Fq '/tmp/videoplayer-render-v1.maintenance' "$source_helper" ||
+	fail "unexpected maintenance marker declaration"
 grep -Fq '/usr/libexec/videoplayer-renderer' "$source_helper" ||
 	fail "unexpected self path"
 grep -Fq '/usr/libexec/videoplayer-ffmpeg/ffmpeg' "$source_helper" ||
 	fail "unexpected private FFmpeg path"
 grep -Fq '/usr/lib/videoplayer-ffmpeg' "$source_helper" ||
 	fail "unexpected private FFmpeg library path"
+grep -Fq '/usr/share/luci-videoplayer-codec-runtime/build-info' "$source_helper" ||
+	fail "unexpected private FFmpeg build-info path"
 grep -Fq 'MJPEG_SEGMENT_SECONDS=45' "$source_helper" ||
 	fail "unexpected MJPEG segment duration"
 grep -Fq 'MJPEG_HEADER_WAIT_SECONDS=10' "$source_helper" ||
@@ -173,6 +205,11 @@ grep -Fq 'AUDIO_RING_SEGMENTS=8' "$source_helper" ||
 	fail "unexpected PCM ring size"
 grep -Fq 'AUDIO_BATCH_MAX_SEGMENTS=2' "$source_helper" ||
 	fail "unexpected PCM batch size"
+# This is an exact source-code literal; the test must not evaluate arithmetic.
+# shellcheck disable=SC2016
+grep -Fq 'STARTUP_BUDGET_SECONDS=$((STARTUP_TIMEOUT + 2 * MEDIA_PROBE_TIMEOUT + AUDIO_PROBE_TIMEOUT + 3))' \
+	"$source_helper" ||
+	fail "startup budget does not include both independent media probes"
 grep -Fq "nice -n \"\$nice_level\"" "$source_helper" ||
 	fail "renderer no longer yields CPU to LuCI under contention"
 if grep -Eq '(^|[[:space:]"])-(re|readrate[^[:space:]"]*)($|[[:space:]"])' \
@@ -221,17 +258,38 @@ sed \
 	-e "s|/usr/libexec/videoplayer-ffmpeg/ffmpeg|$private_ffmpeg|g" \
 	-e "s|/usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay|$host_relay|g" \
 	-e "s|/usr/lib/videoplayer-ffmpeg|$private_lib_dir|g" \
+	-e "s|/usr/share/luci-videoplayer-codec-runtime/build-info|$private_build_info|g" \
 	-e 's|MJPEG_SEGMENT_SECONDS=45|MJPEG_SEGMENT_SECONDS=2|' \
 	-e '/^mjpeg_copy_aligned() {$/a\
 if [ "${VIDEOPLAYER_TEST_REQUIRE_NATIVE_RELAY:-0}" = "1" ]; then\
 \treturn 91\
 fi' \
 	-e '/^[[:space:]]*ffmpeg_pid=\$!$/a\
-sleep 0.05' \
+if [ -n "${VIDEOPLAYER_TEST_PRODUCER_IDENTITY_READY:-}" ] &&\
+   [ -n "${VIDEOPLAYER_TEST_PRODUCER_IDENTITY_RELEASE:-}" ] &&\
+   [ -e "$VIDEOPLAYER_TEST_PRODUCER_IDENTITY_READY.arm" ]; then\
+\tprintf "%s\\n" "$ffmpeg_pid" > "$VIDEOPLAYER_TEST_PRODUCER_IDENTITY_READY"\
+\twhile [ ! -e "$VIDEOPLAYER_TEST_PRODUCER_IDENTITY_RELEASE" ]; do\
+\t\tsleep 0.01\
+\tdone\
+else\
+\tsleep 0.05\
+fi' \
 	-e '/^renderer_decoder_threads() {$/a\
 if [ -n "${VIDEOPLAYER_TEST_DECODER_THREADS:-}" ]; then\
 \tprintf "%s\\n" "$VIDEOPLAYER_TEST_DECODER_THREADS"\
 \treturn 0\
+fi' \
+	-e '/^terminate_worker() {$/a\
+if [ "${VIDEOPLAYER_TEST_STOP_FAILURE:-0}" = "1" ]; then\
+\treturn 1\
+fi' \
+	-e '/^[[:space:]]*# The maintenance marker is now the durable start gate\.$/a\
+if [ "${VIDEOPLAYER_TEST_MAINTENANCE_PAUSE:-0}" = "1" ]; then\
+\t: > "$VIDEOPLAYER_TEST_MAINTENANCE_READY"\
+\twhile [ ! -e "$VIDEOPLAYER_TEST_MAINTENANCE_RELEASE" ]; do\
+\t\tsleep 0.05\
+\tdone\
 fi' \
 	-e '/^[[:space:]]*CGI_COPY_PID=\$!$/a\
 if [ "${VIDEOPLAYER_TEST_DELAY_CGI_IDENTITY:-0}" = "1" ]; then\
@@ -481,12 +539,9 @@ fi
 
 grep -Fq 'export PATH="/usr/sbin:/usr/bin:/sbin:/bin"' "$source_stream" ||
 	fail "unexpected stream PATH declaration"
-grep -Fq 'RENDERER_HELPER="/usr/libexec/videoplayer-renderer"' "$source_stream" ||
-	fail "unexpected stream renderer path"
 sed \
 	-e "s|export PATH=\"/usr/sbin:/usr/bin:/sbin:/bin\"|export PATH=\"$bin:/usr/sbin:/usr/bin:/sbin:/bin\"|" \
 	-e "s|TOKEN_DIR=\"/tmp/videoplayer-tokens\"|TOKEN_DIR=\"$stream_token_dir\"|" \
-	-e "s|RENDERER_HELPER=\"/usr/libexec/videoplayer-renderer\"|RENDERER_HELPER=\"$helper\"|" \
 	"$source_stream" > "$stream_helper"
 chmod 0755 "$stream_helper"
 
@@ -507,8 +562,10 @@ cat > "$rpc_renderer" <<'SH'
 printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" >> "$RPC_RENDERER_CALL_LOG"
 case "${1:-}" in
 	start) printf 'started\n' ;;
-	media-info) printf '125500\t1004\t8\tfast\n' ;;
+	attest) printf 'private-software-cpu\tsoftware-cpu-v1\tnone\n' ;;
+	media-info) printf '125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone\n' ;;
 	has-audio) printf '1\n' ;;
+	audio-state) printf 'ready\n' ;;
 	status-touch) printf 'running\n' ;;
 	reason) : ;;
 	stop) printf 'stopped\n' ;;
@@ -526,6 +583,8 @@ export RPC_RENDERER_CALL_LOG="$rpc_call_log"
 	fail "private FFmpeg transform incomplete"
 ! grep -Fq '/usr/lib/videoplayer-ffmpeg' "$helper" ||
 	fail "private FFmpeg library transform incomplete"
+! grep -Fq '/usr/share/luci-videoplayer-codec-runtime/build-info' "$helper" ||
+	fail "private FFmpeg build-info transform incomplete"
 
 cat > "$bin/uci" <<'SH'
 #!/bin/sh
@@ -537,7 +596,7 @@ case "${2:-}" in
 		printf '1\n'
 		;;
 	videoplayer.main.render_mode)
-		printf 'router\n'
+		printf '%s\n' "${VIDEOPLAYER_TEST_RENDER_MODE:-router}"
 		;;
 	videoplayer.main.media_path)
 		printf '%s\n' "$VIDEOPLAYER_TEST_MEDIA_ROOT"
@@ -557,8 +616,9 @@ SH
 chmod 0755 "$bin/uci"
 
 # An ELF stub preserves the same /proc/cmdline shape as real FFmpeg. Besides
-# providing probe output, it verifies fd 3, closed lock fd 8, and the important
-# resource/security arguments used by the production worker.
+# providing probe output, it verifies fd 3, the private FFmpeg worker-lock
+# lifecycle barrier, and the important resource/security
+# arguments used by the production worker.
 cc -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Werror \
 	-x c -o "$bin/ffmpeg" - <<'C'
 #include <errno.h>
@@ -651,14 +711,32 @@ static int count_input_group(int argc, char **argv, const char *threads)
 			    strcmp(argv[i + 10], "-flags2:v") == 0 &&
 			    strcmp(argv[i + 11], "+fast") == 0)
 				input_offset = 12;
-			if (i + input_offset + 1 < argc &&
-			    strcmp(argv[i + input_offset], "-i") == 0 &&
-			    strcmp(argv[i + input_offset + 1], "/proc/self/fd/3") == 0)
+			if (i + input_offset + 3 < argc &&
+			    strcmp(argv[i + input_offset], "-hwaccel") == 0 &&
+			    strcmp(argv[i + input_offset + 1], "none") == 0 &&
+			    strcmp(argv[i + input_offset + 2], "-i") == 0 &&
+			    strcmp(argv[i + input_offset + 3], "/proc/self/fd/3") == 0)
 				++count;
 		}
 	}
 
 	return count;
+}
+
+static int every_input_is_software_only(int argc, char **argv)
+{
+	int inputs = 0;
+	int i;
+
+	for (i = 1; i + 1 < argc; ++i) {
+		if (strcmp(argv[i], "-i") != 0)
+			continue;
+		++inputs;
+		if (i < 3 || strcmp(argv[i - 2], "-hwaccel") != 0 ||
+		    strcmp(argv[i - 1], "none") != 0)
+			return 0;
+	}
+	return inputs > 0;
 }
 
 static int ends_with(const char *text, const char *suffix)
@@ -900,6 +978,32 @@ static int marker_is(
 	       memcmp(marker, wanted, wanted_size) == 0;
 }
 
+static int wait_for_blocked_probe_release(void)
+{
+	const char *ready_path = getenv("VIDEOPLAYER_TEST_BLOCKED_PROBE_READY");
+	const char *release_path = getenv("VIDEOPLAYER_TEST_BLOCKED_PROBE_RELEASE");
+	FILE *ready;
+
+	if (ready_path == NULL || ready_path[0] == '\0' ||
+	    release_path == NULL || release_path[0] == '\0')
+		return -1;
+	ready = fopen(ready_path, "w");
+	if (ready == NULL)
+		return -1;
+	if (fprintf(ready, "%ld\n", (long)getpid()) < 0) {
+		fclose(ready);
+		return -1;
+	}
+	if (fclose(ready) != 0)
+		return -1;
+	while (access(release_path, F_OK) != 0) {
+		if (errno != ENOENT)
+			return -1;
+		usleep(10000);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct stat input;
@@ -916,6 +1020,7 @@ int main(int argc, char **argv)
 	const char *video_output;
 	int audio_finite;
 	int audio_fast_fixture;
+	int audio_clean_eof;
 	int audio_runtime_failure;
 	int audio_output_fd = -1;
 	int video_output_fd;
@@ -942,6 +1047,7 @@ int main(int argc, char **argv)
 	const char *expected_width;
 	const char *expected_height;
 	const char *library_path;
+	const char *producer_release;
 
 	expected_private_lib = getenv("VIDEOPLAYER_EXPECT_PRIVATE_LIB");
 	expected_decoder_threads = getenv("VIDEOPLAYER_EXPECT_DECODER_THREADS");
@@ -1005,8 +1111,41 @@ int main(int argc, char **argv)
 	}
 
 	if (has_arg(argc, argv, "-encoders")) {
+		puts(" V..... = Video");
+		puts(" A..... = Audio");
 		puts(" V..... mjpeg CI stub");
 		puts(" A..... pcm_s16le CI stub");
+		return 0;
+	}
+	if (has_arg(argc, argv, "-hwaccels")) {
+		puts("Hardware acceleration methods:");
+		return 0;
+	}
+	if (has_arg(argc, argv, "-buildconf")) {
+		puts("configuration:");
+		puts("    --disable-autodetect");
+		puts("    --disable-hwaccels");
+		puts("    --disable-vaapi");
+		puts("    --disable-vdpau");
+		puts("    --disable-vulkan");
+		puts("    --disable-avdevice");
+		puts("    --disable-decoders");
+		puts("    --disable-encoders");
+		return 0;
+	}
+	if (has_arg(argc, argv, "-decoders")) {
+		puts(" V..... = Video"); puts(" A..... = Audio");
+		puts(" S..... = Subtitle");
+		puts(" V..... h264 CI stub"); puts(" V..... hevc CI stub");
+		puts(" V..... vc1 CI stub"); puts(" V..... mpeg4 CI stub");
+		puts(" V..... vp8 CI stub"); puts(" V..... vp9 CI stub");
+		puts(" V..... av1 CI stub"); puts(" V..... mjpeg CI stub");
+		puts(" A..... aac CI stub"); puts(" A..... ac3 CI stub");
+		puts(" A..... eac3 CI stub"); puts(" A..... alac CI stub");
+		puts(" A..... dca CI stub"); puts(" A..... flac CI stub");
+		puts(" A..... mp3 CI stub"); puts(" A..... opus CI stub");
+		puts(" A..... pcm_s16le CI stub"); puts(" A..... truehd CI stub");
+		puts(" A..... vorbis CI stub");
 		return 0;
 	}
 
@@ -1044,12 +1183,13 @@ int main(int argc, char **argv)
 	if (has_arg(argc, argv, "-frames:a")) {
 		errno = 0;
 		if (count_pair(argc, argv, "-i", "/proc/self/fd/3") != 1 ||
+		    !every_input_is_software_only(argc, argv) ||
 		    count_pair(argc, argv, "-map", "0:a:0") != 1 ||
 		    count_pair(argc, argv, "-frames:a", "1") != 1 ||
 		    count_pair(argc, argv, "-f", "s16le") != 1 ||
 		    strcmp(argv[argc - 1], "-") != 0 ||
 		    fstat(3, &input) != 0 || !S_ISREG(input.st_mode) ||
-		    fcntl(8, F_GETFD) != -1 || errno != EBADF)
+		    fcntl(8, F_GETFD) == -1)
 			return 84;
 		marker_size = pread(3, marker, sizeof(marker) - 1, 0);
 		if (marker_size < 0)
@@ -1058,10 +1198,55 @@ int main(int argc, char **argv)
 		    marker_is(marker, marker_size, "delayed-start") ||
 		    marker_is(marker, marker_size, "instant-media") ||
 		    marker_is(marker, marker_size, "fast-producer")) {
-			fputs("Stream map '0:a:0' matches no streams\n", stderr);
+			fputs(
+				"Stream map '0:a:0' matches no streams.\n"
+				"To ignore this, add a trailing '?' to the map.\n"
+				"Failed to set value '0:a:0' for option 'map': Invalid argument\n"
+				"Error parsing options for output file -.\n"
+				"Error opening output files: Invalid argument\n",
+				stderr);
 			return 81;
 		}
+		if (marker_is(marker, marker_size, "audio-probe-failure")) {
+			fputs(
+				"Stream map '0:a:0' matches no streams.\n"
+				"To ignore this, add a trailing '?' to the map.\n"
+				"Failed to set value '0:a:0' for option 'map': Invalid argument\n"
+				"Error parsing options for output file -.\n"
+				"Error opening output files: Invalid argument\n"
+				"Error while decoding advertised audio stream\n",
+				stderr);
+			return 83;
+		}
 		return publish_audio(STDOUT_FILENO, 0) == 0 ? 0 : 86;
+	}
+	if (has_arg(argc, argv, "-frames:v")) {
+		errno = 0;
+		if (count_pair(argc, argv, "-i", "/proc/self/fd/3") != 1 ||
+		    !every_input_is_software_only(argc, argv) ||
+		    count_pair(argc, argv, "-map", "0:V:0") != 1 ||
+		    count_pair(argc, argv, "-frames:v", "1") != 1 ||
+		    count_pair(
+			    argc,
+			    argv,
+			    "-vf",
+			    "scale=16:16:flags=fast_bilinear,format=yuvj420p") != 1 ||
+		    count_pair(argc, argv, "-c:v", "mjpeg") != 1 ||
+		    count_pair(argc, argv, "-f", "mpjpeg") != 1 ||
+		    count_pair(argc, argv, "-boundary_tag", "videoplayer-probe-boundary") != 1 ||
+		    strcmp(argv[argc - 1], "-") != 0 ||
+		    fstat(3, &input) != 0 || !S_ISREG(input.st_mode) ||
+		    fcntl(8, F_GETFD) == -1)
+			return 90;
+		marker_size = pread(3, marker, sizeof(marker) - 1, 0);
+		if (marker_size < 0)
+			return 91;
+		if (marker_is(marker, marker_size, "blocked-probe") &&
+		    wait_for_blocked_probe_release() != 0)
+			return 92;
+		return publish_mjpeg(
+			       STDOUT_FILENO, "videoplayer-probe-boundary", 0) == 0
+			? 0 : 93;
 	}
 
 	tee_mode = count_pair(argc, argv, "-f", "tee") == 1;
@@ -1087,12 +1272,31 @@ int main(int argc, char **argv)
 		errno = 0;
 		if (count_pair(argc, argv, "-loglevel", "info") != 1 ||
 		    count_pair(argc, argv, "-protocol_whitelist", "file,pipe") != 1 ||
+		    !every_input_is_software_only(argc, argv) ||
 		    fstat(3, &input) != 0 || !S_ISREG(input.st_mode) ||
-		    fcntl(8, F_GETFD) != -1 || errno != EBADF)
+		    fcntl(8, F_GETFD) == -1)
 			return 87;
 		marker_size = pread(3, marker, sizeof(marker) - 1, 0);
 		if (marker_size < 0)
 			return 88;
+		if (marker_is(marker, marker_size, "blocked-probe") &&
+		    wait_for_blocked_probe_release() != 0)
+			return 89;
+		fputs("Input #0, mov, from '/proc/self/fd/3':\n", stderr);
+		if (marker_is(marker, marker_size, "long-probe-audio")) {
+			for (line = 0; line < 1400; line++)
+				fprintf(
+					stderr,
+					"  Stream #0:%d: Subtitle: subrip, adversarial inventory padding\n",
+					line + 2);
+		}
+		fputs("  Stream #0:0: Video: h264, yuv420p\n", stderr);
+		if (!marker_is(marker, marker_size, "no-audio") &&
+		    !marker_is(marker, marker_size, "duration-unknown") &&
+		    !marker_is(marker, marker_size, "instant-media") &&
+		    !marker_is(marker, marker_size, "fast-producer") &&
+		    !marker_is(marker, marker_size, "delayed-start"))
+			fputs("  Stream #0:1: Audio: aac, 48000 Hz, stereo\n", stderr);
 		if (marker_is(marker, marker_size, "duration-unknown"))
 			fputs("  Duration: N/A, start: 0.000000, bitrate: N/A\n", stderr);
 		else {
@@ -1103,6 +1307,7 @@ int main(int argc, char **argv)
 	}
 	errno = 0;
 	if (argc < 2 || !has_arg(argc, argv, "-nostdin") ||
+	    !every_input_is_software_only(argc, argv) ||
 	    has_arg(argc, argv, "-re") ||
 	    has_arg_prefix(argc, argv, "-readrate") ||
 	    count_pair(argc, argv, "-filter_threads", expected_pipeline_threads) != 1 ||
@@ -1121,8 +1326,7 @@ int main(int argc, char **argv)
 	    fstat(3, &input) != 0 ||
 	    !S_ISREG(input.st_mode) ||
 	    input.st_size <= 0 ||
-	    fcntl(8, F_GETFD) != -1 ||
-	    errno != EBADF)
+	    fcntl(8, F_GETFD) == -1)
 		return 64;
 
 	errno = 0;
@@ -1191,6 +1395,17 @@ int main(int argc, char **argv)
 	marker_size = pread(3, marker, sizeof(marker) - 1, 0);
 	if (marker_size < 0)
 		return 67;
+	if (marker_is(marker, marker_size, "producer-race")) {
+		producer_release = getenv(
+			"VIDEOPLAYER_TEST_PRODUCER_IDENTITY_RELEASE");
+		if (producer_release == NULL || producer_release[0] == '\0')
+			return 94;
+		while (access(producer_release, F_OK) != 0) {
+			if (errno != ENOENT)
+				return 94;
+			usleep(10000);
+		}
+	}
 	delayed_video = marker_is(marker, marker_size, "delayed-start");
 	finite_video = marker_is(marker, marker_size, "finite-media") ||
 		marker_is(marker, marker_size, "audio-finite") ||
@@ -1201,6 +1416,8 @@ int main(int argc, char **argv)
 	audio_finite = marker_is(marker, marker_size, "audio-finite");
 	audio_runtime_failure =
 		marker_is(marker, marker_size, "audio-runtime-failure");
+	audio_clean_eof =
+		marker_is(marker, marker_size, "audio-clean-eof");
 	audio_fast_fixture =
 		marker_is(marker, marker_size, "finite-media") ||
 		audio_runtime_failure;
@@ -1319,6 +1536,9 @@ int main(int argc, char **argv)
 				}
 				close(audio_output_fd);
 				audio_output_fd = -1;
+			} else if (audio_clean_eof && audio_sequence >= 4) {
+				close(audio_output_fd);
+				audio_output_fd = -1;
 			}
 		}
 		if (publish_mjpeg(video_output_fd, boundary, video_sequence) != 0) {
@@ -1381,6 +1601,26 @@ int main(int argc, char **argv)
 C
 
 chmod 0755 "$bin/ffmpeg"
+
+# Keep `nice` as the worker's direct child for long enough to exercise the
+# bounded exec-identity transition. The production helper must observe the
+# same PID/start-time become the attested private FFmpeg executable; accepting
+# the wrapper itself or checking only once would respectively be unsafe or
+# spuriously fail this deterministic launch.
+cat > "$bin/nice" <<'SH'
+#!/bin/sh
+case " $* " in
+	*"videoplayer-${VIDEOPLAYER_TEST_NICE_DELAY_TOKEN:-not-a-token}"*)
+		: > "$VIDEOPLAYER_TEST_NICE_DELAY_MARKER"
+		sleep "${VIDEOPLAYER_TEST_NICE_DELAY:-0}"
+		;;
+esac
+exec /usr/bin/nice "$@"
+SH
+chmod 0755 "$bin/nice"
+export VIDEOPLAYER_TEST_NICE_DELAY=0.15
+export VIDEOPLAYER_TEST_NICE_DELAY_MARKER="$work/nice-delay-observed"
+
 printf 'non-empty local media fixture\n' > "$work/media/bad apple.mp4"
 printf 'decoder-missing fixture\n' > "$work/media/h264.mp4"
 printf 'decoder-modern fixture\n' > "$work/media/h264-modern.mp4"
@@ -1394,9 +1634,14 @@ printf 'v4l2-permission fixture\n' > "$work/media/v4l2-permission.mp4"
 printf 'sanitized-failure fixture\n' > "$work/media/sanitized.mp4"
 printf 'noisy-diagnostics fixture\n' > "$work/media/noisy.mp4"
 printf 'runtime-failure fixture\n' > "$work/media/runtime.mp4"
+printf 'audio-probe-failure fixture\n' > "$work/media/audio-probe-failure.mp4"
 printf 'no-audio fixture\n' > "$work/media/no-audio.mp4"
 printf 'no-audio extensionless fixture\n' > "$work/media/no-audio-extensionless"
 printf 'audio-runtime-failure fixture\n' > "$work/media/audio-runtime.mp4"
+printf 'audio-clean-eof fixture\n' > "$work/media/audio-clean-eof.mp4"
+printf 'long-probe-audio fixture\n' > "$work/media/long-probe-audio.mp4"
+printf 'blocked-probe fixture\n' > "$work/media/blocked-probe.mp4"
+printf 'producer-race fixture\n' > "$work/media/producer-race.mp4"
 printf 'audio-finite fixture\n' > "$work/media/audio-finite.mp4"
 printf 'finite-media fixture\n' > "$work/media/finite-media.mp4"
 printf 'fast-producer fixture\n' > "$work/media/fast-producer.mp4"
@@ -1488,6 +1733,7 @@ rpc_status_fields="$(
 		json_init() { :; }
 		json_add_string() { printf 'string\t%s\t%s\n' "$1" "$2"; }
 		json_add_int() { printf 'int\t%s\t%s\n' "$1" "$2"; }
+		json_add_boolean() { printf 'boolean\t%s\t%s\n' "$1" "$2"; }
 		json_dump() { :; }
 		json_error() { printf 'error\t%s\n' "$1"; }
 		export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
@@ -1873,7 +2119,7 @@ run_uncontended_audio_cgi() {
 		fi
 		status="$(head -n 1 "$output" | tr -d '\r')"
 		if [[ "$status" != 'Status: 409 Conflict' ]] ||
-		   grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' "$output"; then
+		   ! grep -Fq $'X-Videoplayer-Audio-State: busy\r' "$output"; then
 			return 0
 		fi
 		sleep 0.05
@@ -1882,9 +2128,9 @@ run_uncontended_audio_cgi() {
 
 # The production client retries a generic 409 while a previous PCM response or
 # a terminal audio-state transition briefly owns audio.lock. Mirror that
-# bounded behaviour here for
-# requests which are expected to be ready, but never retry the authenticated
-# unavailable response and never hide a persistent lock leak.
+# bounded behaviour here for requests which are expected to be ready. Only the
+# explicit busy state is retryable; absence/error must not be hidden as a lock
+# overlap, and a persistent busy lock still hits the bounded deadline.
 run_ready_audio_batch_cgi() {
 	local method="$1" token="$2" chunk="$3" count="$4" output="$5"
 	local status
@@ -1897,7 +2143,7 @@ run_ready_audio_batch_cgi() {
 				return 0
 				;;
 			'Status: 409 Conflict')
-				if grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
+				if ! grep -Fq $'X-Videoplayer-Audio-State: busy\r' \
 					"$output"; then
 					return 0
 				fi
@@ -1954,6 +2200,7 @@ PY
 
 token1=0123456789abcdef0123456789abcdef
 token2=fedcba9876543210fedcba9876543210
+export VIDEOPLAYER_TEST_NICE_DELAY_TOKEN="$token1"
 missing_decoder=11111111111111111111111111111111
 modern_decoder=12121212121212121212121212121212
 boundary_decoder=1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a
@@ -1966,28 +2213,30 @@ v4l2_permission=18181818181818181818181818181818
 sanitized_failure=19191919191919191919191919191919
 noisy_diagnostics=22222222222222222222222222222222
 runtime_failure=33333333333333333333333333333333
+audio_probe_failure=53535353535353535353535353535353
 no_audio=34343434343434343434343434343434
 no_audio_capability=45454545454545454545454545454545
 audio_failure=35353535353535353535353535353535
+audio_clean_eof=54545454545454545454545454545454
+long_probe_audio=55555555555555555555555555555555
+blocked_probe=56565656565656565656565656565656
+producer_race=57575757575757575757575757575757
 finite_audio=36363636363636363636363636363636
 chunker_failure=37373737373737373737373737373737
-chunker_terminal_capability=48484848484848484848484848484848
 finite_media=38383838383838383838383838383838
 fast_producer=50505050505050505050505050505050
 quality_producer=51515151515151515151515151515151
 fast_av_producer=52525252525252525252525252525252
 instant_media=39393939393939393939393939393939
-delayed_start=40404040404040404040404040404040
-delayed_capability=41414141414141414141414141414141
 lease_touch=42424242424242424242424242424242
 lease_expire=43434343434343434343434343434343
 long_audio=44444444444444444444444444444444
 duration_unknown=46464646464646464646464646464646
 terminal_gap=47474747474747474747474747474747
-terminal_gap_capability=49494949494949494949494949494949
 stale=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 media="$work/media/bad apple.mp4"
 
+export VIDEOPLAYER_TEST_RENDER_MODE=browser
 run_token_stream_cgi GET "$normal_stream_token" "$work/token-stream"
 check_status_line "$work/token-stream" "200 OK"
 grep -Fq $'Content-Type: video/mp4\r' "$work/token-stream" ||
@@ -1998,15 +2247,41 @@ run_token_stream_cgi GET "$extensionless_stream_token" \
 check_status_line "$work/token-extensionless" "415 Unsupported Media Type"
 REQUEST_METHOD=GET \
 	QUERY_STRING="token=$normal_stream_token&renderer=$no_audio&audio=$no_audio_capability" \
-	"$stream_helper" > "$work/token-mixed-query"
+"$stream_helper" > "$work/token-mixed-query"
 check_status_line "$work/token-mixed-query" "400 Bad Request"
+unset VIDEOPLAYER_TEST_RENDER_MODE
 
-assert_eq "$("$helper" probe)" available "system FFmpeg fallback probe"
+mv -- "$bin/ffmpeg" "$bin/ffmpeg.good"
+cat > "$bin/ffmpeg" <<'SH'
+#!/bin/sh
+: > "$VIDEOPLAYER_SYSTEM_FAIL_MARKER"
+exit 0
+SH
+chmod 0755 "$bin/ffmpeg"
+export VIDEOPLAYER_SYSTEM_FAIL_MARKER="$work/system-ffmpeg-used"
+set +e
+missing_private_output="$("$helper" probe 2>&1)"
+missing_private_rc=$?
+set -e
+assert_eq "$missing_private_rc" 1 "missing private runtime probe"
+[[ "$missing_private_output" == *"metadata failed attestation"* ]] ||
+	fail "missing private runtime diagnostic was not strict"
+[[ ! -e "$VIDEOPLAYER_SYSTEM_FAIL_MARKER" ]] ||
+	fail "system FFmpeg was invoked without an attested private runtime"
+mv -f -- "$bin/ffmpeg.good" "$bin/ffmpeg"
 
-mkdir -m 0755 -- "$work/private-libexec"
-mkdir -m 0755 -- "$private_exec_dir"
+mkdir -m 0755 -- "$work/private-libexec" "$work/private-share"
+mkdir -m 0755 -- "$private_exec_dir" "$private_info_dir"
 cp -- "$bin/ffmpeg" "$private_ffmpeg"
 chmod 0755 "$private_ffmpeg"
+cat > "$private_build_info" <<EOF
+format=4
+renderer_profile=software-cpu-v1
+execution_backend=software-cpu-v1
+software_cpu_only=1
+private_binary=$private_ffmpeg
+EOF
+chmod 0644 "$private_build_info"
 
 # A static or mostly static companion is usable without an artificial empty
 # private library directory, and takes precedence over a broken system FFmpeg.
@@ -2021,6 +2296,10 @@ chmod 0755 "$bin/ffmpeg"
 export VIDEOPLAYER_SYSTEM_FAIL_MARKER="$work/static-system-probe-used"
 rm -f -- "$VIDEOPLAYER_SYSTEM_FAIL_MARKER"
 assert_eq "$("$helper" probe)" available "static private FFmpeg preference"
+assert_eq \
+	"$("$helper" attest)" \
+	$'private-software-cpu\tsoftware-cpu-v1\tnone' \
+	"strict runtime attestation contract"
 [[ ! -e "$VIDEOPLAYER_SYSTEM_FAIL_MARKER" ]] ||
 	fail "system FFmpeg was probed despite a usable static private runtime"
 mv -f -- "$bin/ffmpeg.good" "$bin/ffmpeg"
@@ -2030,8 +2309,7 @@ mkdir -m 0755 -- "$private_lib_dir"
 printf 'private library fixture\n' > "$private_lib_dir/libfixture.so"
 chmod 0644 "$private_lib_dir/libfixture.so"
 
-# A valid but unusable private runtime is tried first, then the system FFmpeg
-# remains available as a capability-checked fallback.
+# A valid but unusable private runtime fails closed; no system fallback exists.
 mv -- "$private_ffmpeg" "$private_ffmpeg.good"
 cat > "$private_ffmpeg" <<'SH'
 #!/bin/sh
@@ -2041,9 +2319,13 @@ SH
 chmod 0755 "$private_ffmpeg"
 export VIDEOPLAYER_PRIVATE_FAIL_MARKER="$work/private-probe-failed"
 export VIDEOPLAYER_EXPECT_PRIVATE_LIB=""
-assert_eq "$("$helper" probe)" available "private FFmpeg probe fallback"
+set +e
+"$helper" probe >/dev/null 2>&1
+broken_private_rc=$?
+set -e
+assert_eq "$broken_private_rc" 1 "broken private FFmpeg fail-closed probe"
 [[ -f "$VIDEOPLAYER_PRIVATE_FAIL_MARKER" ]] ||
-	fail "private FFmpeg was not probed before system fallback"
+	fail "broken private FFmpeg was not capability-probed"
 mv -f -- "$private_ffmpeg.good" "$private_ffmpeg"
 
 # Once the private runtime passes its probes, a broken system executable must
@@ -2076,13 +2358,113 @@ chmod 0777 "$private_lib_dir"
 export VIDEOPLAYER_UNSAFE_PRIVATE_MARKER="$work/unsafe-private-used"
 export VIDEOPLAYER_EXPECT_PRIVATE_LIB=""
 rm -f -- "$VIDEOPLAYER_UNSAFE_PRIVATE_MARKER"
-assert_eq "$("$helper" probe)" available "unsafe private FFmpeg fallback"
+set +e
+"$helper" probe >/dev/null 2>&1
+unsafe_private_rc=$?
+set -e
+assert_eq "$unsafe_private_rc" 1 "unsafe private FFmpeg fail-closed probe"
 [[ ! -e "$VIDEOPLAYER_UNSAFE_PRIVATE_MARKER" ]] ||
 	fail "unsafe private FFmpeg runtime was executed"
 chmod 0755 "$private_lib_dir"
 mv -f -- "$private_ffmpeg.good" "$private_ffmpeg"
 
 export VIDEOPLAYER_EXPECT_PRIVATE_LIB="$private_lib_dir"
+# The package marker is part of the runtime trust boundary. Duplicate security
+# fields are rejected instead of relying on first/last-value parsing.
+cp -- "$private_build_info" "$private_build_info.good"
+printf 'execution_backend=browser\n' >> "$private_build_info"
+set +e
+"$helper" attest >/dev/null 2>&1
+bad_build_info_rc=$?
+set -e
+assert_eq "$bad_build_info_rc" 1 "malformed build-info attestation"
+mv -f -- "$private_build_info.good" "$private_build_info"
+chmod 0644 "$private_build_info"
+
+# The real FFmpeg legend uses the same six-character flag shape as codec rows
+# (`V..... = Video`) and must be ignored, while any actual decoder outside the
+# native software allowlist remains fatal to attestation.
+mv -- "$private_ffmpeg" "$private_ffmpeg.good"
+export VIDEOPLAYER_PRIVATE_GOOD="$private_ffmpeg.good"
+cat > "$private_ffmpeg" <<'SH'
+#!/bin/sh
+"$VIDEOPLAYER_PRIVATE_GOOD" "$@"
+rc=$?
+[ "$rc" -eq 0 ] || exit "$rc"
+case " $* " in
+	*' -decoders '*)
+		printf '%s\n' ' V..... h264_v4l2m2m forbidden wrapper'
+		;;
+esac
+exit 0
+SH
+chmod 0755 "$private_ffmpeg"
+set +e
+unexpected_decoder_output="$("$helper" attest 2>&1)"
+unexpected_decoder_rc=$?
+set -e
+assert_eq "$unexpected_decoder_rc" 1 "unexpected decoder attestation"
+[[ "$unexpected_decoder_output" == *"decoder set differs"* ]] ||
+	fail "unexpected decoder did not fail the exact software allowlist"
+mv -f -- "$private_ffmpeg.good" "$private_ffmpeg"
+unset VIDEOPLAYER_PRIVATE_GOOD
+
+# A configure option merely containing the required spelling is not an exact
+# `--disable-encoders` attestation token.
+mv -- "$private_ffmpeg" "$private_ffmpeg.good"
+export VIDEOPLAYER_PRIVATE_GOOD="$private_ffmpeg.good"
+cat > "$private_ffmpeg" <<'SH'
+#!/bin/sh
+case " $* " in
+	*' -buildconf '*)
+		"$VIDEOPLAYER_PRIVATE_GOOD" "$@" |
+			sed 's/--disable-encoders/--disable-encoders-extra/'
+		exit 0
+		;;
+esac
+exec "$VIDEOPLAYER_PRIVATE_GOOD" "$@"
+SH
+chmod 0755 "$private_ffmpeg"
+set +e
+inexact_encoder_flag_output="$("$helper" attest 2>&1)"
+inexact_encoder_flag_rc=$?
+set -e
+assert_eq "$inexact_encoder_flag_rc" 1 \
+	"inexact disable-encoders build flag attestation"
+[[ "$inexact_encoder_flag_output" == *"not a software-only build"* ]] ||
+	fail "inexact disable-encoders token passed build attestation"
+mv -f -- "$private_ffmpeg.good" "$private_ffmpeg"
+unset VIDEOPLAYER_PRIVATE_GOOD
+
+# Encoder attestation is equally exact: the strict runtime may publish only
+# native MJPEG video and PCM s16le audio. A hardware wrapper or any other extra
+# encoder invalidates the software-cpu-v1 claim even when both required
+# encoders are still present.
+mv -- "$private_ffmpeg" "$private_ffmpeg.good"
+export VIDEOPLAYER_PRIVATE_GOOD="$private_ffmpeg.good"
+cat > "$private_ffmpeg" <<'SH'
+#!/bin/sh
+"$VIDEOPLAYER_PRIVATE_GOOD" "$@"
+rc=$?
+[ "$rc" -eq 0 ] || exit "$rc"
+case " $* " in
+	*' -encoders '*)
+		printf '%s\n' ' V..... h264_v4l2m2m forbidden wrapper'
+		;;
+esac
+exit 0
+SH
+chmod 0755 "$private_ffmpeg"
+set +e
+unexpected_encoder_output="$("$helper" attest 2>&1)"
+unexpected_encoder_rc=$?
+set -e
+assert_eq "$unexpected_encoder_rc" 1 "unexpected encoder attestation"
+[[ "$unexpected_encoder_output" == *"encoder set differs"* ]] ||
+	fail "unexpected encoder did not fail the exact software allowlist"
+mv -f -- "$private_ffmpeg.good" "$private_ffmpeg"
+unset VIDEOPLAYER_PRIVATE_GOOD
+
 assert_eq "$("$helper" probe)" available "final private FFmpeg probe"
 
 set +e
@@ -2237,9 +2619,198 @@ assert_eq \
 	stopped \
 	"stop after runtime failure"
 
-# Missing or undecodable audio is nonfatal: video remains available and the
-# dedicated audio endpoint reports the optional track as unavailable. The
-# disposable one-core override also exercises the video-only decoder argv.
+# An advertised audio stream is part of the strict CPU contract. A private
+# runtime which can inventory but cannot decode its first PCM frame must abort
+# startup instead of silently relabelling the source as video-only.
+set +e
+audio_probe_failure_output="$(
+	"$helper" start \
+		"$audio_probe_failure" "$work/media/audio-probe-failure.mp4" 2>&1
+)"
+audio_probe_failure_rc=$?
+set -e
+assert_eq "$audio_probe_failure_rc" 1 \
+	"advertised audio decode failure exit code"
+assert_eq \
+	"$audio_probe_failure_output" \
+	"Source audio cannot be decoded by the private CPU runtime" \
+	"advertised audio decode failure reason"
+assert_eq \
+	"$("$helper" status "$audio_probe_failure")" \
+	inactive \
+	"advertised audio decode failure cleanup"
+if "$helper" has-audio "$audio_probe_failure" \
+	> "$work/startup-failed-has-audio"; then
+	fail "failed audio startup was relabelled as a source without audio"
+fi
+[[ ! -s "$work/startup-failed-has-audio" ]] ||
+	fail "failed audio startup emitted a false no-audio value"
+
+# The general info probe is deliberately truncated at 64 KiB. This fixture
+# prints more than that much subtitle inventory before its real audio
+# declaration, so only the separate bounded mandatory-map/PCM probe can detect
+# it. The session must be audio-ready (or fail closed), never silently absent.
+assert_eq \
+	"$("$helper" start "$long_probe_audio" "$work/media/long-probe-audio.mp4")" \
+	started \
+	"audio declaration beyond bounded info log"
+assert_eq "$("$helper" has-audio "$long_probe_audio")" 1 \
+	"late audio declaration source classification"
+assert_eq "$("$helper" audio-state "$long_probe_audio")" ready \
+	"late audio declaration strict audio state"
+assert_eq "$("$helper" stop "$long_probe_audio")" stopped \
+	"late audio declaration stop"
+
+# Probe FFmpeg children inherit the worker-lock descriptor until they exit.
+# Kill both the control-side start invocation and the untrapped worker while a
+# real private executable is blocked in the source probe: maintenance must
+# publish its durable gate but cannot quiesce or authorize package mutation
+# until that exact executable releases the lifecycle barrier.
+rm -f -- "$blocked_probe_ready" "$blocked_probe_release"
+"$helper" start "$blocked_probe" "$work/media/blocked-probe.mp4" \
+	> "$work/blocked-probe-start" 2>&1 &
+blocked_probe_start_pid=$!
+for _ in {1..100}; do
+	[[ -s "$blocked_probe_ready" &&
+	   -f "$runtime/s-$blocked_probe/worker" ]] && break
+	sleep 0.02
+done
+[[ -s "$blocked_probe_ready" ]] ||
+	fail "private FFmpeg did not enter the blocked source probe"
+blocked_probe_ffmpeg="$(< "$blocked_probe_ready")"
+[[ "$blocked_probe_ffmpeg" =~ ^[0-9]+$ ]] ||
+	fail "blocked probe did not publish a valid private FFmpeg PID"
+blocked_probe_worker="$(session_pid "$blocked_probe" worker)"
+assert_eq \
+	"$(readlink -f -- "/proc/$blocked_probe_ffmpeg/exe")" \
+	"$private_ffmpeg" \
+	"blocked probe private executable identity"
+assert_eq \
+	"$(readlink -f -- "/proc/$blocked_probe_ffmpeg/fd/8")" \
+	"$runtime.worker.lock" \
+	"blocked probe worker-lock inheritance"
+kill -KILL "$blocked_probe_start_pid"
+wait "$blocked_probe_start_pid" 2>/dev/null || :
+blocked_probe_start_pid=""
+kill -TERM "$blocked_probe_worker"
+wait_dead "$blocked_probe_worker"
+kill -0 "$blocked_probe_ffmpeg" 2>/dev/null ||
+	fail "source probe did not survive the pre-trap worker termination"
+"$helper" maintenance-enter > "$work/blocked-probe-maintenance" 2>&1 &
+maintenance_enter_pid=$!
+for _ in {1..100}; do
+	[[ -f "$maintenance_file" ]] && break
+	sleep 0.02
+done
+[[ -f "$maintenance_file" ]] ||
+	fail "maintenance did not publish its gate during blocked probe teardown"
+sleep 0.1
+kill -0 "$maintenance_enter_pid" 2>/dev/null ||
+	fail "maintenance bypassed the live private source-probe executable"
+assert_eq \
+	"$(readlink -f -- "/proc/$blocked_probe_ffmpeg/exe")" \
+	"$private_ffmpeg" \
+	"private source probe remains attested while maintenance waits"
+touch "$blocked_probe_release"
+set +e
+wait "$maintenance_enter_pid"
+blocked_probe_maintenance_rc=$?
+set -e
+maintenance_enter_pid=""
+assert_eq "$blocked_probe_maintenance_rc" 0 \
+	"maintenance after blocked probe release"
+assert_eq "$(< "$work/blocked-probe-maintenance")" maintenance \
+	"blocked probe maintenance result"
+wait_dead "$blocked_probe_ffmpeg"
+blocked_probe_ffmpeg=""
+blocked_probe_worker=""
+for probe_exe in /proc/[0-9]*/exe; do
+	[[ "$(readlink -f -- "$probe_exe" 2>/dev/null || true)" != \
+	   "$private_ffmpeg" ]] ||
+		fail "private FFmpeg survived successful maintenance quiescence"
+done
+assert_eq "$("$helper" maintenance-exit)" resumed \
+	"resume after blocked source-probe quiescence"
+
+# The long-lived producer keeps the same barrier through its pre-identity
+# launch window. Pause immediately after fork, kill both controlling shells,
+# and prove maintenance still waits for the unrecorded private executable.
+rm -f -- "$producer_identity_ready" "$producer_identity_release"
+: > "$producer_identity_ready.arm"
+"$helper" start "$producer_race" "$work/media/producer-race.mp4" \
+	> "$work/producer-race-start" 2>&1 &
+producer_race_start_pid=$!
+for _ in {1..200}; do
+	[[ -s "$producer_identity_ready" &&
+	   -f "$runtime/s-$producer_race/worker" ]] && break
+	sleep 0.02
+done
+[[ -s "$producer_identity_ready" ]] ||
+	fail "producer did not enter its pre-identity launch window"
+producer_race_ffmpeg="$(< "$producer_identity_ready")"
+producer_race_worker="$(session_pid "$producer_race" worker)"
+[[ ! -e "$runtime/s-$producer_race/ffmpeg" ]] ||
+	fail "producer identity was published before the deterministic pause"
+assert_eq \
+	"$(readlink -f -- "/proc/$producer_race_ffmpeg/exe")" \
+	"$private_ffmpeg" \
+	"pre-identity producer private executable"
+assert_eq \
+	"$(readlink -f -- "/proc/$producer_race_ffmpeg/fd/8")" \
+	"$runtime.worker.lock" \
+	"pre-identity producer worker-lock inheritance"
+kill -KILL "$producer_race_start_pid"
+wait "$producer_race_start_pid" 2>/dev/null || :
+producer_race_start_pid=""
+kill -KILL "$producer_race_worker"
+wait_dead "$producer_race_worker"
+"$helper" maintenance-enter > "$work/producer-race-maintenance" 2>&1 &
+maintenance_enter_pid=$!
+for _ in {1..100}; do
+	[[ -f "$maintenance_file" ]] && break
+	sleep 0.02
+done
+[[ -f "$maintenance_file" ]] ||
+	fail "producer-race maintenance did not publish its gate"
+sleep 0.1
+kill -0 "$maintenance_enter_pid" 2>/dev/null ||
+	fail "maintenance bypassed the unrecorded private producer"
+kill -0 "$producer_race_ffmpeg" 2>/dev/null ||
+	fail "unrecorded private producer exited before barrier assertion"
+touch "$producer_identity_release"
+# The worker died before publishing an identity, so the controller cannot
+# safely address this PID. Simulate the private process's eventual exit only
+# after maintenance has demonstrably blocked; the lifecycle barrier, not PID
+# guessing, must be what releases package mutation.
+kill -KILL "$producer_race_ffmpeg" 2>/dev/null || :
+wait_dead "$producer_race_ffmpeg"
+set +e
+wait "$maintenance_enter_pid"
+producer_race_maintenance_rc=$?
+set -e
+maintenance_enter_pid=""
+if [[ "$producer_race_maintenance_rc" -ne 0 ]]; then
+	producer_race_worker_state="$($helper status "$producer_race" 2>&1 || true)"
+	producer_race_current="$(sed -n '1,8p' "$runtime/current" 2>/dev/null || true)"
+	producer_race_lock_holders="$(
+		for fd in /proc/[0-9]*/fd/8; do
+			[[ "$(readlink -f -- "$fd" 2>/dev/null || true)" == \
+			   "$runtime.worker.lock" ]] && printf '%s\n' "$fd"
+		done
+		:
+	)"
+	fail "maintenance after pre-identity producer release: rc=$producer_race_maintenance_rc; output=$(< "$work/producer-race-maintenance"); status=$producer_race_worker_state; current=$producer_race_current; lock_holders=$producer_race_lock_holders"
+fi
+assert_eq "$(< "$work/producer-race-maintenance")" maintenance \
+	"pre-identity producer maintenance result"
+producer_race_ffmpeg=""
+producer_race_worker=""
+rm -f -- "$producer_identity_ready.arm"
+assert_eq "$("$helper" maintenance-exit)" resumed \
+	"resume after pre-identity producer quiescence"
+
+# A source which genuinely advertises no audio remains a valid silent CPU
+# session. It must not expose any original-source browser-audio capability.
 assert_eq \
 	"$(
 		VIDEOPLAYER_TEST_DECODER_THREADS=1 \
@@ -2250,107 +2821,26 @@ assert_eq \
 	"video-only start"
 assert_eq \
 	"$("$helper" media-info "$no_audio")" \
-	$'125500\t1004\t8\tfast' \
+	$'125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
 	"video-only duration metadata"
-assert_eq \
-	"$("$helper" source "$no_audio")" \
-	"$work/media/no-audio-extensionless" \
-	"active renderer source"
-assert_eq \
-	"$("$helper" authorize-browser-audio \
-		"$no_audio" "$no_audio_capability")" \
-	"$no_audio_capability" \
-	"browser-audio capability authorization"
-assert_eq \
-	"$("$helper" authorize-browser-audio \
-		"$no_audio" 56565656565656565656565656565656)" \
-	"$no_audio_capability" \
-	"browser-audio capability idempotence"
-if "$helper" authorize-browser-audio "$no_audio" "$no_audio" \
-	>/dev/null 2>&1; then
-	fail "renderer token was accepted as its own browser-audio capability"
-fi
-no_audio_worker="$(session_pid "$no_audio" worker)"
-source_info="$(
-	"$helper" source-info "$no_audio" "$no_audio_capability"
-)"
-IFS=$'\t' read -r source_path source_fd source_identity extra <<< "$source_info"
-[[ -z "${extra:-}" ]] || fail "source-info returned extra fields"
-assert_eq "$source_path" "$work/media/no-audio-extensionless" \
-	"browser-audio source path"
-assert_eq "$source_fd" "/proc/$no_audio_worker/fd/3" \
-	"browser-audio stable descriptor"
-assert_eq "$source_identity" \
-	"$(stat -L -c '%d:%i:%s' -- "$source_fd")" \
-	"browser-audio source identity"
-position_ms="$("$helper" position-ms "$no_audio" "$no_audio_capability")"
-[[ "$position_ms" =~ ^[0-9]+$ && "$position_ms" -le 21605000 ]] ||
-	fail "invalid renderer playback offset: $position_ms"
 assert_eq "$("$helper" has-audio "$no_audio")" 0 "video-only audio capability"
+assert_eq "$("$helper" audio-state "$no_audio")" absent \
+	"strict video-only audio state"
+for removed_command in source authorize-browser-audio source-info position-ms; do
+	if "$helper" "$removed_command" "$no_audio" "$no_audio_capability" \
+		>/dev/null 2>&1; then
+		fail "removed browser-audio helper command remained callable: $removed_command"
+	fi
+done
 run_mjpeg_cgi "$no_audio" 1-1 "$work/no-audio-mjpeg"
 check_mjpeg_response \
 	"$work/no-audio-mjpeg" "$no_audio" 1 initial >/dev/null
 run_audio_cgi GET "$no_audio" live "$work/audio-response"
 check_status_line "$work/audio-response" "409 Conflict"
-grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
-	"$work/audio-response" ||
-	fail "video-only PCM response omitted its authenticated fallback state"
-run_stream_cgi HEAD "$no_audio" "$no_audio_capability" \
-	"$work/stream-head"
-check_status_line "$work/stream-head" "200 OK"
-grep -Fq $'Content-Type: application/octet-stream\r' "$work/stream-head" ||
-	fail "extensionless renderer stream used an unexpected MIME type"
-run_stream_cgi GET "$no_audio" "$no_audio_capability" \
-	"$work/stream-get"
-check_status_line "$work/stream-get" "200 OK"
-check_stream_body_file \
-	"$work/stream-get" "$work/media/no-audio-extensionless"
-run_stream_cgi GET "$no_audio" "$no_audio_capability" \
-	"$work/stream-range" "bytes=3-11"
-check_status_line "$work/stream-range" "206 Partial Content"
-check_stream_body_slice \
-	"$work/stream-range" "$work/media/no-audio-extensionless" 3 11
-REQUEST_METHOD=GET \
-	QUERY_STRING="renderer=$no_audio" \
-	"$stream_helper" > "$work/stream-invalid"
-check_status_line "$work/stream-invalid" "400 Bad Request"
-REQUEST_METHOD=GET \
-	QUERY_STRING="renderer=$no_audio&audio=$no_audio" \
-	"$stream_helper" > "$work/stream-invalid"
-check_status_line "$work/stream-invalid" "403 Forbidden"
-
-# Replacing the pathname must not swap the bytes granted to an existing
-# browser-audio capability: CGI reopens the worker's original descriptor and
-# verifies its exact device/inode/size after open.
-mv -- "$work/media/no-audio-extensionless" \
-	"$work/media/no-audio-extensionless.opened"
-run_stream_cgi GET "$no_audio" "$no_audio_capability" \
-	"$work/stream-renamed"
-check_status_line "$work/stream-renamed" "200 OK"
-check_stream_body_file \
-	"$work/stream-renamed" "$work/media/no-audio-extensionless.opened"
-printf 'replacement bytes must not be streamed\n' \
-	> "$work/media/no-audio-extensionless"
-run_stream_cgi GET "$no_audio" "$no_audio_capability" \
-	"$work/stream-replaced"
-check_status_line "$work/stream-replaced" "200 OK"
-check_stream_body_file \
-	"$work/stream-replaced" "$work/media/no-audio-extensionless.opened"
+grep -Fq 'Source has no audio stream' "$work/audio-response" ||
+	fail "silent CPU source did not report strict source absence"
 assert_eq "$("$helper" status "$no_audio")" running "video-only status"
 assert_eq "$("$helper" stop "$no_audio")" stopped "video-only stop"
-if "$helper" source "$no_audio" >/dev/null 2>&1; then
-	fail "stopped renderer exposed its source"
-fi
-if "$helper" source-info "$no_audio" "$no_audio_capability" \
-	>/dev/null 2>&1; then
-	fail "stopped renderer retained its browser-audio capability"
-fi
-run_stream_cgi GET "$no_audio" "$no_audio_capability" \
-	"$work/stream-stopped"
-check_status_line "$work/stream-stopped" "403 Forbidden"
-rm -f -- "$work/media/no-audio-extensionless"
-mv -- "$work/media/no-audio-extensionless.opened" \
-	"$work/media/no-audio-extensionless"
 
 # FFmpeg must be allowed to fill the browser prebuffer faster than wall time.
 # This clock-free fake produces an audio-less stream as quickly as FIFO
@@ -2431,13 +2921,14 @@ rm -f -- "$fast_av_drain_error" "$fast_av_drain_stop"
 				sleep 0.01
 				;;
 			'Status: 409 Conflict')
-				if grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
+				if grep -Fq $'X-Videoplayer-Audio-State: busy\r' \
 					"$work/fast-av-audio-response"; then
-					printf 'fast A/V audio became unavailable at %s\n' "$sequence" \
-						> "$fast_av_drain_error"
+					sleep 0.01
+				else
+					printf 'fast A/V audio lost strict readiness at %s\n' \
+						"$sequence" > "$fast_av_drain_error"
 					exit 1
 				fi
-				sleep 0.01
 				;;
 			*)
 				printf 'unexpected fast A/V audio response at %s\n' "$sequence" \
@@ -2491,7 +2982,7 @@ assert_eq \
 quality_worker="$(session_pid "$quality_producer" worker)"
 assert_eq \
 	"$("$helper" media-info "$quality_producer")" \
-	$'125500\t7530\t60\tquality' \
+	$'125500\t7530\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
 	"quality profile preserved configured FPS"
 run_mjpeg_cgi "$quality_producer" 51-1 "$work/quality-producer"
 IFS=: read -r quality_parts quality_first quality_last quality_preamble <<< "$(
@@ -2520,7 +3011,7 @@ assert_eq \
 	"unknown-duration start"
 assert_eq \
 	"$("$helper" media-info "$duration_unknown")" \
-	$'0\t0\t8\tfast' \
+	$'0\t0\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
 	"unknown-duration metadata"
 assert_eq \
 	"$("$helper" stop "$duration_unknown")" \
@@ -2572,13 +3063,11 @@ assert_eq \
 	"$(< "$work/status-touch-race")" \
 	ended \
 	"status-touch running-to-ended transition"
-[[ "$(< "$runtime/s-$instant_media/heartbeat")" -ge "$now" ]] ||
-	fail "status-touch did not refresh the running-to-ended source-holder lease"
 assert_eq \
 	"$("$helper" status "$instant_media")" \
 	ended \
 	"instant-media final status"
-kill -0 "$instant_worker"
+wait_dead "$instant_worker"
 assert_eq \
 	"$("$helper" stop "$instant_media")" \
 	stopped \
@@ -2602,16 +3091,6 @@ assert_eq \
 	"$("$helper" status "$terminal_gap")" \
 	ended \
 	"terminal-gap ended before drain claim"
-assert_eq \
-	"$("$helper" authorize-browser-audio \
-		"$terminal_gap" "$terminal_gap_capability")" \
-	"$terminal_gap_capability" \
-	"terminal-gap browser-audio capability"
-run_stream_cgi GET "$terminal_gap" "$terminal_gap_capability" \
-	"$work/terminal-range-before" bytes=0-3
-check_status_line "$work/terminal-range-before" "206 Partial Content"
-check_stream_body_slice \
-	"$work/terminal-range-before" "$work/media/terminal-gap.mp4" 0 3
 run_mjpeg_cgi "$terminal_gap" 47-0 "$work/terminal-no-drain"
 check_status_line "$work/terminal-no-drain" "410 Gone"
 run_mjpeg_drain_cgi \
@@ -2635,23 +3114,11 @@ assert_eq \
 	"$(< "$runtime/s-$terminal_gap/video-drained")" \
 	$'snapshot-v1\n47474747474747474747474747474747\n47-1\ncomplete' \
 	"terminal drain marker binding"
-kill -0 "$terminal_gap_worker"
-now="$(date +%s)"
-heartbeat_tmp="$runtime/s-$terminal_gap/.heartbeat-terminal-test"
-(umask 077; printf '%s\n' "$((now - 80))" > "$heartbeat_tmp")
-chmod 0600 "$heartbeat_tmp"
-mv -f -- "$heartbeat_tmp" "$runtime/s-$terminal_gap/heartbeat"
+wait_dead "$terminal_gap_worker"
 assert_eq \
 	"$("$helper" status-touch "$terminal_gap")" \
 	ended \
-	"terminal source-holder lease refresh"
-[[ "$(< "$runtime/s-$terminal_gap/heartbeat")" -ge "$now" ]] ||
-	fail "terminal status-touch did not refresh the source-holder lease"
-run_stream_cgi GET "$terminal_gap" "$terminal_gap_capability" \
-	"$work/terminal-range-after" bytes=4-7
-check_status_line "$work/terminal-range-after" "206 Partial Content"
-check_stream_body_slice \
-	"$work/terminal-range-after" "$work/media/terminal-gap.mp4" 4 7
+	"terminal status remains observable without source retention"
 assert_eq \
 	"$("$helper" status "$terminal_gap")" \
 	ended \
@@ -2662,30 +3129,6 @@ assert_eq \
 	"terminal-gap stop"
 wait_dead "$terminal_gap_worker"
 terminal_gap_worker=""
-
-# Browser-audio synchronization starts at the first published frame, not when
-# a slow decoder process is spawned. Startup latency must therefore not seek
-# the audio several seconds ahead of the visible video.
-assert_eq \
-	"$("$helper" start "$delayed_start" "$work/media/delayed-start.mp4")" \
-	started \
-	"delayed-start media"
-delayed_worker="$(session_pid "$delayed_start" worker)"
-assert_eq \
-	"$("$helper" authorize-browser-audio \
-		"$delayed_start" "$delayed_capability")" \
-	"$delayed_capability" \
-	"delayed-start browser-audio capability"
-delayed_position="$(
-	"$helper" position-ms "$delayed_start" "$delayed_capability"
-)"
-[[ "$delayed_position" =~ ^[0-9]+$ && "$delayed_position" -le 2500 ]] ||
-	fail "renderer clock included decoder startup latency: $delayed_position"
-assert_eq \
-	"$("$helper" stop "$delayed_start")" \
-	stopped \
-	"delayed-start stop"
-wait_dead "$delayed_worker"
 
 # A short source audio track is padded until the longer video ends. Use a
 # A 1.13-second video ends between one-second PCM boundaries; asetnsamples
@@ -2770,9 +3213,8 @@ assert_eq \
 	"long-audio stop"
 wait_dead "$long_audio_worker"
 
-# Once video reaches EOF, completed PCM chunks remain readable while the clean
-# source-holder worker is leased, and still remain readable after that holder's
-# deliberately stale heartbeat releases fd 3.
+# Once video reaches EOF, completed PCM chunks remain readable without keeping
+# the original source descriptor or worker alive after terminal drain.
 assert_eq \
 	"$(
 		VIDEOPLAYER_TEST_DECODER_THREADS=1 \
@@ -2793,12 +3235,6 @@ for _ in {1..200}; do
 	sleep 0.05
 done
 assert_eq "$("$helper" status "$finite_media")" ended "finite-media status"
-kill -0 "$finite_media_worker"
-now="$(date +%s)"
-heartbeat_tmp="$runtime/s-$finite_media/.heartbeat-terminal-stale"
-(umask 077; printf '%s\n' "$((now - 120))" > "$heartbeat_tmp")
-chmod 0600 "$heartbeat_tmp"
-mv -f -- "$heartbeat_tmp" "$runtime/s-$finite_media/heartbeat"
 wait_dead "$finite_media_worker"
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$finite_media/audio-state")" \
@@ -2814,47 +3250,56 @@ run_audio_cgi \
 check_status_line "$work/audio-response" "204 No Content"
 assert_eq "$("$helper" stop "$finite_media")" stopped "finite-media stop"
 
-# The PCM sink can receive complete blocks and then a truncated block after
-# the one-frame source probe succeeded. The shared producer's verified standby
-# drain must discard subsequent audio, mark PCM unavailable, and keep the
-# MJPEG output independently playable.
+# A PCM failure after successful startup is fatal to the whole strict CPU
+# session. It must never preserve video as a partial CPU-rendering session.
 assert_eq \
 	"$("$helper" start "$audio_failure" "$work/media/audio-runtime.mp4")" \
 	started \
 	"audio-failure start"
-audio_failure_audio=""
-audio_failure_video=""
-audio_failure_state=""
-for _ in {1..100}; do
-	audio_failure_audio="$("$helper" has-audio "$audio_failure")"
-	audio_failure_video="$("$helper" status "$audio_failure")"
-	if [[ -f "$runtime/s-$audio_failure/audio-state" ]]; then
-		audio_failure_state="$(sed -n '2p' \
-			"$runtime/s-$audio_failure/audio-state")"
-	fi
-	if [[ "$audio_failure_audio" == 0 &&
-	      "$audio_failure_video" == running &&
-	      "$audio_failure_state" =~ ^(unavailable|error)$ ]]; then
-		break
-	fi
+for _ in {1..200}; do
+	[[ "$("$helper" status "$audio_failure")" == error ]] && break
 	sleep 0.05
 done
-assert_eq "$audio_failure_audio" 0 "audio-failure state"
-assert_eq "$audio_failure_video" running "audio-failure video status"
-[[ "$audio_failure_state" =~ ^(unavailable|error)$ ]] ||
-	fail "audio-failure endpoint was tested before its terminal PCM state: $audio_failure_state"
+assert_eq "$("$helper" status "$audio_failure")" error \
+	"audio-failure strict session status"
+assert_eq "$("$helper" audio-state "$audio_failure")" error \
+	"audio-failure strict audio state"
 run_audio_cgi GET "$audio_failure" live "$work/audio-response"
-check_status_line "$work/audio-response" "409 Conflict"
-grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
-	"$work/audio-response" ||
-	fail "failed PCM pipeline omitted its authenticated fallback state"
-run_mjpeg_cgi "$audio_failure" 1-1 "$work/audio-failure-mjpeg"
-check_mjpeg_response \
-	"$work/audio-failure-mjpeg" "$audio_failure" 1 initial >/dev/null
+check_status_line "$work/audio-response" "503 Service Unavailable"
 assert_eq "$("$helper" stop "$audio_failure")" stopped "audio-failure stop"
 
-# Killing only the chunker must make the optional audio track fail closed,
-# stop its FIFO writer, preserve video playback, and leave bounded storage.
+# Even an exit-0 PCM EOF is fatal while video is still being produced. With
+# apad enabled, a valid short audio source cannot end this output early; doing
+# so means the strict CPU audio branch disappeared mid-session.
+assert_eq \
+	"$("$helper" start "$audio_clean_eof" "$work/media/audio-clean-eof.mp4")" \
+	started \
+	"clean early PCM EOF start"
+# Keep the video tee slave flowing until the fake closes only its PCM slave;
+# otherwise a small host FIFO could backpressure video before the fourth chunk.
+run_mjpeg_cgi \
+	"$audio_clean_eof" 54-0 "$work/audio-clean-eof-mjpeg" &
+audio_clean_eof_video_cgi=$!
+for _ in {1..240}; do
+	[[ "$("$helper" status "$audio_clean_eof")" == error ]] && break
+	sleep 0.05
+done
+assert_eq "$("$helper" status "$audio_clean_eof")" error \
+	"clean early PCM EOF strict session status"
+assert_eq "$("$helper" audio-state "$audio_clean_eof")" error \
+	"clean early PCM EOF strict audio state"
+if "$helper" has-audio "$audio_clean_eof" > "$work/failed-has-audio"; then
+	fail "failed advertised audio was relabelled as a source capability"
+fi
+[[ ! -s "$work/failed-has-audio" ]] ||
+	fail "failed advertised audio emitted a false no-audio value"
+wait "$audio_clean_eof_video_cgi"
+audio_clean_eof_video_cgi=""
+assert_eq "$("$helper" stop "$audio_clean_eof")" stopped \
+	"clean early PCM EOF stop"
+
+# Killing the CPU PCM chunker also terminates video; partial strict CPU sessions
+# are forbidden even when the MJPEG side could technically continue.
 assert_eq \
 	"$("$helper" start "$chunker_failure" "$media")" \
 	started \
@@ -2862,10 +3307,7 @@ assert_eq \
 chunker_failure_worker="$(session_pid "$chunker_failure" worker)"
 chunker_failure_ffmpeg="$(session_pid "$chunker_failure" ffmpeg)"
 chunker_failure_chunker="$(session_pid "$chunker_failure" chunker)"
-# Drain video concurrently so the unified tee cannot stop before its second
-# PCM chunk on kernels with a small pipe capacity. This mirrors the browser's
-# real continuous video consumer and makes the published-running precondition
-# independent of the host kernel's FIFO size.
+# Drain video concurrently so the tee can publish the initial PCM chunks.
 run_mjpeg_cgi \
 	"$chunker_failure" 1-0 "$work/chunker-failure-prime-mjpeg" &
 chunker_failure_video_cgi=$!
@@ -2887,130 +3329,36 @@ assert_eq \
 	"$chunker_failure_initial_state" \
 	running \
 	"chunker-failure published running audio state"
-audio_race_ready="$work/audio-race-ready"
-audio_race_release="$work/audio-race-release"
-audio_race_once="$work/audio-race-once"
-export VIDEOPLAYER_TEST_AUDIO_RACE_READY="$audio_race_ready"
-export VIDEOPLAYER_TEST_AUDIO_RACE_RELEASE="$audio_race_release"
-export VIDEOPLAYER_TEST_AUDIO_RACE_ONCE="$audio_race_once"
-run_audio_cgi \
-	GET "$chunker_failure" live "$work/chunker-failure-race-audio" &
-chunker_failure_cgi=$!
-for _ in {1..100}; do
-	[[ -e "$audio_race_ready" ]] && break
-	sleep 0.05
-done
-[[ -e "$audio_race_ready" ]] ||
-	fail "audio CGI race did not reach its deterministic pre-lock gate"
 kill -KILL "$chunker_failure_chunker"
 wait_dead "$chunker_failure_chunker"
-for _ in {1..100}; do
-	[[ "$(sed -n '2p' "$runtime/s-$chunker_failure/audio-state")" == error ]] &&
-		break
+for _ in {1..200}; do
+	[[ "$("$helper" status "$chunker_failure")" == error ]] && break
 	sleep 0.05
 done
 assert_eq \
-	"$(sed -n '2p' "$runtime/s-$chunker_failure/audio-state")" \
+	"$("$helper" status "$chunker_failure")" \
 	error \
-	"chunker-failure locked terminal audio state"
-touch "$audio_race_release"
-wait "$chunker_failure_cgi"
-chunker_failure_cgi=""
+	"chunker failure terminates strict CPU session"
 wait "$chunker_failure_video_cgi"
 chunker_failure_video_cgi=""
-check_mjpeg_response \
-	"$work/chunker-failure-prime-mjpeg" "$chunker_failure" 1 initial \
-	>/dev/null
-unset VIDEOPLAYER_TEST_AUDIO_RACE_READY
-unset VIDEOPLAYER_TEST_AUDIO_RACE_RELEASE
-unset VIDEOPLAYER_TEST_AUDIO_RACE_ONCE
-check_status_line "$work/chunker-failure-race-audio" "409 Conflict"
-grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
-	"$work/chunker-failure-race-audio" ||
-	fail "post-lock PCM failure race omitted authenticated fallback state"
 assert_eq \
-	"$("$helper" has-audio "$chunker_failure")" \
-	0 \
-	"chunker-failure audio state"
+	"$("$helper" audio-state "$chunker_failure")" \
+	error \
+	"chunker-failure strict audio state"
 inspect_audio_ring "$chunker_failure"
 assert_audio_storage_bound
-chunker_failure_bytes="$AUDIO_TOTAL_BYTES"
-sleep 0.5
-inspect_audio_ring "$chunker_failure"
-assert_audio_storage_bound
-assert_eq \
-	"$AUDIO_TOTAL_BYTES" \
-	"$chunker_failure_bytes" \
-	"audio growth after dead chunker"
-assert_eq \
-	"$("$helper" status "$chunker_failure")" \
-	running \
-	"chunker-failure video status"
-run_mjpeg_cgi "$chunker_failure" 1-1 "$work/chunker-failure-mjpeg"
-check_mjpeg_response \
-	"$work/chunker-failure-mjpeg" "$chunker_failure" 1 initial >/dev/null
-
-# Terminal video status precedes the bounded final FIFO drain. During that
-# window the exact worker and its fd 3 remain a safe protected browser-audio
-# source; once the worker exits, the same capability operations must fail.
-chunker_status_tmp="$runtime/s-$chunker_failure/.status-terminal-test.$$"
-printf '%s\n%s\n%s\n' snapshot-v1 ended 'Terminal audio fallback test' \
-	> "$chunker_status_tmp"
-chmod 0600 "$chunker_status_tmp"
-mv -f -- "$chunker_status_tmp" "$runtime/s-$chunker_failure/status"
-kill -0 "$chunker_failure_worker"
-assert_eq \
-	"$("$helper" authorize-browser-audio \
-		"$chunker_failure" "$chunker_terminal_capability")" \
-	"$chunker_terminal_capability" \
-	"terminal browser-audio capability authorization"
-terminal_source_info="$(
-	"$helper" source-info "$chunker_failure" "$chunker_terminal_capability"
-)"
-IFS=$'\t' read -r terminal_source_path terminal_source_fd \
-	terminal_source_identity terminal_source_extra <<< "$terminal_source_info"
-[[ -z "${terminal_source_extra:-}" ]] ||
-	fail "terminal source-info returned extra fields"
-assert_eq "$terminal_source_path" "$media" "terminal browser-audio source path"
-assert_eq \
-	"$terminal_source_fd" \
-	"/proc/$chunker_failure_worker/fd/3" \
-	"terminal browser-audio stable descriptor"
-assert_eq \
-	"$terminal_source_identity" \
-	"$(stat -L -c '%d:%i:%s' -- "$terminal_source_fd")" \
-	"terminal browser-audio source identity"
-terminal_position_ms="$(
-	"$helper" position-ms "$chunker_failure" "$chunker_terminal_capability"
-)"
-[[ "$terminal_position_ms" =~ ^[0-9]+$ ]] ||
-	fail "terminal browser-audio position is invalid: $terminal_position_ms"
-run_audio_cgi GET "$chunker_failure" live \
-	"$work/chunker-failure-terminal-audio"
-check_status_line "$work/chunker-failure-terminal-audio" "409 Conflict"
-grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
-	"$work/chunker-failure-terminal-audio" ||
-	fail "terminal PCM failure omitted authenticated fallback state"
 assert_eq \
 	"$("$helper" stop "$chunker_failure")" \
 	stopped \
 	"chunker-failure stop"
 wait_dead "$chunker_failure_worker"
 wait_dead "$chunker_failure_ffmpeg"
-if "$helper" authorize-browser-audio \
-	"$chunker_failure" "$chunker_terminal_capability" >/dev/null 2>&1; then
-	fail "browser-audio authorization survived terminal worker exit"
-fi
-if "$helper" source-info \
-	"$chunker_failure" "$chunker_terminal_capability" >/dev/null 2>&1; then
-	fail "browser-audio source-info survived terminal worker exit"
-fi
 
 assert_eq "$("$helper" start "$token1" "$media")" started "start"
 assert_eq "$("$helper" status "$token1")" running "status after start"
 assert_eq \
 	"$("$helper" media-info "$token1")" \
-	$'125500\t1004\t8\tfast' \
+	$'125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
 	"validated renderer media metadata"
 assert_eq \
 	"$(stat -c '%u:%a' -- "$runtime/s-$token1/media-info")" \
@@ -3035,10 +3383,20 @@ chunker1="$(session_pid "$token1" chunker)"
 kill -0 "$worker1"
 kill -0 "$ffmpeg1"
 kill -0 "$chunker1"
+source_descriptor_identity="$(stat -Lc '%d:%i' -- "$media")"
+for worker_fd in "/proc/$worker1/fd"/*; do
+	[[ "$(stat -Lc '%d:%i' -- "$worker_fd" 2>/dev/null || true)" != \
+	   "$source_descriptor_identity" ]] ||
+		fail "renderer worker retained the protected original source descriptor as ${worker_fd##*/}"
+done
 assert_eq \
 	"$(tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" | sed -n '1p')" \
 	"$private_ffmpeg" \
 	"private FFmpeg process identity"
+assert_eq \
+	"$(readlink -f -- "/proc/$ffmpeg1/exe")" \
+	"$private_ffmpeg" \
+	"private FFmpeg executable identity"
 assert_eq \
 	"$(tr '\000' '\n' < "/proc/$ffmpeg1/cmdline" | tail -n 1)" \
 	"[select=v:f=mpjpeg:boundary_tag=videoplayer-$token1]$runtime/s-$token1/video.pipe|[select=a:f=s16le:onfail=ignore]$runtime/s-$token1/audio.pipe" \
@@ -3058,26 +3416,23 @@ assert_eq \
 	audio-chunker \
 	"audio chunker process identity"
 assert_eq "$("$helper" has-audio "$token1")" 1 "audio capability"
+[[ -e "$VIDEOPLAYER_TEST_NICE_DELAY_MARKER" ]] ||
+	fail "private FFmpeg exec-identity race was not exercised"
 
-# A competing PCM request must fail fast and must not carry the authenticated
-# unavailable header used to authorize browser-audio fallback. Holding this
-# descriptor also proves the CGI uses a nonblocking lock instead of consuming
-# a second uhttpd worker until the first response finishes.
+# A competing PCM request must fail fast with the explicit retryable busy
+# state. Holding this descriptor also proves the CGI uses a nonblocking lock
+# instead of consuming a second uhttpd worker until the first response finishes.
 exec 7< "$runtime/s-$token1/audio.lock"
 flock -x 7
 run_audio_cgi GET "$token1" live "$work/audio-busy-response"
 exec 7<&-
 check_status_line "$work/audio-busy-response" "409 Conflict"
-if grep -Fq $'X-Videoplayer-Audio-State: unavailable\r' \
-	"$work/audio-busy-response"; then
-	fail "busy PCM response falsely authorized browser-audio fallback"
-fi
 grep -Fq $'X-Videoplayer-Audio-State: busy\r' \
 	"$work/audio-busy-response" ||
 	fail "busy PCM response omitted its bounded-retry state"
 
-# Drain video while forcing audio-ring saturation. With no browser audio
-# request, the chunker must preserve the first eight unacknowledged chunks and
+# Drain video while forcing audio-ring saturation. With no PCM acknowledgement,
+# the chunker must preserve the first eight unacknowledged chunks and
 # backpressure the shared producer before reading another PCM block.
 # A PCM chunk represents one second, so the clock-faithful fake needs roughly
 # eight seconds to fill eight slots. Reconnect bounded MJPEG segments throughout
@@ -3132,7 +3487,7 @@ check_status_line "$work/audio-batch-invalid" "202 Accepted"
 assert_eq \
 	"$(sed -n '2p' "$runtime/s-$token1/audio-ack")" \
 	0 \
-	"non-destructive HEAD and unavailable batch"
+	"non-destructive HEAD and not-ready batch"
 inspect_audio_ring "$token1"
 assert_eq "$AUDIO_FILE_COUNT" 8 "unacknowledged saturated audio ring"
 for sequence in {0..7}; do
@@ -3491,14 +3846,176 @@ assert_eq \
 # A crashed wrapper therefore cannot leave an orphaned FFmpeg process behind.
 wait_dead "$ffmpeg2"
 
+# Entering maintenance is the only operation which authorizes destructive
+# runtime cleanup. The marker survives cleanup and repeated helper invocations,
+# blocking starts and runtime attestation until an explicit, quiescent exit.
+assert_eq "$("$helper" maintenance-enter)" maintenance \
+	"maintenance entry after worker crash"
+assert_eq \
+	"$(stat -c '%u:%a:%s' -- "$maintenance_file")" \
+	"0:600:15" \
+	"maintenance marker metadata"
+assert_eq "$(< "$maintenance_file")" maintenance-v1 \
+	"maintenance marker schema"
+for blocked_command in probe attest; do
+	set +e
+	blocked_output="$("$helper" "$blocked_command" 2>&1)"
+	blocked_rc=$?
+	set -e
+	assert_eq "$blocked_rc" 1 "$blocked_command during maintenance"
+	[[ "$blocked_output" == *"maintenance is active"* ]] ||
+		fail "$blocked_command did not report maintenance"
+done
+set +e
+blocked_output="$("$helper" start "$token1" "$media" 2>&1)"
+blocked_rc=$?
+set -e
+assert_eq "$blocked_rc" 1 "start during maintenance"
+[[ "$blocked_output" == *"maintenance is active"* ]] ||
+	fail "start did not report maintenance"
+assert_eq "$("$helper" maintenance-enter)" maintenance \
+	"idempotent persistent maintenance entry"
 "$helper" cleanup
 
 [[ ! -e "$runtime" && ! -L "$runtime" ]] ||
 	fail "cleanup left runtime state"
+[[ -f "$maintenance_file" ]] ||
+	fail "cleanup removed the persistent maintenance gate"
 
 assert_eq \
 	"$("$helper" status "$token2")" \
 	inactive \
 	"status after cleanup"
+# Simulate the package replacing the helper while the old invocation is gone.
+# The fixed marker must gate the new executable and only that executable's
+# explicit resume may clear it.
+replacement_helper="$bin/videoplayer-renderer-replacement"
+cp -- "$helper" "$replacement_helper"
+chmod 0755 "$replacement_helper"
+set +e
+replacement_probe_output="$("$replacement_helper" probe 2>&1)"
+replacement_probe_rc=$?
+set -e
+assert_eq "$replacement_probe_rc" 1 "replacement helper maintenance gate"
+[[ "$replacement_probe_output" == *"maintenance is active"* ]] ||
+	fail "replacement helper did not inherit persistent maintenance"
+assert_eq "$("$replacement_helper" maintenance-exit)" resumed \
+	"replacement helper maintenance exit"
+[[ ! -e "$maintenance_file" && ! -L "$maintenance_file" ]] ||
+	fail "maintenance exit retained its marker"
+assert_eq "$("$helper" probe)" available "probe after maintenance exit"
+set +e
+"$helper" maintenance-exit > "$work/maintenance-exit-absent" 2>&1
+maintenance_exit_absent_rc=$?
+set -e
+assert_eq "$maintenance_exit_absent_rc" 1 \
+	"maintenance exit requires an active marker"
+
+# Cleanup without a prior maintenance gate is never a one-shot substitute: it
+# would reopen the start race as soon as the helper returns.
+set +e
+"$helper" cleanup > "$work/cleanup-without-maintenance" 2>&1
+cleanup_without_maintenance_rc=$?
+set -e
+assert_eq "$cleanup_without_maintenance_rc" 1 \
+	"cleanup without maintenance gate"
+
+# A malformed marker is an immutable fail-closed condition: ordinary commands,
+# cleanup, and maintenance-exit must all refuse it rather than chmod/remove an
+# attacker-controlled object.
+ln -s -- "$work" "$maintenance_file"
+for unsafe_command in probe attest maintenance-enter maintenance-exit cleanup; do
+	set +e
+	"$helper" "$unsafe_command" > "$work/unsafe-maintenance-$unsafe_command" 2>&1
+	unsafe_maintenance_rc=$?
+	set -e
+	assert_eq "$unsafe_maintenance_rc" 1 \
+		"unsafe maintenance marker $unsafe_command"
+done
+[[ -L "$maintenance_file" ]] ||
+	fail "unsafe maintenance marker was mutated by helper"
+rm -f -- "$maintenance_file"
+
+# Unsafe runtime state must fail maintenance entry after the gate is written;
+# cleanup must preserve both objects for an administrator to inspect/repair.
+mkdir -m 0755 -- "$runtime"
+set +e
+unsafe_runtime_output="$("$helper" maintenance-enter 2>&1)"
+unsafe_runtime_rc=$?
+set -e
+assert_eq "$unsafe_runtime_rc" 1 "unsafe runtime maintenance entry"
+[[ "$unsafe_runtime_output" == *"could not be quiesced safely"* ]] ||
+	fail "unsafe runtime maintenance entry lacked fail-closed diagnostic"
+[[ -f "$maintenance_file" ]] ||
+	fail "unsafe runtime failure did not retain maintenance marker"
+set +e
+"$helper" cleanup > "$work/unsafe-runtime-cleanup" 2>&1
+unsafe_runtime_cleanup_rc=$?
+set -e
+assert_eq "$unsafe_runtime_cleanup_rc" 1 "unsafe runtime cleanup"
+[[ -d "$runtime" && -f "$maintenance_file" ]] ||
+	fail "unsafe runtime cleanup mutated protected state"
+rmdir -- "$runtime"
+assert_eq "$("$helper" maintenance-exit)" resumed \
+	"resume after administrator repairs unsafe runtime"
+
+# A stop failure is equally fail-closed. The persistent marker remains, the
+# active session remains tracked, and no cleanup/replacement is authorized.
+assert_eq "$("$helper" start "$token1" "$media")" started \
+	"maintenance stop-failure source start"
+set +e
+VIDEOPLAYER_TEST_STOP_FAILURE=1 \
+	"$helper" maintenance-enter > "$work/maintenance-stop-failure" 2>&1
+maintenance_stop_failure_rc=$?
+set -e
+assert_eq "$maintenance_stop_failure_rc" 1 "maintenance stop failure"
+[[ -f "$maintenance_file" && -f "$runtime/current" ]] ||
+	fail "stop failure removed maintenance or current tracking state"
+set +e
+"$helper" cleanup > "$work/cleanup-after-stop-failure" 2>&1
+cleanup_after_stop_failure_rc=$?
+set -e
+assert_eq "$cleanup_after_stop_failure_rc" 0 \
+	"maintenance cleanup retries a transient stop failure"
+assert_eq "$("$helper" maintenance-exit)" resumed \
+	"resume after recovered stop failure"
+
+# Once the gate is published, a concurrent start waits on CONTROL_LOCK and then
+# observes the still-persistent marker. It cannot slip between stop and package
+# mutation, even across a separate helper invocation.
+assert_eq "$("$helper" start "$token1" "$media")" started \
+	"maintenance race source start"
+rm -f -- "$maintenance_pause_ready" "$maintenance_pause_release"
+VIDEOPLAYER_TEST_MAINTENANCE_PAUSE=1 \
+	"$helper" maintenance-enter > "$work/maintenance-race-enter" &
+maintenance_enter_pid=$!
+for _ in {1..100}; do
+	[[ -e "$maintenance_pause_ready" ]] && break
+	sleep 0.05
+done
+[[ -e "$maintenance_pause_ready" ]] ||
+	fail "maintenance entry did not publish its durable gate"
+set +e
+timeout 1 "$helper" start "$token2" "$media" \
+	> "$work/maintenance-race-start" 2>&1
+maintenance_race_start_rc=$?
+set -e
+assert_eq "$maintenance_race_start_rc" 124 \
+	"concurrent start waits on maintenance control lock"
+touch "$maintenance_pause_release"
+wait "$maintenance_enter_pid"
+maintenance_enter_pid=""
+assert_eq "$(< "$work/maintenance-race-enter")" maintenance \
+	"concurrent maintenance entry"
+set +e
+blocked_output="$("$helper" start "$token2" "$media" 2>&1)"
+blocked_rc=$?
+set -e
+assert_eq "$blocked_rc" 1 "start after maintenance race"
+[[ "$blocked_output" == *"maintenance is active"* ]] ||
+	fail "post-race start did not observe persistent maintenance"
+"$helper" cleanup
+assert_eq "$("$helper" maintenance-exit)" resumed \
+	"maintenance race resume"
 
 printf 'renderer lifecycle test: OK\n'

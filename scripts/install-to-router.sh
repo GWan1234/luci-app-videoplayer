@@ -91,8 +91,44 @@ cleanup_token_store() (
 		-exec rm -rf -- '{}' \;
 )
 
-[ ! -x /usr/libexec/videoplayer-renderer ] ||
-	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
+enter_renderer_maintenance() {
+	renderer_helper="/usr/libexec/videoplayer-renderer"
+	maintenance_marker="/tmp/videoplayer-render-v1.maintenance"
+	[ -e "$renderer_helper" ] || [ -L "$renderer_helper" ] || {
+		echo "Renderer helper is missing; use the verified application package to repair or remove this installation safely." >&2
+		return 1
+	}
+	[ -f "$renderer_helper" ] &&
+		[ ! -L "$renderer_helper" ] &&
+		[ -x "$renderer_helper" ] &&
+		[ "$(readlink -f -- "$renderer_helper" 2>/dev/null)" = "$renderer_helper" ] &&
+		[ "$(stat -c '%u:%a' "$renderer_helper" 2>/dev/null)" = "0:755" ] || {
+		echo "Cannot safely enter renderer maintenance before uninstalling the application." >&2
+		return 1
+	}
+	maintenance_output="$(
+		"$renderer_helper" maintenance-enter
+		maintenance_status=$?
+		printf '__VIDEOPLAYER_RC__%s' "$maintenance_status"
+	)"
+	[ "$maintenance_output" = "$(printf 'maintenance\n__VIDEOPLAYER_RC__0')" ] || {
+		echo "The installed renderer does not support strict maintenance. Upgrade with the verified 1.2.0 package before using the development uninstaller." >&2
+		return 1
+	}
+	"$renderer_helper" cleanup || {
+		echo "Could not quiesce the renderer before uninstalling the application; maintenance remains active." >&2
+		return 1
+	}
+	[ -f "$maintenance_marker" ] && [ ! -L "$maintenance_marker" ] &&
+		[ "$(readlink -f -- "$maintenance_marker" 2>/dev/null)" = "$maintenance_marker" ] &&
+		[ "$(stat -c '%u:%a:%s' -- "$maintenance_marker" 2>/dev/null)" = "0:600:15" ] &&
+		[ "$(cat "$maintenance_marker" 2>/dev/null)" = maintenance-v1 ] || {
+		echo "Renderer maintenance marker is absent or unsafe; uninstall aborted." >&2
+		return 1
+	}
+}
+
+enter_renderer_maintenance
 
 rm -f \
 	/www/luci-static/resources/view/videoplayer/main.js \
@@ -109,10 +145,9 @@ rmdir /www/luci-static/resources/view/videoplayer 2>/dev/null || true
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 rm -rf /tmp/luci-modulecache 2>/dev/null || true
 cleanup_token_store 2>/dev/null || true
-rm -f /tmp/videoplayer-render-v1.lock /tmp/videoplayer-render-v1.worker.lock 2>/dev/null || true
 /etc/init.d/rpcd reload 2>/dev/null || true
 
-echo "Program files removed; /etc/config/videoplayer and media were preserved."
+echo "Program files removed; renderer maintenance remains active and /etc/config/videoplayer and media were preserved."
 REMOTE_UNINSTALL
 }
 
@@ -170,60 +205,10 @@ for command_name in uci ubus sort stat flock; do
 		missing "command '$command_name'"
 done
 
-renderer_ffmpeg=""
-renderer_ffmpeg_private=0
-renderer_candidate_found=0
-
-run_renderer_ffmpeg() {
-	if [ "$renderer_ffmpeg_private" -eq 1 ]; then
-		LD_LIBRARY_PATH="/usr/lib/videoplayer-ffmpeg" \
-			"$renderer_ffmpeg" "$@"
-	else
-		"$renderer_ffmpeg" "$@"
-	fi
-}
-
-renderer_pipeline_usable() {
-	run_renderer_ffmpeg -hide_banner -encoders 2>/dev/null |
-		grep -Eq '^[[:space:]]*V[^[:space:]]*[[:space:]]+mjpeg([[:space:]]|$)' ||
-		return 1
-	run_renderer_ffmpeg -hide_banner -muxers 2>/dev/null |
-		grep -Eq '^[[:space:]]*E[[:space:]]+mpjpeg([[:space:]]|$)' ||
-		return 1
-	ffmpeg_filters="$(run_renderer_ffmpeg -hide_banner -filters 2>/dev/null)" ||
-		return 1
-	printf '%s\n' "$ffmpeg_filters" |
-		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+fps[[:space:]]' ||
-		return 1
-	printf '%s\n' "$ffmpeg_filters" |
-		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+scale[[:space:]]' ||
-		return 1
-	printf '%s\n' "$ffmpeg_filters" |
-		grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+format[[:space:]]' ||
-		return 1
-	return 0
-}
-
 if [ -x /usr/libexec/videoplayer-ffmpeg/ffmpeg ]; then
-	renderer_candidate_found=1
-	renderer_ffmpeg="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
-	renderer_ffmpeg_private=1
-	renderer_pipeline_usable || renderer_ffmpeg=""
-fi
-if [ -z "$renderer_ffmpeg" ] &&
-   command -v ffmpeg >/dev/null 2>&1; then
-	renderer_candidate_found=1
-	renderer_ffmpeg="ffmpeg"
-	renderer_ffmpeg_private=0
-	renderer_pipeline_usable || renderer_ffmpeg=""
-fi
-
-if [ -n "$renderer_ffmpeg" ]; then
-	echo "Router CPU renderer will use: $renderer_ffmpeg"
-elif [ "$renderer_candidate_found" -eq 1 ]; then
-	echo "No installed FFmpeg has the complete MJPEG pipeline; continuing with browser rendering." >&2
+	echo "Private codec runtime found; strict software-CPU attestation follows installation."
 else
-	echo "No FFmpeg runtime found; continuing with browser rendering only." >&2
+	echo "No private codec runtime found; Browser mode remains available, but strict Router mode will be unavailable." >&2
 fi
 
 if command -v stat >/dev/null 2>&1; then
@@ -352,12 +337,114 @@ install_staged() {
 	mv -f "$temporary" "$destination"
 }
 
+maintenance_marker_is_safe() {
+	maintenance_marker="/tmp/videoplayer-render-v1.maintenance"
+	[ -f "$maintenance_marker" ] && [ ! -L "$maintenance_marker" ] &&
+		[ "$(readlink -f -- "$maintenance_marker" 2>/dev/null)" = "$maintenance_marker" ] &&
+		[ "$(stat -c '%u:%a:%s' -- "$maintenance_marker" 2>/dev/null)" = "0:600:15" ] &&
+		[ "$(cat "$maintenance_marker" 2>/dev/null)" = maintenance-v1 ]
+}
+
+ensure_renderer_lock() {
+	if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+		(umask 077; set -C; : > "$1") 2>/dev/null || :
+	fi
+	[ -f "$1" ] && [ ! -L "$1" ] &&
+		[ "$(readlink -f -- "$1" 2>/dev/null)" = "$1" ] || return 1
+	chmod 0600 "$1" 2>/dev/null &&
+		[ "$(stat -c '%u:%a' -- "$1" 2>/dev/null)" = "0:600" ]
+}
+
+lock_renderer_fd() {
+	lock_round=0
+	while ! flock -xn "$1" 2>/dev/null; do
+		lock_round=$((lock_round + 1))
+		[ "$lock_round" -lt 15 ] || return 1
+		sleep 1
+	done
+}
+
+enter_renderer_maintenance() {
+	renderer_helper="/usr/libexec/videoplayer-renderer"
+	maintenance_marker="/tmp/videoplayer-render-v1.maintenance"
+	control_lock="/tmp/videoplayer-render-v1.lock"
+	worker_lock="/tmp/videoplayer-render-v1.worker.lock"
+	runtime_dir="/tmp/videoplayer-render-v1"
+	if [ ! -e "$renderer_helper" ] && [ ! -L "$renderer_helper" ]; then
+		had_marker=0
+		{ [ -e "$maintenance_marker" ] || [ -L "$maintenance_marker" ]; } && had_marker=1
+		if [ "$had_marker" -eq 0 ]; then
+			{ [ ! -e "$control_lock" ] && [ ! -L "$control_lock" ] &&
+				[ ! -e "$worker_lock" ] && [ ! -L "$worker_lock" ]; } || {
+				echo "Renderer helper is missing while renderer locks exist; use the verified application package for recovery." >&2
+				return 1
+			}
+			(umask 077; set -C; printf 'maintenance-v1\n' > "$maintenance_marker") 2>/dev/null ||
+				maintenance_marker_is_safe || return 1
+		fi
+		maintenance_marker_is_safe &&
+			ensure_renderer_lock "$control_lock" &&
+			ensure_renderer_lock "$worker_lock" || return 1
+		exec 9< "$control_lock" && lock_renderer_fd 9 &&
+			exec 8< "$worker_lock" && lock_renderer_fd 8 || return 1
+		[ ! -e "$runtime_dir" ] && [ ! -L "$runtime_dir" ] || {
+			echo "Renderer runtime exists without a trusted helper; use the verified application package for recovery." >&2
+			return 1
+		}
+		return 0
+	fi
+	[ -f "$renderer_helper" ] &&
+		[ ! -L "$renderer_helper" ] &&
+		[ -x "$renderer_helper" ] &&
+		[ "$(readlink -f -- "$renderer_helper" 2>/dev/null)" = "$renderer_helper" ] &&
+		[ "$(stat -c '%u:%a' "$renderer_helper" 2>/dev/null)" = "0:755" ] || {
+		echo "Cannot safely enter renderer maintenance before replacing the application." >&2
+		return 1
+	}
+	maintenance_output="$(
+		"$renderer_helper" maintenance-enter
+		maintenance_status=$?
+		printf '__VIDEOPLAYER_RC__%s' "$maintenance_status"
+	)"
+	[ "$maintenance_output" = "$(printf 'maintenance\n__VIDEOPLAYER_RC__0')" ] || {
+		echo "The installed renderer predates strict maintenance. Upgrade with the verified 1.2.0 package before using the development installer." >&2
+		return 1
+	}
+	"$renderer_helper" cleanup && maintenance_marker_is_safe || {
+		echo "Could not quiesce the renderer before replacing the application; maintenance remains active." >&2
+		return 1
+	}
+}
+
+resume_renderer_after_change() {
+	renderer_helper="/usr/libexec/videoplayer-renderer"
+	maintenance_marker_is_safe || return 1
+	[ -f "$renderer_helper" ] && [ ! -L "$renderer_helper" ] &&
+		[ -x "$renderer_helper" ] &&
+		[ "$(readlink -f -- "$renderer_helper" 2>/dev/null)" = "$renderer_helper" ] &&
+		[ "$(stat -c '%u:%a' -- "$renderer_helper" 2>/dev/null)" = "0:755" ] || return 1
+	maintenance_output="$(
+		"$renderer_helper" maintenance-enter
+		maintenance_status=$?
+		printf '__VIDEOPLAYER_RC__%s' "$maintenance_status"
+	)"
+	[ "$maintenance_output" = "$(printf 'maintenance\n__VIDEOPLAYER_RC__0')" ] &&
+		"$renderer_helper" cleanup && maintenance_marker_is_safe || return 1
+	resume_output="$(
+		"$renderer_helper" maintenance-exit
+		resume_status=$?
+		printf '__VIDEOPLAYER_RC__%s' "$resume_status"
+	)"
+	[ "$resume_output" = "$(printf 'resumed\n__VIDEOPLAYER_RC__0')" ] &&
+		[ ! -e "/tmp/videoplayer-render-v1.maintenance" ] &&
+		[ ! -L "/tmp/videoplayer-render-v1.maintenance" ]
+}
+
 if [ ! -f /etc/config/videoplayer ]; then
 	install_staged videoplayer.config /etc/config/videoplayer 0644
 fi
 
-[ ! -x /usr/libexec/videoplayer-renderer ] ||
-	/usr/libexec/videoplayer-renderer cleanup 2>/dev/null || true
+enter_renderer_maintenance
 
 install_staged menu.json /usr/share/luci/menu.d/luci-app-videoplayer.json 0644
 install_staged acl.json /usr/share/rpcd/acl.d/luci-app-videoplayer.json 0644
@@ -371,9 +458,24 @@ install_staged main.js /www/luci-static/resources/view/videoplayer/main.js 0644
 # Add only missing UCI values; this never creates the media directory.
 sh "$stage/80_luci-videoplayer"
 
+resume_renderer_after_change || {
+	echo "The new files were installed, but renderer maintenance could not be completed; playback remains blocked." >&2
+	exit 1
+}
+
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null || true
 rm -rf /tmp/luci-modulecache 2>/dev/null || true
 /etc/init.d/rpcd reload 2>/dev/null || true
+
+attestation_tab="$(printf '\t')"
+expected_attestation="private-software-cpu${attestation_tab}software-cpu-v1${attestation_tab}none"
+if renderer_attestation="$(
+	/usr/libexec/videoplayer-renderer attest 2>/dev/null
+)" && [ "$renderer_attestation" = "$expected_attestation" ]; then
+	echo "Strict Router mode attestation passed: private software CPU runtime."
+else
+	echo "Strict Router mode is unavailable until codec runtime 6.1.4-r4 passes attestation; Browser mode remains available." >&2
+fi
 
 rm -rf "$stage"
 echo OK

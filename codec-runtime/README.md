@@ -21,14 +21,14 @@ CPU:
 dist/
 └── aarch64_cortex-a53/
     ├── openwrt-25.12.5-r33051-f5dae5ece4/
-    │   ├── luci-app-videoplayer-1.1.0.apk
-    │   ├── luci-videoplayer-codec-runtime-6.1.4-r3.apk
+    │   ├── luci-app-videoplayer-1.2.0.apk
+    │   ├── luci-videoplayer-codec-runtime-6.1.4-r4.apk
     │   ├── BUILD_INFO
     │   ├── PACKAGE_SET.json
     │   └── SHA256SUMS
     └── openwrt-24.10.8-r29233-443ec4032a/
-        ├── luci-app-videoplayer_1.1.0_all.ipk
-        ├── luci-videoplayer-codec-runtime_6.1.4-r3_aarch64_cortex-a53.ipk
+        ├── luci-app-videoplayer_1.2.0_all.ipk
+        ├── luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk
         ├── BUILD_INFO
         ├── PACKAGE_SET.json
         └── SHA256SUMS
@@ -62,7 +62,8 @@ H.264-to-continuous-MJPEG video output and AAC-to-48 kHz stereo PCM audio
 output. This includes the `mpjpeg`, raw PCM, and `tee` muxers plus the `apad`
 filter used to end both outputs on the video timeline; H.264, HEVC, VC-1,
 MPEG-4, VP8, VP9, AV1, MJPEG, AAC, AC-3, E-AC-3, DTS, FLAC, MP3, Opus,
-TrueHD, and Vorbis, subject to what FFmpeg 6.1.4 supports. It is not a promise
+ALAC, PCM S16LE, TrueHD, and Vorbis, subject to what FFmpeg 6.1.4 supports.
+It is not a promise
 to decode every existing or future media format, DRM system, encrypted stream,
 or damaged file.
 
@@ -77,16 +78,25 @@ Every matrix entry records:
 - `feeds.buildinfo` checksum and packages-feed commit;
 - QEMU user-mode emulator and the applicable runtime or static validation mode.
 
-`BUILD_INFO` also records the `buffered-tee-v1` renderer profile. The
-installer uses that capability marker to force-reinstall an older
-`6.1.4-r3` package which predates the unified tee/apad output or its
-frame-aligned relay, while retaining the explicitly fixed package version.
+The format-4 `BUILD_INFO` records `renderer_profile=software-cpu-v1`,
+`execution_backend=software-cpu-v1`, and `software_cpu_only=1`. The installer
+requires all three attestation fields and the exact private binary path, so a
+pre-r4 package or incomplete same-version package is repaired rather than
+accepted as a strict CPU runtime.
 
 Multiple OpenWrt targets can share a userspace package ABI. The representative
 SDK target is therefore build provenance, not an installation restriction.
 The package pre-install script checks the exact release, revision, and
 `DISTRIB_ARCH`. This is safe for this libc-only userspace runtime; it would not
 be sufficient for a kernel module.
+
+On a live router with the application installed, codec install, upgrade, and
+removal enter the renderer's maintenance gate and quiesce all sessions before
+package files can change. The gate stays active on every pre-hook failure and
+is released only by the matching successful post-hook. A legacy renderer
+helper is rejected with an instruction to install application 1.2.0 or newer;
+the package never falls back to an unguarded cleanup. Standalone codec
+installation and removal remain valid when no renderer helper is installed.
 
 The matrix includes the official Malta `mips64_mips64r2` and
 `mips64el_mips64r2` SDKs and marks them as emulator entries. OpenWrt 25.12 has
@@ -100,16 +110,23 @@ HTTPS, verifies its pinned checksum, pins the packages feed, applies that
 feed's FFmpeg patch set, and builds the private package with
 `CONFIG_BUILD_PATENTED=y`.
 
-Each resulting executable is checked for:
+Each resulting executable is checked statically for:
 
 - an isolated three-file package payload;
 - exact package name, version, ABI, internal build metadata, and ELF target;
 - no dynamic libav dependency, RPATH, or unexpected shared library;
-- frame-aligned MJPEG relay resynchronization after a truncated segment;
 - required decoder, encoder, demuxer, muxer, and filter lists;
+- fail-closed native software decoder and encoder allowlists derived from its
+  embedded build configuration and generated component headers;
+
+On every QEMU-compatible architecture the executable is additionally checked
+for:
+
+- frame-aligned MJPEG relay resynchronization after a truncated segment;
+- an empty runtime `ffmpeg -hwaccels` report;
 - H.264-to-multipart-MJPEG decoding under the architecture's QEMU user
   emulator when the ISA is faithfully supported;
-- AAC-to-PCM output in exact 48,000-byte quarter-second chunks under the same
+- AAC-to-PCM output in exact 192,000-byte one-second chunks under the same
   condition.
 
 The `mipsel_74kc` runtime is executed with QEMU's explicit `74Kf` CPU model;

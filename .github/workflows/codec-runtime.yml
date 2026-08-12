@@ -23,6 +23,7 @@ on:
       - "scripts/verify_codec_package.py"
       - "scripts/verify-dist.py"
       - "scripts/verify_packages.py"
+      - "tests/codec-attestation.py"
       - ".github/workflows/codec-runtime.yml"
   pull_request:
     paths:
@@ -34,6 +35,7 @@ on:
       - "scripts/verify_codec_package.py"
       - "scripts/verify-dist.py"
       - "scripts/verify_packages.py"
+      - "tests/codec-attestation.py"
       - ".github/workflows/codec-runtime.yml"
 
 permissions:
@@ -72,8 +74,10 @@ jobs:
             scripts/build-dist.py \
             scripts/codec_matrix.py \
             scripts/verify_codec_package.py \
-            scripts/verify-dist.py
+            scripts/verify-dist.py \
+            tests/codec-attestation.py
           python scripts/codec_matrix.py --summary
+          python tests/codec-attestation.py
 
           scope=smoke
           if [[ "$EVENT_NAME" == workflow_dispatch && "$REQUESTED_SCOPE" == full ]]; then
@@ -216,7 +220,7 @@ jobs:
           cp -a "$official_patches" "$package_dir/patches"
 
           cat > "$package_dir/files/build-info" <<EOF
-          format=3
+          format=4
           openwrt_release=$OPENWRT_RELEASE
           openwrt_revision=$OPENWRT_REVISION
           compatible_arch=$OPENWRT_ARCH
@@ -227,7 +231,9 @@ jobs:
           ffmpeg_version=$FFMPEG_VERSION
           package_format=$PACKAGE_FORMAT
           validation_mode=$VALIDATION_MODE
-          renderer_profile=buffered-tee-v1
+          renderer_profile=software-cpu-v1
+          execution_backend=software-cpu-v1
+          software_cpu_only=1
           build_patented=y
           network_enabled=n
           avdevice_enabled=n
@@ -235,8 +241,8 @@ jobs:
           audio_output=pcm_s16le
           audio_sample_rate=48000
           audio_channels=2
-          audio_chunk_frames=12000
-          audio_chunk_bytes=48000
+          audio_chunk_frames=48000
+          audio_chunk_bytes=192000
           private_binary=/usr/libexec/videoplayer-ffmpeg/ffmpeg
           EOF
           if grep -Eq '@[A-Z_]+@' "$package_dir/files/build-info"; then
@@ -310,7 +316,7 @@ jobs:
             "$RUNNER_TEMP/package-files.txt"
 
           build_info="$package_root/usr/share/luci-videoplayer-codec-runtime/build-info"
-          grep -Fx 'format=3' "$build_info"
+          grep -Fx 'format=4' "$build_info"
           grep -Fx "openwrt_release=$OPENWRT_RELEASE" "$build_info"
           grep -Fx "openwrt_revision=$OPENWRT_REVISION" "$build_info"
           grep -Fx "compatible_arch=$OPENWRT_ARCH" "$build_info"
@@ -319,7 +325,11 @@ jobs:
           grep -Fx "sdk_sha256=$SDK_SHA256" "$build_info"
           grep -Fx "packages_feed_commit=$PACKAGES_FEED_COMMIT" "$build_info"
           grep -Fx "package_format=$PACKAGE_FORMAT" "$build_info"
-          grep -Fx 'renderer_profile=buffered-tee-v1' "$build_info"
+          grep -Fx 'renderer_profile=software-cpu-v1' "$build_info"
+          grep -Fx 'execution_backend=software-cpu-v1' "$build_info"
+          grep -Fx 'software_cpu_only=1' "$build_info"
+          grep -Fx 'audio_chunk_frames=48000' "$build_info"
+          grep -Fx 'audio_chunk_bytes=192000' "$build_info"
           relay="$package_root/usr/libexec/videoplayer-ffmpeg/videoplayer-mjpeg-relay"
           [ -f "$relay" ] && [ ! -L "$relay" ] && [ -x "$relay" ]
 

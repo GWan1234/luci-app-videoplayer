@@ -70,7 +70,10 @@ for disabled_option in \
 	CONFIG_SHARED \
 	CONFIG_AUTODETECT \
 	CONFIG_NETWORK \
-	CONFIG_AVDEVICE
+	CONFIG_AVDEVICE \
+	CONFIG_VAAPI \
+	CONFIG_VDPAU \
+	CONFIG_VULKAN
 do
 	require_config_value "$main_config" "$disabled_option" 0
 done
@@ -95,6 +98,52 @@ for wrapper in \
 do
 	require_config_value "$component_config" "CONFIG_$wrapper" 0
 done
+
+# Global decoder/encoder disables followed by native allowlists are the
+# fail-closed boundary: a newly added FFmpeg codec component, including a
+# future hardware wrapper whose name we do not yet know, must stay disabled.
+allowed_decoders=" \
+H264_DECODER HEVC_DECODER VC1_DECODER MPEG4_DECODER VP8_DECODER \
+VP9_DECODER AV1_DECODER MJPEG_DECODER AAC_DECODER AC3_DECODER \
+EAC3_DECODER ALAC_DECODER DCA_DECODER FLAC_DECODER MP3_DECODER \
+OPUS_DECODER PCM_S16LE_DECODER TRUEHD_DECODER VORBIS_DECODER "
+while IFS=' ' read -r directive symbol value _rest; do
+	[ "$directive" = "#define" ] || continue
+	[ "$value" = "1" ] || continue
+	case "$symbol" in
+		CONFIG_*_HWACCEL)
+			die "hardware accelerator was unexpectedly enabled: $symbol"
+			;;
+		CONFIG_*_DECODER)
+			decoder="${symbol#CONFIG_}"
+			case "$allowed_decoders" in
+				*" $decoder "*)
+					;;
+				*)
+					die "decoder outside the software allowlist was enabled: $decoder"
+					;;
+			esac
+			;;
+	esac
+done < "$component_config"
+
+allowed_encoders=" MJPEG_ENCODER PCM_S16LE_ENCODER "
+while IFS=' ' read -r directive symbol value _rest; do
+	[ "$directive" = "#define" ] || continue
+	[ "$value" = "1" ] || continue
+	case "$symbol" in
+		CONFIG_*_ENCODER)
+			encoder="${symbol#CONFIG_}"
+			case "$allowed_encoders" in
+				*" $encoder "*)
+					;;
+				*)
+					die "encoder outside the software allowlist was enabled: $encoder"
+					;;
+			esac
+			;;
+	esac
+done < "$component_config"
 
 dynamic="$work/readelf-dynamic.txt"
 readelf -d "$binary" > "$dynamic"
@@ -242,6 +291,12 @@ for option in \
 	--disable-autodetect \
 	--disable-network \
 	--disable-avdevice \
+	--disable-hwaccels \
+	--disable-vaapi \
+	--disable-vdpau \
+	--disable-vulkan \
+	--disable-decoders \
+	--disable-encoders \
 	--enable-swresample
 do
 	grep -F -- "$option" "$version" >/dev/null ||
@@ -253,6 +308,7 @@ encoders="$work/encoders.txt"
 demuxers="$work/demuxers.txt"
 muxers="$work/muxers.txt"
 filters="$work/filters.txt"
+hwaccels="$work/hwaccels.txt"
 mjpeg_help="$work/mjpeg-help.txt"
 
 run_target -hide_banner -decoders > "$decoders" 2>&1
@@ -260,7 +316,15 @@ run_target -hide_banner -encoders > "$encoders" 2>&1
 run_target -hide_banner -demuxers > "$demuxers" 2>&1
 run_target -hide_banner -muxers > "$muxers" 2>&1
 run_target -hide_banner -filters > "$filters" 2>&1
+run_target -hide_banner -hwaccels > "$hwaccels" 2>&1
 run_target -hide_banner -h encoder=mjpeg > "$mjpeg_help" 2>&1
+
+grep -Fx 'Hardware acceleration methods:' "$hwaccels" >/dev/null ||
+	die "FFmpeg returned a malformed hardware-accelerator report"
+if sed -n '/^Hardware acceleration methods:$/,$p' "$hwaccels" |
+	sed '1d' | grep -Eq '[^[:space:]]'; then
+	die "private FFmpeg reports a hardware accelerator"
+fi
 
 has_component() {
 	awk -v name="$2" '
@@ -274,6 +338,38 @@ has_component() {
 	' "$1"
 }
 
+# CODEC_REPORT_ALLOWLIST_BEGIN
+unexpected_codec_aliases() (
+	component_report="$1"
+	allowed_names="$2"
+	awk -v allowed_names="$allowed_names" '
+		BEGIN {
+			count = split(allowed_names, names, " ")
+			for (i = 1; i <= count; i++)
+				allowed[names[i]] = 1
+		}
+		$2 == "=" { next }
+		length($1) == 6 && substr($1, 1, 1) ~ /^[VAS]$/ {
+			if ($2 !~ /^[a-z0-9_]+(,[a-z0-9_]+)*$/) {
+				invalid_alias = 1
+				next
+			}
+			count = split($2, aliases, ",")
+			for (i = 1; i <= count; i++)
+				if (!allowed[aliases[i]])
+					unexpected = unexpected \
+						(unexpected ? "," : "") aliases[i]
+		}
+		END {
+			if (invalid_alias)
+				unexpected = unexpected \
+					(unexpected ? "," : "") "__invalid_component_alias__"
+			print unexpected
+		}
+	' "$component_report"
+)
+# CODEC_REPORT_ALLOWLIST_END
+
 for decoder in \
 	h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg \
 	aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis
@@ -281,6 +377,12 @@ do
 	has_component "$decoders" "$decoder" ||
 		die "native decoder is missing: $decoder"
 done
+unexpected_decoders="$(
+	unexpected_codec_aliases "$decoders" \
+		"h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis"
+)"
+[ -z "$unexpected_decoders" ] ||
+	die "decoder outside the software allowlist was enabled: $unexpected_decoders"
 has_component "$encoders" mjpeg ||
 	die "MJPEG encoder is missing"
 grep -Eq '^[[:space:]]*-huffman[[:space:]]' "$mjpeg_help" ||
@@ -291,6 +393,11 @@ if ! grep -Eq '^[[:space:]]+default[[:space:]]' "$mjpeg_help" ||
 fi
 has_component "$encoders" pcm_s16le ||
 	die "PCM S16LE encoder is missing"
+unexpected_encoders="$(
+	unexpected_codec_aliases "$encoders" "mjpeg pcm_s16le"
+)"
+[ -z "$unexpected_encoders" ] ||
+	die "encoder outside the software allowlist was enabled: $unexpected_encoders"
 for demuxer in mov matroska avi mpegts
 do
 	has_component "$demuxers" "$demuxer" ||
@@ -340,6 +447,7 @@ ffmpeg \
 	run_target \
 		-y -hide_banner -loglevel error -nostats -nostdin \
 		-protocol_whitelist file,pipe -threads 1 \
+		-hwaccel none \
 		-fflags +genpts -err_detect ignore_err \
 		-i /proc/self/fd/3 -map 0:V:0 -an -sn -dn -map_metadata -1 \
 		-filter_threads 1 \
@@ -368,10 +476,11 @@ esac
 	run_target \
 		-y -hide_banner -loglevel error -nostats -nostdin \
 		-protocol_whitelist file,pipe -threads 1 \
+		-hwaccel none \
 		-fflags +genpts -err_detect ignore_err \
 		-i /proc/self/fd/3 -map 0:a:0 -vn -sn -dn -map_metadata -1 \
 		-filter_threads 1 \
-		-af "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,asetnsamples=n=12000:p=1" \
+		-af "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,asetnsamples=n=48000:p=1" \
 		-c:a pcm_s16le \
 		-f s16le "$audio_pcm"
 )
@@ -381,28 +490,29 @@ esac
 audio_size="$(wc -c < "$audio_pcm" | tr -d '[:space:]')"
 [ "$audio_size" -ge 192000 ] ||
 	die "AAC-to-PCM smoke test produced only $audio_size bytes"
-[ $((audio_size % 48000)) -eq 0 ] ||
-	die "PCM smoke-test size is not an exact number of 48,000-byte chunks"
+[ $((audio_size % 192000)) -eq 0 ] ||
+	die "PCM smoke-test size is not an exact number of 192,000-byte chunks"
 
 # Exercise the unified output topology and Fast-profile FFmpeg options used by
 # the router renderer. This runtime capability test deliberately retains the
-# published quarter-second PCM block contract; the application groups the same
-# PCM output into one-second transport chunks. The apad/shortest pair makes
-# video authoritative while tee sends each selected stream to its own transport.
+# exact one-second PCM block contract. The apad/shortest pair makes video
+# authoritative while tee sends each selected stream to its own transport.
 (
 	exec 3< "$long_audio_sample"
 	run_target \
 		-y -hide_banner -loglevel error -nostats -nostdin \
 		-filter_threads 4 \
 		-protocol_whitelist file,pipe -threads 4 \
+		-hwaccel none \
 		-fflags +genpts -err_detect ignore_err \
 		-skip_loop_filter:v noref -flags2:v +fast \
 		-i /proc/self/fd/3 \
 		-protocol_whitelist file,pipe -threads 1 \
+		-hwaccel none \
 		-fflags +genpts -err_detect ignore_err -i /proc/self/fd/3 \
 		-map 0:V:0 -map 1:a:0 -sn -dn -map_metadata -1 \
 		-vf "fps=fps=5:start_time=0,scale=160:90:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format=yuvj420p" \
-		-af "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=12000:p=1" \
+		-af "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=stereo,apad,asetnsamples=n=48000:p=1" \
 		-threads:v 4 -threads:a 1 \
 		-c:v mjpeg -q:v 12 -huffman default \
 		-c:a pcm_s16le -shortest -flush_packets 1 \
@@ -415,9 +525,9 @@ audio_size="$(wc -c < "$audio_pcm" | tr -d '[:space:]')"
 [ -s "$tee_audio_pcm" ] ||
 	die "unified tee smoke test produced no PCM audio"
 tee_audio_size="$(wc -c < "$tee_audio_pcm" | tr -d '[:space:]')"
-[ $((tee_audio_size % 48000)) -eq 0 ] ||
-	die "unified tee PCM is not an exact number of 48,000-byte chunks"
-[ "$tee_audio_size" -le $((32 * 48000)) ] ||
+[ $((tee_audio_size % 192000)) -eq 0 ] ||
+	die "unified tee PCM is not an exact number of 192,000-byte chunks"
+[ "$tee_audio_size" -le $((8 * 192000)) ] ||
 	die "overlong audio filled the complete router PCM ring after video EOF"
 
 printf '%s\n' "Private codec runtime validation passed."

@@ -1,13 +1,13 @@
 {
   "application": {
-    "apk_filename": "luci-app-videoplayer-1.1.0.apk",
-    "ipk_filename": "luci-app-videoplayer_1.1.0_all.ipk",
+    "apk_filename": "luci-app-videoplayer-1.2.0.apk",
+    "ipk_filename": "luci-app-videoplayer_1.2.0_all.ipk",
     "name": "luci-app-videoplayer",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "codec": {
     "name": "luci-videoplayer-codec-runtime",
-    "release": 3,
+    "release": 4,
     "source_sha256": "a231e3d5742c44b1cdaebfb98ad7b6200d12763e0b6db9e1e2c5891f2c083a18",
     "version": "6.1.4"
   },

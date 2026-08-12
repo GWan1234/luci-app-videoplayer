@@ -22,11 +22,11 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DIST = ROOT / ".staging" / "app"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.1.0"
+PKG_VERSION = "1.2.0"
 PKG_ARCH_IPK = "all"
 PKG_ARCH_APK = "noarch"
 PKG_LICENSE = "GPL-2.0-or-later"
-PKG_DESCRIPTION = "LuCI video player with browser and router CPU rendering"
+PKG_DESCRIPTION = "LuCI video player with browser and strict router CPU rendering"
 PKG_MAINTAINER = "openwrt-video-player contributors"
 PKG_ORIGIN = f"feeds/luci/applications/{PKG_NAME}"
 PKG_URL = "https://github.com/communism420/luci-app-videoplayer"
@@ -79,6 +79,53 @@ class PackageVerificationError(RuntimeError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise PackageVerificationError(message)
+
+
+def verify_lifecycle_contract(name: str, script: bytes) -> None:
+    """Independently enforce the fail-closed renderer transaction invariants."""
+    require(script.startswith(b"#!/bin/sh\n"), f"{name} has no canonical shell header")
+    require(
+        b"videoplayer-renderer cleanup" not in script
+        and b"renderer_helper\" cleanup 2>/dev/null || true" not in script,
+        f"{name} bypasses renderer maintenance before cleanup",
+    )
+    require(
+        b"rm -f /tmp/videoplayer-render-v1.lock" not in script
+        and b"rm -f /tmp/videoplayer-render-v1.worker.lock" not in script,
+        f"{name} deletes a persistent renderer lock inode",
+    )
+    if name in {"preinst", "prerm", "preupgrade"}:
+        for token in (
+            b"maintenance-enter",
+            b"renderer_enter_for_change",
+            b"maintenance-v1",
+            b"renderer_helper\" cleanup",
+        ):
+            require(token in script, f"{name} lacks {token.decode()} enforcement")
+        require(
+            script.count(b"renderer_enter_for_change") >= 2
+            and script.count(b"renderer_resume_after_change") == 1,
+            f"{name} does not end with the maintenance-enter phase only",
+        )
+    elif name in {"postinst", "postupgrade"}:
+        for token in (
+            b"maintenance-enter",
+            b"maintenance-exit",
+            b"renderer_resume_after_change",
+            b"maintenance-v1",
+        ):
+            require(token in script, f"{name} lacks {token.decode()} enforcement")
+        require(
+            script.count(b"renderer_resume_after_change") >= 2,
+            f"{name} does not execute the maintenance-exit phase",
+        )
+    elif name == "postrm":
+        require(
+            b"maintenance-enter" not in script
+            and b"maintenance-exit" not in script
+            and b"renderer_helper" not in script,
+            "postrm must preserve the durable maintenance gate after app removal",
+        )
 
 
 def read_limited_file(path: Path, limit: int, label: str) -> bytes:
@@ -407,8 +454,8 @@ Maintainer: {PKG_MAINTAINER}
 Architecture: {PKG_ARCH_IPK}
 Installed-Size: {installed_size}
 Description:  {PKG_DESCRIPTION}
- Browser playback and experimental FFmpeg-powered local CPU previews.
- Remote HTTP(S) URLs always remain client-side. Application files are architecture-independent.
+ Browser playback and attested fail-closed software CPU rendering for local media.
+ Remote HTTP(S) URLs are browser-only. Application files are architecture-independent.
 """.encode()
 
 
@@ -460,7 +507,8 @@ def verify_ipk(ipk_path: Path, expected: dict[str, tuple[bytes, int]]) -> int:
         max_members=MAX_DATA_TAR_MEMBERS,
     )
     require(
-        set(control_members) == {"control", "conffiles", "postinst", "prerm", "postrm"},
+        set(control_members)
+        == {"control", "conffiles", "preinst", "postinst", "prerm", "postrm"},
         "IPK control archive member set is incorrect",
     )
     require(
@@ -493,8 +541,8 @@ def verify_ipk(ipk_path: Path, expected: dict[str, tuple[bytes, int]]) -> int:
         "Architecture": PKG_ARCH_IPK,
         "Description": (
             f"{PKG_DESCRIPTION}\n"
-            "Browser playback and experimental FFmpeg-powered local CPU previews.\n"
-            "Remote HTTP(S) URLs always remain client-side. Application files are "
+            "Browser playback and attested fail-closed software CPU rendering for local media.\n"
+            "Remote HTTP(S) URLs are browser-only. Application files are "
             "architecture-independent."
         ),
     }
@@ -530,12 +578,14 @@ def verify_ipk(ipk_path: Path, expected: dict[str, tuple[bytes, int]]) -> int:
 
     build_packages = load_builder_module()
     expected_scripts = {
+        "preinst": build_packages.preinst_script(),
         "postinst": build_packages.postinst_script(),
         "prerm": build_packages.prerm_script(),
         "postrm": build_packages.postrm_script(),
     }
     for name, expected_script in expected_scripts.items():
         verify_script(control_members, name, expected_script)
+        verify_lifecycle_contract(name, expected_script)
 
     require(
         set(data_members) == set(expected),
@@ -706,9 +756,11 @@ def load_builder_module():
 def expected_apk_scripts() -> dict[int, bytes]:
     build_packages = load_builder_module()
     return {
+        2: build_packages.preinst_script(),
         3: build_packages.postinst_script(),
         4: build_packages.prerm_script(),
         5: build_packages.postrm_script(),
+        6: build_packages.preupgrade_script(),
         7: build_packages.postupgrade_script(),
     }
 
@@ -716,9 +768,11 @@ def expected_apk_scripts() -> dict[int, bytes]:
 def expected_apk_uid(payload: dict[str, tuple[bytes, int]]) -> bytes:
     script_fields = expected_apk_scripts()
     scripts = [
+        ("pre-install", script_fields[2]),
         ("post-install", script_fields[3]),
         ("pre-deinstall", script_fields[4]),
         ("post-deinstall", script_fields[5]),
+        ("pre-upgrade", script_fields[6]),
         ("post-upgrade", script_fields[7]),
     ]
     digest = hashlib.sha256()
@@ -951,6 +1005,15 @@ def verify_apk(
     expected_scripts = expected_apk_scripts()
     require(set(scripts) == set(expected_scripts), "APK lifecycle script set is incomplete")
     for field, expected_script in expected_scripts.items():
+        lifecycle_name = {
+            2: "preinst",
+            3: "postinst",
+            4: "prerm",
+            5: "postrm",
+            6: "preupgrade",
+            7: "postupgrade",
+        }[field]
+        verify_lifecycle_contract(lifecycle_name, expected_script)
         require(
             reader.blob(scripts[field]) == expected_script,
             f"APK lifecycle script {field} differs from the builder",

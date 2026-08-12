@@ -8,11 +8,11 @@ set -eu
 REPOSITORY="communism420/luci-app-videoplayer"
 MAIN_BRANCH="main"
 SNAPSHOT_BRANCH="snapshot"
-APP_VERSION="1.1.0"
+APP_VERSION="1.2.0"
 SNAPSHOT_APK="luci-app-videoplayer-$APP_VERSION.apk"
 SNAPSHOT_INDEX="INDEX.tsv"
 CODEC_INSTALLER_OBJECT="scripts/install-codec-runtime.sh"
-CODEC_INSTALLER_SHA256="314adaa8f713b5b5979a65139ad006c5af35ea7d1570072c21d922992ead814b"
+CODEC_INSTALLER_SHA256="e6eae9d462c1f87f928f43c0c918c9b8ff9a469e440c580b348424a4b3fb15a1"
 API_BASE_URL="https://api.github.com/repos/$REPOSITORY"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
@@ -237,8 +237,8 @@ case "$#" in
 				printf '%s\n' \
 					"Usage: sh install-main-apk.sh" \
 					"" \
-					"Downloads and verifies the required files, installs or updates the matching" \
-					"private FFmpeg runtime, then installs the APK built from the current main branch." \
+					"Downloads and verifies the required files, installs the APK built from the" \
+					"current main branch first, then installs or updates its matching private FFmpeg runtime." \
 					"This installer supports only OpenWrt versions that use apk."
 				exit 0
 				;;
@@ -409,12 +409,6 @@ verify_sha256 \
 	"$CODEC_INSTALLER_PATH" \
 	"FFmpeg installer"
 
-printf '%s\n' \
-	"Installing or updating the architecture-specific FFmpeg runtime first..."
-if ! /bin/sh "$CODEC_INSTALLER_PATH"; then
-	die "The architecture-specific FFmpeg installation or update failed."
-fi
-
 if ! apk update; then
 	warn "Could not refresh apk indexes; continuing with the current indexes."
 fi
@@ -432,6 +426,12 @@ require_current_snapshot "$SOURCE_COMMIT" "$FINAL_MAIN_COMMIT"
 
 printf 'Installing %s with apk...\n' "$SNAPSHOT_APK"
 install_apk_package "$APK_INSTALL_MODE" "$APK_PATH"
+
+printf '%s\n' \
+	"Installing or updating the architecture-specific FFmpeg runtime after the strict application maintenance helper..."
+if ! /bin/sh "$CODEC_INSTALLER_PATH"; then
+	die "The application was updated, but the architecture-specific FFmpeg installation or update failed. Browser mode remains available; retry this installer before using strict Router mode."
+fi
 
 printf '%s\n' \
 	"Installation complete." \

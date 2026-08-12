@@ -1,18 +1,21 @@
 # luci-app-videoplayer
 
 A joke but functional video player for **OpenWrt**, integrated into **LuCI**.
-Local videos can either be decoded normally by the client browser or decoded
-by the router CPU with FFmpeg and delivered as a continuous MJPEG stream.
-In router mode, a fetch-capable browser first builds a bounded client-side
-buffer containing at least 120 seconds of router-rendered JPEG frames and
-router-decoded PCM audio, or the complete stream when it is shorter. It then
-draws frames on a persistent canvas while PCM plays at its original speed.
-Audio is the playback clock; if the buffer runs dry, sound and picture pause
-together while it refills. The original browser-decoded audio track remains an
-automatic fallback. Playback stays inside the LuCI web interface and does not
-use HDMI or a framebuffer.
+Local videos can either be decoded normally by the client browser or processed
+by the router in a strict software-CPU mode and delivered as MJPEG plus PCM.
+Both the Fast and Quality router profiles use only the attested private FFmpeg
+runtime: source video/audio decoding, filtering, scaling, MJPEG encoding, and
+PCM production run in software on the router CPU. The mode fails closed rather
+than silently decoding the original file or its original audio in the browser.
+A fetch-capable browser first builds a bounded client-side buffer containing at
+least 120 seconds of router-produced JPEG frames and PCM audio, or the complete
+stream when it is shorter. It then presents those already-produced outputs on a
+persistent canvas and through Web Audio. Browser/OS presentation, compositing,
+and audio-device implementation are outside a web application's control and
+are therefore not claimed to be CPU-only. Playback stays inside LuCI and does
+not use the router's HDMI or framebuffer.
 
-Current source package version: **1.1.0**. The latest published GitHub release
+Current source package version: **1.2.0**. The latest published GitHub release
 is still **1.0.0**. The release installer below remains pinned to that release,
 while a separate APK-only installer follows the latest successfully tested
 `main` source.
@@ -22,16 +25,17 @@ while a separate APK-only installer follows the latest successfully tested
 | Mode | How it works |
 |---|---|
 | Browser decoding | Browse local storage and stream the original file to the HTML5 `<video>` element with HTTP Range support |
-| Router CPU rendering | After bounded media and audio probes, one long-lived FFmpeg producer scales and MJPEG-encodes video at selectable targets from 5 to 60 FPS and decodes PCM from the same input clock; fetch-capable browsers prebuffer at least 120 seconds (or the complete shorter stream), draw JPEG frames on a persistent canvas against fixed-rate PCM audio, and pause both tracks together on underrun |
-| Remote URLs | Play `http://` and `https://` URLs directly in the browser; remote URLs are never fetched by FFmpeg on the router |
+| Router CPU rendering | Strict, fail-closed software processing through the attested private FFmpeg runtime. Fast and Quality both decode the source, filter/scale video, encode MJPEG, and produce PCM only on the router CPU; the browser presents only those JPEG/PCM outputs |
+| Remote URLs | Play `http://` and `https://` URLs only in Browser mode. Router mode refuses them instead of proxying them through FFmpeg or silently changing render modes |
 | Interface | **Services → Video Player** page in LuCI |
 
 The local browser recognizes common containers and raw streams, including
 MP4/M4V/MOV, WebM, MKV, AVI/DivX, Ogg, MPEG/VOB, MPEG-TS/M2TS/MTS, FLV/F4V,
 WMV/ASF, 3GP/3G2, RealMedia, and raw H.264/H.265 files. Extension matching is
 case-insensitive. MP4 with H.264 video and AAC audio offers the broadest
-client-browser compatibility. Router CPU mode depends on the decoders enabled
-in the installed OpenWrt FFmpeg build, so it may support a different subset.
+client-browser compatibility. Router CPU mode depends on the native software
+decoders enabled in the installed private codec runtime, so it may support a
+different subset.
 When CPU mode is available, the browser lists every regular non-symlink file
 inside the media directory so FFmpeg can probe uncommon containers and files
 without an extension by content. Browser mode keeps the extension allowlist and
@@ -48,15 +52,13 @@ luci.videoplayer ── authenticated list / resolve / renderer control
     ├── Browser mode ── /cgi-bin/videoplayer-stream?token=…
     │                    └── original file with HTTP Range (206)
     │
-    └── Router mode ─── one long-lived FFmpeg producer
+    └── Router mode ─── attested private software-only FFmpeg producer
                          ├── MJPEG FIFO → /cgi-bin/videoplayer-frame?token=…
                          │                 └── browser JPEG buffer → canvas
                          ├── PCM FIFO/ring → /cgi-bin/videoplayer-audio
                          │                  ?token=…&chunk=…&count=…
                          │                  └── browser PCM buffer → Web Audio 1×
-                         ├── original descriptor → /cgi-bin/videoplayer-stream
-                         │    ?renderer=…&audio=… (hidden <audio> fallback)
-                         └── full browser decoding if router video cannot start
+                         └── any strict-path failure → stop with an error
 
 UCI videoplayer.main.media_path ── root of the accessible media library
 ```
@@ -64,16 +66,10 @@ UCI videoplayer.main.media_path ── root of the accessible media library
 LuCI calls ACL-protected backend methods. Browser resolution and renderer
 status require read permission; starting or stopping the CPU renderer requires
 write permission. The unrestricted regular-file listing used only by CPU mode
-and the browser-audio capability resolver also require write permission; the
-read-only `list` method retains the video extension allowlist. Browser-audio
-resolution accepts only the canonical source of the current active renderer
-session, so the client cannot exchange an arbitrary path for an unrestricted
-stream. It creates a second random nonce that is distinct from and bound to the
-active renderer token; possession of the MJPEG token alone cannot open the
-original file. The CGI reopens the source descriptor already held by the live
-renderer and verifies its device, inode, and size before serving it. Stop,
-expiry, worker failure, or session replacement invalidates new audio requests.
-Read-only LuCI accounts automatically fall back to full browser decoding.
+also requires write permission; the read-only `list` method retains the video
+extension allowlist. A read-only account cannot start strict router processing
+and is told to select Browser mode explicitly instead of being silently moved
+there.
 
 Normal browser mode uses a separate short-lived opaque path token. Its CGI
 endpoint accepts only that token, never a file path supplied by the browser.
@@ -97,7 +93,7 @@ opens the next segment when its bounded buffer has capacity. This is one
 request per segment rather than one request per frame. The frame sequence is
 global across those segments, so reconnect wall time is not added to media
 time. The relay validates a complete bounded JPEG before publishing it. Any
-ambiguous HTTP interruption after dispatch falls back the whole playback
+ambiguous HTTP interruption after dispatch stops the whole strict playback
 because the browser cannot prove how many FIFO frames uHTTPd already consumed.
 At video EOF, a nonce-bound two-phase drain and acknowledgement prove both FIFO
 completion and a clean browser body before the final timeline is sealed. Only
@@ -125,29 +121,28 @@ video. Web Audio runs at exactly 1× and supplies the master media clock;
 `requestAnimationFrame()` selects the matching JPEG for a persistent canvas.
 No image element is replaced between frames, and audio speed or pitch is never
 changed to chase renderer or network jitter. If either queue runs dry, both
-tracks pause on the last complete position and resume only after a refill. If
-the PCM path is unavailable, LuCI requests a session-bound browser-audio
-capability and uses the renderer's already-open original-file descriptor as a
-reduced-guarantee audio fallback. Browsers without the streaming and canvas
-features required by this mode fall back to normal browser decoding instead of
-using an unsynchronized native MJPEG image. The session renews a 90-second
+tracks pause on the last complete position and resume only after a refill. A
+source with no audio stream plays silently. If a source advertises audio but
+the private runtime cannot decode it, or if the PCM path fails during playback,
+the complete strict session stops; the original audio is never handed back to
+the browser. A browser without the required streaming, canvas, and Web Audio
+features cannot start Router mode and must be switched explicitly to Browser
+mode. The session renews a 90-second
 inactivity lease while rendering, buffering, or playback is active. This
 tolerates minute-level timer throttling in a background browser tab. Closing
 the page or losing the client stops the sole allowed renderer after that
 bounded delay, and every session also has an absolute six-hour expiry.
-After a clean terminal drain, the worker releases FFmpeg, FIFO, ring, relay,
-and log resources but temporarily retains the validated original-file
-descriptor for later protected browser-audio Range requests. Authenticated
-status polling renews this minimal source-holder lease while buffered playback
-continues; **Stop**, replacement by another session, 90 seconds without a
-heartbeat, or the absolute expiry releases it.
+After a clean terminal drain, the worker releases FFmpeg, source descriptors,
+FIFO, ring, relay, and log resources. **Stop**, replacement by another session,
+90 seconds without a heartbeat, or the absolute expiry also releases them.
 
 ## Requirements
 
 The package directly depends on `luci-base`, `uhttpd`, `jshn`,
-`coreutils-stat`, and `coreutils-timeout`. FFmpeg is optional: browser mode
-works without it, while router CPU mode uses the private compatible codec
-runtime when installed and otherwise tries a compatible system `ffmpeg`.
+`coreutils-stat`, and `coreutils-timeout`. FFmpeg is optional for Browser mode.
+Router CPU mode requires the architecture-specific private codec runtime and
+refuses to start without its complete software-only attestation; it never uses
+`/usr/bin/ffmpeg` or another executable found through `PATH`.
 The application itself contains no CPU-specific binaries, so its architecture
 remains `all` for IPK and `noarch` for APK.
 
@@ -159,9 +154,9 @@ FFmpeg build containing the native MJPEG encoder, the `mpjpeg` muxer, and the
 requires the `pcm_s16le` encoder, the `s16le` muxer, and the `aresample`,
 `aformat`, `apad`, and `asetnsamples` filters, plus the `tee` muxer. The UI
 checks these capabilities before
-enabling the corresponding router output. If only the PCM path is unavailable,
-video can remain router-rendered while the browser attempts to decode the
-original audio track.
+enabling the corresponding router output. A file with no audio stream is valid,
+but an advertised audio stream whose software decoder or PCM path is unusable
+causes the strict session to stop.
 
 Despite its name, the official OpenWrt `libffmpeg-full` package is built
 without H.264, HEVC, and VC-1 decoders when OpenWrt's global
@@ -177,11 +172,14 @@ This repository also builds an optional architecture-specific companion named
 it installs private FFmpeg and a small frame-aligned MJPEG relay under
 `/usr/libexec/videoplayer-ffmpeg/`. The relay gives bounded CGI segments exact
 complete-frame handoffs; a slower shell implementation remains available if
-the relay fails its root-owned filesystem safety check. The package does not overwrite
-`/usr/bin/ffmpeg` or install global `libav*.so` files. The renderer prefers the
-private executable when it is present and passes all capability and filesystem
-safety checks, then falls back to the normal system FFmpeg if it is absent or
-unusable.
+the relay fails its root-owned filesystem safety check. The package does not
+overwrite `/usr/bin/ffmpeg` or install global `libav*.so` files. Its root-owned
+build metadata attests the private executable, exact software-only execution
+profile, and disabled hardware-acceleration surface. The renderer accepts only
+that fixed private executable after repeating filesystem, metadata, component,
+decoder, and hardware-acceleration checks. Missing, outdated, unsafe, or
+mismatched runtime state makes Router mode unavailable instead of selecting a
+system FFmpeg.
 
 The codec build matrix covers every package ABI published for the current
 official OpenWrt stable and old-stable releases: 35 APK architectures for
@@ -194,18 +192,17 @@ If the player reports that the installed FFmpeg has no usable decoder for a
 video, inspect the installed decoder list:
 
 ```sh
-ffmpeg -hide_banner -decoders 2>/dev/null | grep -E 'h264|hevc|vc1'
+/usr/libexec/videoplayer-ffmpeg/ffmpeg -hide_banner -decoders 2>/dev/null | grep -E 'h264|hevc|vc1'
 ```
 
 A plain decoder entry such as `h264` is the native software decoder. If it is
 listed but playback still fails, the player now reports a bounded, sanitized
 FFmpeg diagnostic that can be used to identify the separate failure. An entry
-such as `h264_v4l2m2m` is only a hardware wrapper: it works only with a
-compatible and accessible V4L2 device and does not replace the native software
-decoder. If only the wrapper is listed, use browser mode or install an FFmpeg
-build with the native decoder for the router's exact OpenWrt release and
-architecture. If neither entry is listed, a decoder-enabled FFmpeg build is
-also required.
+such as `h264_v4l2m2m` is only a hardware wrapper and is deliberately excluded
+from strict Router mode. That mode never accepts an arbitrary or system FFmpeg
+build. If the required native decoder is absent, use Browser mode or install a
+future attested `luci-videoplayer-codec-runtime` release whose exact
+software-only allowlist includes the codec.
 
 The scripts also use standard OpenWrt BusyBox commands, including `sort -z`
 and `flock`.
@@ -252,19 +249,8 @@ It deliberately does not pipe partially downloaded network content into a
 shell.
 
 The installer currently installs the latest published release, not the newer
-1.1.0 source tree. Before changing the application package, it downloads and
-SHA-256-verifies the architecture-specific FFmpeg installer. That installer
-selects the private runtime for the router's exact OpenWrt release, revision,
-package manager, and `DISTRIB_ARCH`. It installs a missing runtime, attempts a
-normal in-place update when one is already installed, and treats an
-already-current package as success before continuing without downloading the
-large FFmpeg package again. Because the package version intentionally remains
-`6.1.4-r3`, its checksum-verified build metadata also carries the
-`buffered-tee-v1` renderer profile. An older same-version runtime without that
-profile is downloaded and force-reinstalled, which repairs pre-unified builds
-without changing either application or codec package version. The release
-installer then detects whether the
-router uses `apk` or `opkg`, downloads the matching
+1.2.0 source tree. It detects whether the router uses `apk` or `opkg`,
+downloads the matching
 1.0.0 package from
 [Release 1.0.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.0.0),
 verifies its pinned SHA-256 checksum, attempts to refresh the package indexes,
@@ -272,13 +258,15 @@ and installs the package. The released APK is unsigned, so installation on
 OpenWrt 25.12+ uses `apk add --allow-untrusted`. Downloads are size-limited to
 protect the router's RAM-backed `/tmp` filesystem.
 
-Because the FFmpeg step is mandatory, the release installer now requires an
-exact codec-matrix entry. At present that means OpenWrt 25.12.5
-`r33051-f5dae5ece4` or OpenWrt 24.10.8 `r29233-443ec4032a`; an unsupported
-release, revision, or architecture is rejected before the application package
-is changed. Release 1.0.0 itself remains browser-only, so it prepares the
-private runtime for a later 1.1.0 installation but does not use router CPU
-rendering.
+Release 1.0.0 remains browser-only and deliberately does not attempt to install
+the strict r4 codec runtime: its legacy helper cannot participate in the new
+fail-closed maintenance transaction. To migrate an existing APK installation
+and enable strict Router mode, use the current-`main` installer below. It
+installs the 1.2.0 maintenance-capable application first and only then performs
+the architecture-specific codec transaction. On an `opkg` router, install the
+current 1.2.0 application IPK and matching r4 codec IPK in that same order using
+the prebuilt-package instructions below; the published 1.0.0 installer cannot
+enable strict Router mode there.
 
 ### Current `main` APK (OpenWrt 25.12.5)
 
@@ -298,22 +286,24 @@ rebuilds the current source package and publishes the architecture-scoped
 generated `snapshot` branch. The installer resolves that branch immutably,
 matches the router's exact release, revision, and `DISTRIB_ARCH`, validates the
 indexed path and checksum, and confirms that the source commit still equals
-the current head of `main`. Before installing that verified application APK,
-it also installs or checks for an update to the same exact
-architecture-specific private FFmpeg runtime described below. An
-already-current runtime does not stop the application installation. The
-installer then checks the head of `main` again immediately before replacing
-the application package. It refuses to proceed while a newer push is still
-being checked or if any verification fails. This path supports only `apk`; use
-the published-release installer above on OpenWrt versions that still use
-`opkg`.
+the current head of `main`. The installer checks the head of `main` again
+immediately before replacing the application package. Only after the verified
+1.2.0 maintenance helper is installed does it install or update the matching
+architecture-specific private FFmpeg runtime. This ordering safely migrates
+legacy helpers and prevents the r4 codec package from being changed outside a
+strict maintenance transaction. It refuses to proceed while a newer push is
+still being checked or if application verification fails. This path supports only `apk`; use
+the 1.2.0 application-plus-r4 local IPK procedure under
+**Installing a Prebuilt Local Package** on OpenWrt versions that still use
+`opkg`. The published-release installer above deliberately leaves those routers
+on browser-only 1.0.0.
 The current snapshot targets the exact OpenWrt 25.12.5 revision listed below
 and force-reinstalls the application when a newer snapshot still has the same
-package version, `1.1.0`.
+package version, `1.2.0`.
 
 ### Architecture-specific Codec Runtime (APK or IPK)
 
-The generated codec package version is **6.1.4-r3**. The current matrix covers:
+The generated codec package version is **6.1.4-r4**. The current matrix covers:
 
 - OpenWrt `25.12.5` revision `r33051-f5dae5ece4`: 35 APK architectures;
 - OpenWrt `24.10.8` revision `r29233-443ec4032a`: 36 IPK architectures;
@@ -324,8 +314,9 @@ folder. Other AArch64 routers may report `aarch64_cortex-a72`,
 `aarch64_cortex-a76`, or `aarch64_generic`; those are separate ABI folders
 with separately compiled codec binaries.
 
-Both quick application installers above perform this FFmpeg installation or
-update check automatically before changing the application package. To
+The current-`main` installer performs this FFmpeg installation or update
+automatically after installing the maintenance-capable application. The
+browser-only 1.0.0 release installer deliberately does not. To
 install, update, or verify only the codec runtime independently, run:
 
 ```sh
@@ -352,9 +343,10 @@ checksum failures before installation. It compares the installed and published
 package versions: a missing or older runtime is installed, a matching current
 or newer runtime with compatible build metadata is kept, and a current-version
 runtime with missing or incompatible metadata is reinstalled from the verified
-package. It then confirms that the private runtime exposes the native H.264,
-HEVC, and VC-1 decoders plus every component required by the continuous MJPEG
-and PCM renderers.
+package. It then confirms the exact native software video-decoder allowlist
+(H.264, HEVC, VC-1, MPEG-4, VP8, VP9, AV1, and MJPEG), the exact audio-decoder
+allowlist, the two permitted encoders, an empty hardware-accelerator report,
+and every component required by the continuous MJPEG and PCM renderers.
 
 Each runtime is built from a checksum-pinned official OpenWrt SDK with
 `CONFIG_BUILD_PATENTED=y`. QEMU-compatible architectures are executed under
@@ -434,11 +426,11 @@ dist/
 ├── SOURCE_COMMIT
 ├── aarch64_cortex-a53/
 │   ├── openwrt-25.12.5-r33051-f5dae5ece4/
-│   │   ├── luci-app-videoplayer-1.1.0.apk
-│   │   └── luci-videoplayer-codec-runtime-6.1.4-r3.apk
+│   │   ├── luci-app-videoplayer-1.2.0.apk
+│   │   └── luci-videoplayer-codec-runtime-6.1.4-r4.apk
 │   └── openwrt-24.10.8-r29233-443ec4032a/
-│       ├── luci-app-videoplayer_1.1.0_all.ipk
-│       └── luci-videoplayer-codec-runtime_6.1.4-r3_aarch64_cortex-a53.ipk
+│       ├── luci-app-videoplayer_1.2.0_all.ipk
+│       └── luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk
 ├── aarch64_cortex-a72/
 ├── …
 └── x86_64/
@@ -463,28 +455,37 @@ OpenWrt 25.12.5 on `aarch64_cortex-a53`:
 
 ```sh
 scp -O \
-  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.1.0.apk \
+  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.2.0.apk \
+  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-videoplayer-codec-runtime-6.1.4-r4.apk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-apk add --allow-untrusted /tmp/luci-app-videoplayer-1.1.0.apk
+apk add --allow-untrusted /tmp/luci-app-videoplayer-1.2.0.apk
+apk add --allow-untrusted /tmp/luci-videoplayer-codec-runtime-6.1.4-r4.apk
 ```
 
 OpenWrt 24.10.8 on `aarch64_cortex-a53`:
 
 ```sh
 scp -O \
-  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.1.0_all.ipk \
+  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.2.0_all.ipk \
+  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-opkg install /tmp/luci-app-videoplayer_1.1.0_all.ipk
+opkg install /tmp/luci-app-videoplayer_1.2.0_all.ipk
+opkg install /tmp/luci-videoplayer-codec-runtime_6.1.4-r4_aarch64_cortex-a53.ipk
 ```
+
+Keep this order when upgrading an existing installation: the 1.2.0
+application installs the maintenance-capable helper first, then the r4 codec
+package replaces the private FFmpeg while that helper holds the strict
+maintenance gate.
 
 If your `scp` implementation does not support `-O`, omit that option. After
 installation, sign out of LuCI and sign in again if the new menu item does not
 appear.
 
 Package managers may consider an older build with a release suffix newer than
-this suffix-free `1.1.0` build. When replacing such an installation, explicitly
+this suffix-free `1.2.0` build. When replacing such an installation, explicitly
 allow a downgrade or remove the old package before installing this one.
 
 Direct URL:
@@ -501,7 +502,11 @@ make package/luci-app-videoplayer/compile V=s
 
 The package is listed under **LuCI → Applications**. Its canonical project URL
 is configured in `luci-app-videoplayer/Makefile`; set a specific maintainer
-contact there before submitting it to an official package feed.
+contact there before submitting it to an official package feed. The ordinary
+OpenWrt package hook intentionally refuses a direct upgrade from a legacy
+pre-1.2 helper because it cannot close that helper's startup race. Run the
+verified standalone 1.2.0 package once to perform that migration, after which
+normal package upgrades use the strict maintenance protocol.
 
 ## Manual Installation over SSH for Development
 
@@ -515,8 +520,13 @@ installed files atomically. An existing `/etc/config/videoplayer` is preserved;
 missing UCI options are added separately. The script tries `scp -O` first and
 then falls back to regular `scp`. This development installer does not install
 package dependencies. FFmpeg is optional for browser mode; router CPU mode
-requires either the private codec runtime described above or a compatible
-system FFmpeg.
+requires the attested private codec runtime described above. A system FFmpeg is
+never accepted for Router mode. Before replacing or removing the renderer
+helper, the script requires the strict maintenance acknowledgement, quiesces
+the session, and preserves the global lock inodes. Renderer startup resumes
+only after the new helper revalidates the maintenance state; removal leaves the
+durable gate active. A legacy helper must first be migrated by the verified
+1.2.0 package.
 
 To remove only the program files installed manually:
 
@@ -573,14 +583,17 @@ opkg remove luci-app-videoplayer
 opkg remove luci-videoplayer-codec-runtime
 ```
 
-Removing only `luci-videoplayer-codec-runtime` restores the normal system
-FFmpeg fallback and does not remove the LuCI application, its configuration,
-or any videos.
+Removing only `luci-videoplayer-codec-runtime` makes strict Router mode
+unavailable and does not remove the LuCI application, its configuration, or any
+videos. Browser mode remains usable.
 
-The post-removal script clears LuCI caches and temporary player state
-(stream tokens, renderer sessions, and locks), then reloads rpcd. Videos are
-never deleted. How the configuration file is handled during removal depends
-on the package manager and whether the file has been modified.
+The post-removal script clears LuCI caches and stream tokens, then reloads rpcd.
+The renderer maintenance marker and its two global lock files deliberately
+survive application removal so a stale command cannot reopen a different lock
+inode. A later verified installation consumes that marker and resumes playback
+only after its new helper is validated. Videos are never deleted. How the
+configuration file is handled during removal depends on the package manager and
+whether the file has been modified.
 
 ## Limitations and Security
 
@@ -618,16 +631,12 @@ on the package manager and whether the file has been modified.
   the whole ring while waiting for a complete batch, and LuCI backs off repeated
   empty polls from 50 ms to an interval of one second.
   A short authenticated lock-busy response is retried for a bounded interval
-  instead of aborting the entire CPU-rendered session. If the backend explicitly
-  reports that its PCM chunker is
-  unavailable, or Web Audio fails after a safe discard drain has been
-  established, the player attempts the protected original track in a hidden
-  HTML media element at 1×. It keeps acknowledging discarded PCM batches when
-  that transport is still trustworthy, so unused router audio cannot block
-  video rendering. Persistent PCM HTTP/session loss cannot be acknowledged
-  safely and falls back to complete browser playback. If neither audio path can
-  decode the track, playback remains silent. For uncommon or extensionless
-  containers, fallback audio support can still depend on browser sniffing.
+  instead of aborting the entire CPU-rendered session. A true video-only source
+  plays silently. If the source advertises audio and the private software
+  decoder, PCM producer, transport, Web Audio queue, or synchronization path
+  fails, the strict session stops with a classified error. The application does
+  not open the original track in a hidden media element and does not acknowledge
+  data it cannot prove was safely received.
 - Video is authoritative when source track lengths differ. A shorter audio
   track is padded with silence and longer audio is cut at video EOF inside the
   unified FFmpeg output, preventing a full PCM ring from keeping a completed
@@ -636,8 +645,10 @@ on the package manager and whether the file has been modified.
   are decoded; this trades some storage I/O for deterministic track-length
   handling without a second renderer process.
 - Router CPU mode has no user-controlled pause or seeking. Separate
-  **Rendered time**, **Played time**, **Render speed**, and **Buffered ahead**
-  counters distinguish producer throughput from the fixed 1× playback clock.
+  **Rendered time**, **Played time**, **Router output speed**, and **Buffered
+  ahead** counters distinguish end-to-end router-output arrival throughput from
+  the fixed 1× playback clock. The speed value is not presented as a pure
+  FFmpeg benchmark or a measurement of browser presentation cost.
   The two time counters show elapsed media time against
   advisory container duration while rendering; the total is shown as `?` when
   the container does not report one. Container metadata never shortens the
@@ -652,16 +663,12 @@ on the package manager and whether the file has been modified.
   room for at most one final 4 MiB frame). An active response is always drained
   to that validated frame boundary; high-water backpressure delays only
   its successor, so a hidden tab cannot leave uHTTPd holding an unread body.
-- A fatal error inside the shared FFmpeg producer can end both router video and
-  PCM even when the one-frame audio probe succeeded. An authenticated backend
-  `unavailable` state and recoverable Web Audio failures preserve router video
-  and switch to protected browser audio. Ambiguous PCM transport/session loss,
-  or a fatal shared decoder/filter failure, safely falls back the whole
-  playback instead of guessing a synchronization point.
-- If router-side FFmpeg cannot start for a local file, the UI reports the
-  classified failure and automatically retries that file with browser
-  decoding. Automatic browser fallback starts muted; audio can be enabled with
-  the player control.
+- A fatal error inside the shared FFmpeg producer ends both router video and
+  PCM even when startup probes succeeded. Renderer attestation, startup,
+  transport, parsing, buffering, canvas, PCM, or shared decoder/filter failures
+  are fail-closed: the UI stops playback, preserves the selected Router mode,
+  and explains that the user may explicitly switch to Browser mode. It never
+  guesses a synchronization point or silently changes the source-decoding path.
 - Router CPU mode can cause high CPU use, heat, stutter, and temporary LuCI
   slowdown. Reducing the output frame rate does not prevent FFmpeg from
   decoding the source stream, so high-resolution media may still overwhelm a
@@ -680,8 +687,10 @@ on the package manager and whether the file has been modified.
 - The remote server must allow the browser to load the resource. CORS is
   required when the server or page policy enforces a CORS check; convenient
   seeking also requires HTTP Range support.
-- Remote URLs deliberately remain browser-side in both modes. Passing them to
-  router-side FFmpeg would turn the player into an SSRF-capable network proxy.
+- Remote URLs are accepted only while Browser mode is active. Router mode
+  rejects them and asks for an explicit mode change; passing them to FFmpeg
+  would turn the router into an SSRF-capable network proxy, while silently
+  browser-playing them would violate the selected strict-mode contract.
 - Do not store sensitive files inside `media_path`.
 - To protect memory on resource-constrained routers, each directory is limited
   to 5,000 entries and 1 MiB of combined path data. Split larger libraries into
@@ -700,17 +709,19 @@ verifier and checks its version, release suffix, and dependencies against the
 OpenWrt Makefile. The CI workflow checks and lints all shipped scripts,
 exercises browser extension filtering and extensionless CPU media discovery,
 exercises successful renderer and PCM-audio lifecycle, validates the
-session-bound browser-audio nonce, stable source-descriptor Range streaming,
-continuous multipart MJPEG framing, single-viewer locking, heartbeat renewal,
+strict private-runtime attestation, software-only decoder inventory, explicit
+hardware-acceleration disablement, continuous multipart MJPEG framing,
+single-viewer locking, heartbeat renewal,
 minute-throttled lease tolerance, video-authoritative mismatched-track
 termination and short-audio silence padding,
 path-replacement resistance, bounded JPEG and sequential PCM prebuffering, the
 120-second start gate and short-file EOF exception, persistent-canvas media-time
 presentation, fixed-rate audio, joint underrun/refill, progress counters,
-browser-audio fallback, autoplay recovery, stale asynchronous cleanup, and
-renderer cleanup, checks modern and legacy missing-decoder diagnostics,
-unusable V4L2 hardware decoders, bounded noisy logs, and unknown FFmpeg failures
-with isolated fake processes, and builds and verifies both packages. After
+autoplay recovery, stale asynchronous cleanup, strict rejection of every
+automatic browser/original-audio fallback, and renderer cleanup. It also checks
+modern and legacy missing-decoder diagnostics, rejects V4L2 and other hardware
+decoder wrappers, bounds noisy logs and unknown FFmpeg failures with isolated
+fake processes, and builds and verifies both packages. After
 those checks pass on `main`, a separate job
 with narrowly scoped repository write access rebuilds the architecture-scoped
 application layout and updates the generated `snapshot` branch. It never
@@ -750,6 +761,9 @@ openwrt-video-player/
 │   ├── validate-runtime.sh
 │   └── package/
 ├── tests/
+│   ├── app-lifecycle.sh
+│   ├── codec-attestation.py
+│   ├── installer-entrypoints.sh
 │   ├── local-listing.sh
 │   ├── renderer-behavior.sh
 │   └── web-audio.js

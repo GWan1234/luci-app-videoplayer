@@ -82,49 +82,48 @@ codec_installer_sha="$(
 	sha256sum "$root/scripts/install-codec-runtime.sh" |
 		awk '{ print $1 }'
 )"
-for app_installer in \
-	scripts/install-from-github.sh \
-	scripts/install-main-apk.sh
-do
-	grep -Fx \
-		"CODEC_INSTALLER_SHA256=\"$codec_installer_sha\"" \
+app_installer="scripts/install-main-apk.sh"
+grep -Fx \
+	"CODEC_INSTALLER_SHA256=\"$codec_installer_sha\"" \
+	"$root/$app_installer" >/dev/null || {
+	printf '%s does not pin the current codec installer SHA-256.\n' \
+		"$app_installer" >&2
+	exit 1
+}
+grep -F "if ! /bin/sh \"\$CODEC_INSTALLER_PATH\"; then" \
 		"$root/$app_installer" >/dev/null || {
-		printf '%s does not pin the current codec installer SHA-256.\n' \
-			"$app_installer" >&2
-		exit 1
-	}
-	grep -F "if ! /bin/sh \"\$CODEC_INSTALLER_PATH\"; then" \
-		"$root/$app_installer" >/dev/null || {
-		printf '%s does not run the verified codec installer.\n' \
-			"$app_installer" >&2
-		exit 1
-	}
-	codec_call_line="$(
-		grep -nF \
-			"if ! /bin/sh \"\$CODEC_INSTALLER_PATH\"; then" \
-			"$root/$app_installer" |
-			awk -F: 'NR == 1 { print $1 }'
-	)"
-	case "$app_installer" in
-		scripts/install-from-github.sh)
-			app_install_marker="printf 'Installing %s with %s..."
-			;;
-		scripts/install-main-apk.sh)
-			app_install_marker="install_apk_package \"\$APK_INSTALL_MODE\" \"\$APK_PATH\""
-			;;
-	esac
-	app_install_line="$(
-		grep -nF "$app_install_marker" "$root/$app_installer" |
-			awk -F: 'NR == 1 { print $1 }'
-	)"
-	if [[ ! "$codec_call_line" =~ ^[0-9]+$ ]] ||
-		[[ ! "$app_install_line" =~ ^[0-9]+$ ]] ||
-		((codec_call_line >= app_install_line)); then
-		printf '%s does not install FFmpeg before the application package.\n' \
-			"$app_installer" >&2
-		exit 1
-	fi
-done
+	printf '%s does not run the verified codec installer.\n' \
+		"$app_installer" >&2
+	exit 1
+}
+codec_call_line="$(
+	grep -nF \
+		"if ! /bin/sh \"\$CODEC_INSTALLER_PATH\"; then" \
+		"$root/$app_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
+app_install_marker="install_apk_package \"\$APK_INSTALL_MODE\" \"\$APK_PATH\""
+app_install_line="$(
+	grep -nF "$app_install_marker" "$root/$app_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
+if [[ ! "$codec_call_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$app_install_line" =~ ^[0-9]+$ ]] ||
+	((app_install_line >= codec_call_line)); then
+	printf '%s does not install the strict application maintenance helper before FFmpeg.\n' \
+		"$app_installer" >&2
+	exit 1
+fi
+
+if grep -Eq 'CODEC_INSTALLER|install-codec-runtime' \
+	"$root/scripts/install-from-github.sh"; then
+	printf '%s\n' \
+		'The browser-only 1.0.0 release installer must not attempt a strict r4 codec transaction.' >&2
+	exit 1
+fi
+release_help="$(sh "$root/scripts/install-from-github.sh" --help)"
+grep -Fq 'browser-only' <<<"$release_help"
+grep -Fq 'does not install the strict CPU runtime' <<<"$release_help"
 
 main_installer="$root/scripts/install-main-apk.sh"
 main_installer_without_main="$tmp/install-main-apk.without-main"
@@ -187,9 +186,9 @@ if [[ ! "$initial_freshness_line" =~ ^[0-9]+$ ]] ||
 	[[ ! "$final_freshness_line" =~ ^[0-9]+$ ]] ||
 	[[ ! "$codec_call_line" =~ ^[0-9]+$ ]] ||
 	[[ ! "$app_install_line" =~ ^[0-9]+$ ]] ||
-	((initial_freshness_line >= codec_call_line)) ||
-	((final_freshness_line <= codec_call_line)) ||
-	((final_freshness_line >= app_install_line)); then
+		((initial_freshness_line >= final_freshness_line)) ||
+		((final_freshness_line >= app_install_line)) ||
+		((app_install_line >= codec_call_line)); then
 	printf '%s\n' \
 		'The current-main freshness checks do not guard both installation stages.' >&2
 	exit 1
@@ -421,6 +420,10 @@ do
 	done
 done
 
+main_help="$(sh "$root/scripts/install-main-apk.sh" --help)"
+printf '%s\n' "$main_help" | grep -Fq 'current main branch first' ||
+	fail "current-main installer help does not document app-first ordering"
+
 codec_installer_without_main="$tmp/install-codec-runtime.without-main"
 sed '$d' "$root/scripts/install-codec-runtime.sh" \
 	> "$codec_installer_without_main"
@@ -477,9 +480,8 @@ then
 	exit 1
 fi
 
-# Same-version codec packages built before the unified tee/apad renderer have
-# the same r3 package version. The capability profile must turn that legacy
-# metadata into a repair action without executing the incomplete binary.
+# Codec packages built before the software-cpu-v1 attestation must turn their
+# legacy metadata into a repair action without executing the incomplete binary.
 codec_build_info="$tmp/codec-build-info"
 codec_ffmpeg="$tmp/codec-ffmpeg"
 codec_relay="$tmp/codec-relay"
@@ -515,7 +517,7 @@ then
 		'Legacy same-version codec metadata unexpectedly skipped repair.' >&2
 	exit 1
 fi
-printf '%s\n' 'renderer_profile=buffered-tee-v1' >> "$codec_build_info"
+printf '%s\n' 'renderer_profile=software-cpu-v1' >> "$codec_build_info"
 if sh -s -- \
 	"$codec_installer_without_main" "$codec_build_info" "$codec_ffmpeg" \
 	"$codec_relay" <<'EOF'
@@ -542,6 +544,26 @@ then
 fi
 printf '%s\n' '#!/bin/sh' 'exit 64' > "$codec_relay"
 chmod 0755 "$codec_relay"
+printf '%s\n' \
+	'format=4' \
+	'build_target=test-target' \
+	'build_subtarget=test-subtarget' \
+	'sdk_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+	'packages_feed_commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+	'ffmpeg_version=6.1.4' \
+	'validation_mode=qemu' \
+	'execution_backend=software-cpu-v1' \
+	'software_cpu_only=1' \
+	'build_patented=y' \
+	'network_enabled=n' \
+	'avdevice_enabled=n' \
+	'swresample_enabled=y' \
+	'audio_output=pcm_s16le' \
+	'audio_sample_rate=48000' \
+	'audio_channels=2' \
+	'audio_chunk_frames=48000' \
+	'audio_chunk_bytes=192000' \
+	"private_binary=$codec_ffmpeg" >> "$codec_build_info"
 sh -s -- \
 	"$codec_installer_without_main" "$codec_build_info" "$codec_ffmpeg" \
 	"$codec_relay" <<'EOF'
@@ -564,8 +586,13 @@ PACKAGE_FORMAT=apk
 # the package manager's ownership result; every unrelated stat call stays real.
 stat() {
 	if [ "$#" -eq 3 ] && [ "$1" = -c ] && [ "$2" = '%u:%a' ] &&
-	   [ "$3" = "$PRIVATE_RELAY" ]; then
-		printf '%s\n' '0:755'
+	   { [ "$3" = "$PRIVATE_BUILD_INFO" ] ||
+	     [ "$3" = "$PRIVATE_FFMPEG" ] ||
+	     [ "$3" = "$PRIVATE_RELAY" ]; }; then
+		case "$3" in
+			"$PRIVATE_BUILD_INFO") printf '%s\n' '0:644' ;;
+			*) printf '%s\n' '0:755' ;;
+		esac
 		return 0
 	fi
 	command stat "$@"

@@ -13,9 +13,13 @@ RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
 PACKAGE_NAME="luci-videoplayer-codec-runtime"
 CODEC_VERSION="6.1.4"
-CODEC_RELEASE="3"
+CODEC_RELEASE="4"
 TARGET_PACKAGE_VERSION="$CODEC_VERSION-r$CODEC_RELEASE"
-RENDERER_PROFILE="buffered-tee-v1"
+RENDERER_PROFILE="software-cpu-v1"
+EXECUTION_BACKEND="software-cpu-v1"
+SOFTWARE_CPU_ONLY="1"
+BUILD_INFO_FORMAT="4"
+BUILD_INFO_LINES="24"
 INDEX_OBJECT="dist/INDEX.tsv"
 SOURCE_COMMIT_OBJECT="dist/SOURCE_COMMIT"
 PRIVATE_FFMPEG="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
@@ -65,12 +69,22 @@ read_release_value() {
 
 installed_runtime_matches_router() {
 	build_info="$PRIVATE_BUILD_INFO"
-	[ -r "$build_info" ] &&
+	[ -f "$build_info" ] &&
+		[ ! -L "$build_info" ] &&
+		[ -r "$build_info" ] &&
+		[ "$(stat -c '%u:%a' "$build_info" 2>/dev/null)" = "0:644" ] &&
+		[ -f "$PRIVATE_FFMPEG" ] &&
+		[ ! -L "$PRIVATE_FFMPEG" ] &&
 		[ -x "$PRIVATE_FFMPEG" ] &&
+		[ "$(stat -c '%u:%a' "$PRIVATE_FFMPEG" 2>/dev/null)" = "0:755" ] &&
 		[ -f "$PRIVATE_RELAY" ] &&
 		[ ! -L "$PRIVATE_RELAY" ] &&
 		[ -x "$PRIVATE_RELAY" ] &&
 		[ "$(stat -c '%u:%a' "$PRIVATE_RELAY" 2>/dev/null)" = "0:755" ] &&
+		[ "$(wc -l < "$build_info" | tr -d '[:space:]')" = \
+			"$BUILD_INFO_LINES" ] &&
+		[ "$(sed -n 's/^format=//p' "$build_info")" = \
+			"$BUILD_INFO_FORMAT" ] &&
 		[ "$(sed -n 's/^openwrt_release=//p' "$build_info")" = \
 			"$DISTRIB_RELEASE_VALUE" ] &&
 		[ "$(sed -n 's/^openwrt_revision=//p' "$build_info")" = \
@@ -79,8 +93,35 @@ installed_runtime_matches_router() {
 			"$DISTRIB_ARCH_VALUE" ] &&
 		[ "$(sed -n 's/^package_format=//p' "$build_info")" = \
 			"$PACKAGE_FORMAT" ] &&
+		[ -n "$(sed -n 's/^build_target=//p' "$build_info")" ] &&
+		[ -n "$(sed -n 's/^build_subtarget=//p' "$build_info")" ] &&
+		printf '%s\n' "$(sed -n 's/^sdk_sha256=//p' "$build_info")" |
+			grep -Eq '^[0-9a-f]{64}$' &&
+		printf '%s\n' "$(sed -n 's/^packages_feed_commit=//p' "$build_info")" |
+			grep -Eq '^[0-9a-f]{40}$' &&
+		[ "$(sed -n 's/^ffmpeg_version=//p' "$build_info")" = \
+			"$CODEC_VERSION" ] &&
+		case "$(sed -n 's/^validation_mode=//p' "$build_info")" in
+			qemu|static) true ;;
+			*) false ;;
+		esac &&
 		[ "$(sed -n 's/^renderer_profile=//p' "$build_info")" = \
-			"$RENDERER_PROFILE" ]
+			"$RENDERER_PROFILE" ] &&
+		[ "$(sed -n 's/^execution_backend=//p' "$build_info")" = \
+			"$EXECUTION_BACKEND" ] &&
+		[ "$(sed -n 's/^software_cpu_only=//p' "$build_info")" = \
+			"$SOFTWARE_CPU_ONLY" ] &&
+		[ "$(sed -n 's/^build_patented=//p' "$build_info")" = "y" ] &&
+		[ "$(sed -n 's/^network_enabled=//p' "$build_info")" = "n" ] &&
+		[ "$(sed -n 's/^avdevice_enabled=//p' "$build_info")" = "n" ] &&
+		[ "$(sed -n 's/^swresample_enabled=//p' "$build_info")" = "y" ] &&
+		[ "$(sed -n 's/^audio_output=//p' "$build_info")" = "pcm_s16le" ] &&
+		[ "$(sed -n 's/^audio_sample_rate=//p' "$build_info")" = "48000" ] &&
+		[ "$(sed -n 's/^audio_channels=//p' "$build_info")" = "2" ] &&
+		[ "$(sed -n 's/^audio_chunk_frames=//p' "$build_info")" = "48000" ] &&
+		[ "$(sed -n 's/^audio_chunk_bytes=//p' "$build_info")" = "192000" ] &&
+		[ "$(sed -n 's/^private_binary=//p' "$build_info")" = \
+			"$PRIVATE_FFMPEG" ]
 }
 
 select_runtime_action() {
@@ -270,6 +311,38 @@ check_component() {
 	return 1
 }
 
+# CODEC_REPORT_ALLOWLIST_BEGIN
+unexpected_codec_aliases() (
+	component_report="$1"
+	allowed_names="$2"
+	awk -v allowed_names="$allowed_names" '
+		BEGIN {
+			count = split(allowed_names, names, " ")
+			for (i = 1; i <= count; i++)
+				allowed[names[i]] = 1
+		}
+		$2 == "=" { next }
+		length($1) == 6 && substr($1, 1, 1) ~ /^[VAS]$/ {
+			if ($2 !~ /^[a-z0-9_]+(,[a-z0-9_]+)*$/) {
+				invalid_alias = 1
+				next
+			}
+			count = split($2, aliases, ",")
+			for (i = 1; i <= count; i++)
+				if (!allowed[aliases[i]])
+					unexpected = unexpected \
+						(unexpected ? "," : "") aliases[i]
+		}
+		END {
+			if (invalid_alias)
+				unexpected = unexpected \
+					(unexpected ? "," : "") "__invalid_component_alias__"
+			print unexpected
+		}
+	' "$component_report"
+)
+# CODEC_REPORT_ALLOWLIST_END
+
 # Keep all side effects behind the final entry-point call so the installer is
 # inert until a complete script has been parsed.
 main() {
@@ -305,7 +378,7 @@ command -v id >/dev/null 2>&1 ||
 [ "$(id -u)" = "0" ] ||
 	die "Run this installer as root."
 
-for required_command in grep mktemp sed sha256sum stat tr wc; do
+for required_command in awk grep mktemp sed sha256sum stat tr wc; do
 	command -v "$required_command" >/dev/null 2>&1 ||
 		die "Required command is missing: $required_command"
 done
@@ -614,8 +687,14 @@ if [ "$RUNTIME_ACTION" != "install" ]; then
 		"Architecture-specific FFmpeg update check complete; continuing."
 fi
 
-[ -x "$PRIVATE_FFMPEG" ] ||
-	die "The installed private FFmpeg is missing or not executable: $PRIVATE_FFMPEG"
+installed_runtime_matches_router ||
+	die "The installed codec attestation does not match the exact software-cpu-v1 runtime contract."
+if [ ! -f "$PRIVATE_FFMPEG" ] ||
+	[ -L "$PRIVATE_FFMPEG" ] ||
+	[ ! -x "$PRIVATE_FFMPEG" ] ||
+	[ "$(stat -c '%u:%a' "$PRIVATE_FFMPEG" 2>/dev/null)" != "0:755" ]; then
+	die "The installed private FFmpeg is missing or unsafe: $PRIVATE_FFMPEG"
+fi
 if [ ! -f "$PRIVATE_RELAY" ] ||
 	[ -L "$PRIVATE_RELAY" ] ||
 	[ ! -x "$PRIVATE_RELAY" ] ||
@@ -631,9 +710,11 @@ DECODERS_REPORT="$WORK_DIR/ffmpeg-decoders"
 ENCODERS_REPORT="$WORK_DIR/ffmpeg-encoders"
 MUXERS_REPORT="$WORK_DIR/ffmpeg-muxers"
 FILTERS_REPORT="$WORK_DIR/ffmpeg-filters"
+HWACCELS_REPORT="$WORK_DIR/ffmpeg-hwaccels"
+VERSION_REPORT="$WORK_DIR/ffmpeg-version"
 FFMPEG_ERROR="$WORK_DIR/ffmpeg-error"
 
-for report in decoders encoders muxers filters; do
+for report in decoders encoders muxers filters hwaccels version; do
 	case "$report" in
 		decoders)
 			report_path="$DECODERS_REPORT"
@@ -647,6 +728,12 @@ for report in decoders encoders muxers filters; do
 		filters)
 			report_path="$FILTERS_REPORT"
 			;;
+		hwaccels)
+			report_path="$HWACCELS_REPORT"
+			;;
+		version)
+			report_path="$VERSION_REPORT"
+			;;
 	esac
 	if ! run_ffmpeg_report "-$report" "$report_path" "$FFMPEG_ERROR"; then
 		[ ! -s "$FFMPEG_ERROR" ] ||
@@ -655,8 +742,44 @@ for report in decoders encoders muxers filters; do
 	fi
 done
 
+grep -Fx 'Hardware acceleration methods:' "$HWACCELS_REPORT" >/dev/null ||
+	die "The installed private FFmpeg returned a malformed hardware-accelerator report."
+if sed -n '/^Hardware acceleration methods:$/,$p' "$HWACCELS_REPORT" |
+	sed '1d' | grep -Eq '[^[:space:]]'; then
+	die "The installed private FFmpeg reports a hardware accelerator."
+fi
+for SOFTWARE_OPTION in \
+	--disable-autodetect \
+	--disable-avdevice \
+	--disable-network \
+	--disable-indevs \
+	--disable-outdevs \
+	--disable-hwaccels \
+	--disable-vaapi \
+	--disable-vdpau \
+	--disable-vulkan \
+	--disable-decoders \
+	--disable-encoders
+do
+	grep -F -- "$SOFTWARE_OPTION" "$VERSION_REPORT" >/dev/null ||
+		die "The installed private FFmpeg lacks $SOFTWARE_OPTION."
+done
+
+UNEXPECTED_DECODERS="$(
+	unexpected_codec_aliases "$DECODERS_REPORT" \
+		"h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg aac ac3 eac3 alac dca flac mp3 opus pcm_s16le truehd vorbis"
+)"
+[ -z "$UNEXPECTED_DECODERS" ] ||
+	die "The installed private FFmpeg exposes decoder(s) outside the software allowlist: $UNEXPECTED_DECODERS"
+
+UNEXPECTED_ENCODERS="$(
+	unexpected_codec_aliases "$ENCODERS_REPORT" "mjpeg pcm_s16le"
+)"
+[ -z "$UNEXPECTED_ENCODERS" ] ||
+	die "The installed private FFmpeg exposes encoder(s) outside the software allowlist: $UNEXPECTED_ENCODERS"
+
 COMPONENTS_OK="1"
-for VIDEO_DECODER in h264 hevc vc1; do
+for VIDEO_DECODER in h264 hevc vc1 mpeg4 vp8 vp9 av1 mjpeg; do
 	check_component "$DECODERS_REPORT" \
 		"^[[:space:]]*V[^[:space:]]*[[:space:]]+$VIDEO_DECODER([[:space:]]|$)" \
 		"the native $VIDEO_DECODER video decoder" ||
@@ -695,9 +818,11 @@ done
 
 printf '%s\n' \
 	"Codec runtime installation complete." \
+	"Verified execution backend: $EXECUTION_BACKEND" \
+	"Verified hardware accelerators: none" \
 	"Verified private FFmpeg: $PRIVATE_FFMPEG" \
 	"Verified frame-aligned MJPEG relay: $PRIVATE_RELAY" \
-	"Verified video decoders: h264, hevc, vc1" \
+	"Verified video decoders: h264, hevc, vc1, mpeg4, vp8, vp9, av1, mjpeg" \
 	"Verified audio decoders: aac, ac3, eac3, alac, dca, flac, mp3, opus, pcm_s16le, truehd, vorbis" \
 	"Verified video pipeline: mjpeg encoder, mpjpeg stream, image2 compatibility, fps, scale, format" \
 	"Verified audio pipeline: pcm_s16le, s16le, tee, aresample, aformat, apad, asetnsamples"
