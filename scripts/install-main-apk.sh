@@ -216,8 +216,10 @@ verify_apk_architecture() {
 }
 
 require_supported_apk_platform() {
-	[ "$1" = "25.12.5" ] && [ "$2" = "r33051-f5dae5ece4" ] ||
-		die "No current-main APK is published for OpenWrt $1 $2."
+	if [ "$1" = "25.12.5" ] && [ "$2" = "r33051-f5dae5ece4" ]; then
+		return 0
+	fi
+	die "No current-main APK is published for OpenWrt $1 $2."
 }
 
 require_current_snapshot() {
