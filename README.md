@@ -15,7 +15,7 @@ and audio-device implementation are outside a web application's control and
 are therefore not claimed to be CPU-only. Playback stays inside LuCI and does
 not use the router's HDMI or framebuffer.
 
-Current source package version: **1.2.0**. The latest published GitHub release
+Current source package version: **1.1.0**. The latest published GitHub release
 is still **1.0.0**. The release installer below remains pinned to that release,
 while a separate APK-only installer follows the latest successfully tested
 `main` source.
@@ -248,8 +248,9 @@ size-limited temporary file before executing it and removes that file on exit.
 It deliberately does not pipe partially downloaded network content into a
 shell.
 
-The installer currently installs the latest published release, not the newer
-1.2.0 source tree. It detects whether the router uses `apk` or `opkg`,
+The installer currently installs the latest published release, not the current
+strict-maintenance 1.1.0 source tree. It detects whether the router uses `apk`
+or `opkg`,
 downloads the matching
 1.0.0 package from
 [Release 1.0.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.0.0),
@@ -262,9 +263,9 @@ Release 1.0.0 remains browser-only and deliberately does not attempt to install
 the strict r5 codec runtime: its legacy helper cannot participate in the new
 fail-closed maintenance transaction. To migrate an existing APK installation
 and enable strict Router mode, use the current-`main` installer below. It
-installs the 1.2.0 maintenance-capable application first and only then performs
+installs the current 1.1.0 maintenance-capable application first and only then performs
 the architecture-specific codec transaction. On an `opkg` router, install the
-current 1.2.0 application IPK and matching r5 codec IPK in that same order using
+current 1.1.0 application IPK and matching r5 codec IPK in that same order using
 the prebuilt-package instructions below; the published 1.0.0 installer cannot
 enable strict Router mode there.
 
@@ -288,18 +289,21 @@ matches the router's exact release, revision, and `DISTRIB_ARCH`, validates the
 indexed path and checksum, and confirms that the source commit still equals
 the current head of `main`. The installer checks the head of `main` again
 immediately before replacing the application package. Only after the verified
-1.2.0 maintenance helper is installed does it install or update the matching
+1.1.0 maintenance helper is installed does it install or update the matching
 architecture-specific private FFmpeg runtime. This ordering safely migrates
 legacy helpers and prevents the r5 codec package from being changed outside a
 strict maintenance transaction. It refuses to proceed while a newer push is
 still being checked or if application verification fails. This path supports only `apk`; use
-the 1.2.0 application-plus-r5 local IPK procedure under
+the 1.1.0 application-plus-r5 local IPK procedure under
 **Installing a Prebuilt Local Package** on OpenWrt versions that still use
 `opkg`. The published-release installer above deliberately leaves those routers
 on browser-only 1.0.0.
 The current snapshot targets the exact OpenWrt 25.12.5 revision listed below
 and force-reinstalls the application when a newer snapshot still has the same
-package version, `1.2.0`.
+package version, `1.1.0`. Because that number is also used by older builds and
+is lower than a previously tested source package, the installer
+performs an explicit replacement instead of relying on ordinary version
+ordering.
 
 ### Architecture-specific Codec Runtime (APK or IPK)
 
@@ -426,10 +430,10 @@ dist/
 ├── SOURCE_COMMIT
 ├── aarch64_cortex-a53/
 │   ├── openwrt-25.12.5-r33051-f5dae5ece4/
-│   │   ├── luci-app-videoplayer-1.2.0.apk
+│   │   ├── luci-app-videoplayer-1.1.0.apk
 │   │   └── luci-videoplayer-codec-runtime-6.1.4-r5.apk
 │   └── openwrt-24.10.8-r29233-443ec4032a/
-│       ├── luci-app-videoplayer_1.2.0_all.ipk
+│       ├── luci-app-videoplayer_1.1.0_all.ipk
 │       └── luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
 ├── aarch64_cortex-a72/
 ├── …
@@ -455,11 +459,11 @@ OpenWrt 25.12.5 on `aarch64_cortex-a53`:
 
 ```sh
 scp -O \
-  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.2.0.apk \
+  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.1.0.apk \
   dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-videoplayer-codec-runtime-6.1.4-r5.apk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-apk add --allow-untrusted /tmp/luci-app-videoplayer-1.2.0.apk
+apk add --allow-untrusted --force-reinstall /tmp/luci-app-videoplayer-1.1.0.apk
 apk add --allow-untrusted /tmp/luci-videoplayer-codec-runtime-6.1.4-r5.apk
 ```
 
@@ -467,15 +471,15 @@ OpenWrt 24.10.8 on `aarch64_cortex-a53`:
 
 ```sh
 scp -O \
-  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.2.0_all.ipk \
+  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.1.0_all.ipk \
   dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-opkg install /tmp/luci-app-videoplayer_1.2.0_all.ipk
+opkg --force-downgrade --force-reinstall install /tmp/luci-app-videoplayer_1.1.0_all.ipk
 opkg install /tmp/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
 ```
 
-Keep this order when upgrading an existing installation: the 1.2.0
+Keep this order when replacing an existing installation: the current 1.1.0
 application installs the maintenance-capable helper first, then the r5 codec
 package replaces the private FFmpeg while that helper holds the strict
 maintenance gate.
@@ -484,9 +488,10 @@ If your `scp` implementation does not support `-O`, omit that option. After
 installation, sign out of LuCI and sign in again if the new menu item does not
 appear.
 
-Package managers may consider an older build with a release suffix newer than
-this suffix-free `1.2.0` build. When replacing such an installation, explicitly
-allow a downgrade or remove the old package before installing this one.
+The numeric version `1.1.0` is shared with historical builds that do not have
+the strict maintenance helper, and it is lower than a previously tested source
+package. Use the forced replacement commands above (or remove the
+old application package first); an ordinary install may retain the wrong build.
 
 Direct URL:
 `http://<router-ip>/cgi-bin/luci/admin/services/videoplayer`.
@@ -503,10 +508,11 @@ make package/luci-app-videoplayer/compile V=s
 The package is listed under **LuCI → Applications**. Its canonical project URL
 is configured in `luci-app-videoplayer/Makefile`; set a specific maintainer
 contact there before submitting it to an official package feed. The ordinary
-OpenWrt package hook intentionally refuses a direct upgrade from a legacy
-pre-1.2 helper because it cannot close that helper's startup race. Run the
-verified standalone 1.2.0 package once to perform that migration, after which
-normal package upgrades use the strict maintenance protocol.
+OpenWrt package hook intentionally refuses a direct replacement from a legacy
+helper without strict maintenance because it cannot close that helper's startup
+race. Run the current verified standalone 1.1.0 package once to perform that
+migration, after which normal package upgrades use the strict maintenance
+protocol.
 
 ## Manual Installation over SSH for Development
 
@@ -525,8 +531,8 @@ never accepted for Router mode. Before replacing or removing the renderer
 helper, the script requires the strict maintenance acknowledgement, quiesces
 the session, and preserves the global lock inodes. Renderer startup resumes
 only after the new helper revalidates the maintenance state; removal leaves the
-durable gate active. A legacy helper must first be migrated by the verified
-1.2.0 package.
+durable gate active. A legacy helper must first be migrated by the current
+verified standalone 1.1.0 package.
 
 To remove only the program files installed manually:
 

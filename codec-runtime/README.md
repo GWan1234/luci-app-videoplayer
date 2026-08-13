@@ -21,13 +21,13 @@ CPU:
 dist/
 └── aarch64_cortex-a53/
     ├── openwrt-25.12.5-r33051-f5dae5ece4/
-    │   ├── luci-app-videoplayer-1.2.0.apk
+    │   ├── luci-app-videoplayer-1.1.0.apk
     │   ├── luci-videoplayer-codec-runtime-6.1.4-r5.apk
     │   ├── BUILD_INFO
     │   ├── PACKAGE_SET.json
     │   └── SHA256SUMS
     └── openwrt-24.10.8-r29233-443ec4032a/
-        ├── luci-app-videoplayer_1.2.0_all.ipk
+        ├── luci-app-videoplayer_1.1.0_all.ipk
         ├── luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
         ├── BUILD_INFO
         ├── PACKAGE_SET.json
@@ -94,8 +94,9 @@ On a live router with the application installed, codec install, upgrade, and
 removal enter the renderer's maintenance gate and quiesce all sessions before
 package files can change. The gate stays active on every pre-hook failure and
 is released only by the matching successful post-hook. A legacy renderer
-helper is rejected with an instruction to install application 1.2.0 or newer;
-the package never falls back to an unguarded cleanup. Standalone codec
+helper is rejected with an instruction to install the current verified
+strict-maintenance application package; the package never falls back to an
+unguarded cleanup. Standalone codec
 installation and removal remain valid when no renderer helper is installed.
 
 The matrix includes the official Malta `mips64_mips64r2` and

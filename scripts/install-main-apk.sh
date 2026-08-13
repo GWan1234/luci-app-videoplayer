@@ -8,7 +8,7 @@ set -eu
 REPOSITORY="communism420/luci-app-videoplayer"
 MAIN_BRANCH="main"
 SNAPSHOT_BRANCH="snapshot"
-APP_VERSION="1.2.0"
+APP_VERSION="1.1.0"
 SNAPSHOT_APK="luci-app-videoplayer-$APP_VERSION.apk"
 SNAPSHOT_INDEX="INDEX.tsv"
 CODEC_INSTALLER_OBJECT="scripts/install-codec-runtime.sh"

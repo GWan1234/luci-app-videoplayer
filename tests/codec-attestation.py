@@ -253,7 +253,7 @@ run_pre
 [ ! -e "$CASE_DIR/mutated" ]
 [ ! -e "$CASE_DIR/maintenance" ]
 [ "$(cat "$CASE_DIR/calls")" = "maintenance-enter" ]
-grep -F "Install luci-app-videoplayer 1.2.0 or newer first" \
+grep -F "Install the current verified strict-maintenance application package first" \
     "$CASE_DIR/stderr" >/dev/null
 
 reset_case enter-fail

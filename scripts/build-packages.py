@@ -30,7 +30,7 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DEFAULT_DIST = ROOT / ".staging" / "app"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.2.0"
+PKG_VERSION = "1.1.0"
 PKG_DESC = "LuCI video player with browser and strict router CPU rendering"
 PKG_LICENSE = "GPL-2.0-or-later"
 PKG_MAINTAINER = "openwrt-video-player contributors"
@@ -1368,9 +1368,9 @@ def main() -> None:
     print()
     print("Install on OpenWrt:")
     print("  # OpenWrt 25.12+ / snapshot (unsigned local APK):")
-    print(f"  apk add --allow-untrusted ./{apk.name}")
+    print(f"  apk add --allow-untrusted --force-reinstall ./{apk.name}")
     print("  # OpenWrt 24.10 (opkg):")
-    print(f"  opkg install ./{ipk.name}")
+    print(f"  opkg --force-downgrade --force-reinstall install ./{ipk.name}")
     print("  Then: log out of LuCI and log in again -> Services -> Video Player")
     print()
     print("For published releases, build and sign packages with the official OpenWrt SDK.")

@@ -241,7 +241,7 @@ if [ -z "$${IPKG_INSTROOT:-}" ]; then
 			[ ! -L "$${renderer_helper}" ] &&
 			[ -x "$${renderer_helper}" ] &&
 			[ "$$(stat -c '%u:%a' "$${renderer_helper}" 2>/dev/null)" = "0:755" ] || {
-				echo "Cannot enter renderer maintenance mode before replacing the codec runtime. Install luci-app-videoplayer 1.2.0 or newer first." >&2
+				echo "Cannot enter renderer maintenance mode before replacing the codec runtime. Install the current verified strict-maintenance application package first." >&2
 				exit 1
 			}
 		maintenance_output="$$(
@@ -251,7 +251,7 @@ if [ -z "$${IPKG_INSTROOT:-}" ]; then
 		)"
 		maintenance_expected="$$(printf 'maintenance\n__VIDEOPLAYER_RC__0')"
 		[ "$${maintenance_output}" = "$${maintenance_expected}" ] || {
-			echo "Renderer maintenance mode is unavailable or returned an invalid acknowledgement. Install luci-app-videoplayer 1.2.0 or newer first; the codec runtime was not changed." >&2
+			echo "Renderer maintenance mode is unavailable or returned an invalid acknowledgement. Install the current verified strict-maintenance application package first; the codec runtime was not changed." >&2
 			exit 1
 		}
 		"$${renderer_helper}" cleanup || {
@@ -320,7 +320,7 @@ if [ -z "$${IPKG_INSTROOT:-}" ]; then
 			[ ! -L "$${renderer_helper}" ] &&
 			[ -x "$${renderer_helper}" ] &&
 			[ "$$(stat -c '%u:%a' "$${renderer_helper}" 2>/dev/null)" = "0:755" ] || {
-				echo "Cannot enter renderer maintenance mode before removing the codec runtime. Install luci-app-videoplayer 1.2.0 or newer first." >&2
+				echo "Cannot enter renderer maintenance mode before removing the codec runtime. Install the current verified strict-maintenance application package first." >&2
 				exit 1
 			}
 		maintenance_output="$$(
@@ -330,7 +330,7 @@ if [ -z "$${IPKG_INSTROOT:-}" ]; then
 		)"
 		maintenance_expected="$$(printf 'maintenance\n__VIDEOPLAYER_RC__0')"
 		[ "$${maintenance_output}" = "$${maintenance_expected}" ] || {
-			echo "Renderer maintenance mode is unavailable or returned an invalid acknowledgement. Install luci-app-videoplayer 1.2.0 or newer first; the codec runtime was not changed." >&2
+			echo "Renderer maintenance mode is unavailable or returned an invalid acknowledgement. Install the current verified strict-maintenance application package first; the codec runtime was not changed." >&2
 			exit 1
 		}
 		"$${renderer_helper}" cleanup || {

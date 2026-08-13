@@ -78,6 +78,21 @@ for bootstrap_command in "${bootstrap_commands[@]}"; do
 	sh -n -c "$bootstrap_command"
 done
 
+grep -Fq \
+	'apk add --allow-untrusted --force-reinstall /tmp/luci-app-videoplayer-1.1.0.apk' \
+	"$root/README.md" || {
+	printf '%s\n' \
+		'README.md must force-reinstall the current local APK.' >&2
+	exit 1
+}
+grep -Fq \
+	'opkg --force-downgrade --force-reinstall install /tmp/luci-app-videoplayer_1.1.0_all.ipk' \
+	"$root/README.md" || {
+	printf '%s\n' \
+		'README.md must force-downgrade and force-reinstall the current local IPK.' >&2
+	exit 1
+}
+
 codec_installer_sha="$(
 	sha256sum "$root/scripts/install-codec-runtime.sh" |
 		awk '{ print $1 }'

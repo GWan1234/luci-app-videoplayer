@@ -617,8 +617,8 @@ def renderer_maintenance_enter_lines(action: str) -> list[str]:
         '[ "$(stat -c \'%u:%a\' "${renderer_helper}" 2>/dev/null)" = "0:755" ] || {',
         (
             'echo "Cannot enter renderer maintenance mode before '
-            f"{action} the codec runtime. Install luci-app-videoplayer 1.2.0 "
-            'or newer first." >&2'
+            f"{action} the codec runtime. Install the current verified "
+            'strict-maintenance application package first." >&2'
         ),
         "exit 1",
         "}",
@@ -631,8 +631,9 @@ def renderer_maintenance_enter_lines(action: str) -> list[str]:
         '[ "${maintenance_output}" = "${maintenance_expected}" ] || {',
         (
             'echo "Renderer maintenance mode is unavailable or returned an '
-            "invalid acknowledgement. Install luci-app-videoplayer 1.2.0 or "
-            'newer first; the codec runtime was not changed." >&2'
+            "invalid acknowledgement. Install the current verified "
+            "strict-maintenance application package first; the codec runtime "
+            'was not changed." >&2'
         ),
         "exit 1",
         "}",

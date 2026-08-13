@@ -112,7 +112,7 @@ enter_renderer_maintenance() {
 		printf '__VIDEOPLAYER_RC__%s' "$maintenance_status"
 	)"
 	[ "$maintenance_output" = "$(printf 'maintenance\n__VIDEOPLAYER_RC__0')" ] || {
-		echo "The installed renderer does not support strict maintenance. Upgrade with the verified 1.2.0 package before using the development uninstaller." >&2
+		echo "The installed renderer does not support strict maintenance. Install the current verified standalone application package before using the development uninstaller." >&2
 		return 1
 	}
 	"$renderer_helper" cleanup || {
@@ -407,7 +407,7 @@ enter_renderer_maintenance() {
 		printf '__VIDEOPLAYER_RC__%s' "$maintenance_status"
 	)"
 	[ "$maintenance_output" = "$(printf 'maintenance\n__VIDEOPLAYER_RC__0')" ] || {
-		echo "The installed renderer predates strict maintenance. Upgrade with the verified 1.2.0 package before using the development installer." >&2
+		echo "The installed renderer predates strict maintenance. Install the current verified standalone application package before using the development installer." >&2
 		return 1
 	}
 	"$renderer_helper" cleanup && maintenance_marker_is_safe || {
