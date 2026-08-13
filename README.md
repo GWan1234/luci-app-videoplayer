@@ -16,9 +16,9 @@ are therefore not claimed to be CPU-only. Playback stays inside LuCI and does
 not use the router's HDMI or framebuffer.
 
 Current source package version: **1.1.0**. The latest published GitHub release
-is still **1.0.0**. The release installer below remains pinned to that release,
-while a separate APK-only installer follows the latest successfully tested
-`main` source.
+is **1.1.0**. Its release installer installs the application and the exact
+architecture-specific private codec runtime together. A separate APK-only
+installer follows the latest successfully tested `main` source.
 
 ## Features
 
@@ -240,39 +240,48 @@ After preparing the storage, connect to the router over SSH as `root`. The
 router must have working HTTPS access to GitHub:
 
 ```sh
-(set -eu; installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-from-github.sh'); [ -s "$installer" ]; sh "$installer")
+(set -eu; expected='af67d1280ae2b48c57a90e498afc6409533829105875227a6537ce903dbfa1ca'; installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh'); [ -s "$installer" ]; actual="$(sha256sum "$installer")"; actual="${actual%% *}"; [ "$actual" = "$expected" ]; sh "$installer")
 ```
 
 This one-line bootstrap downloads the complete installer into a private,
-size-limited temporary file before executing it and removes that file on exit.
-It deliberately does not pipe partially downloaded network content into a
-shell.
+size-limited temporary file, verifies the installer itself against the pinned
+SHA-256 above, executes it only after the download is complete, and removes it
+on exit. It does not pipe a partial network response into a shell.
 
-The installer currently installs the latest published release, not the current
-strict-maintenance 1.1.0 source tree. It detects whether the router uses `apk`
-or `opkg`,
-downloads the matching
-1.0.0 package from
-[Release 1.0.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.0.0),
-verifies its pinned SHA-256 checksum, attempts to refresh the package indexes,
-and installs the package. The released APK is unsigned, so installation on
-OpenWrt 25.12+ uses `apk add --allow-untrusted`. Downloads are size-limited to
-protect the router's RAM-backed `/tmp` filesystem.
+The installer is pinned to
+[Release 1.1.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.1.0)
+and supports both package generations in that release:
 
-Release 1.0.0 remains browser-only and deliberately does not attempt to install
-the strict r5 codec runtime: its legacy helper cannot participate in the new
-fail-closed maintenance transaction. To migrate an existing APK installation
-and enable strict Router mode, use the current-`main` installer below. It
-installs the current 1.1.0 maintenance-capable application first and only then performs
-the architecture-specific codec transaction. On an `opkg` router, install the
-current 1.1.0 application IPK and matching r5 codec IPK in that same order using
-the prebuilt-package instructions below; the published 1.0.0 installer cannot
-enable strict Router mode there.
+- OpenWrt `25.12.5` revision `r33051-f5dae5ece4` with `apk`;
+- OpenWrt `24.10.8` revision `r29233-443ec4032a` with `opkg`.
+
+It reads the exact `DISTRIB_ARCH` from `/etc/openwrt_release`, downloads the
+release's pinned 71-entry codec manifest, verifies that manifest against a
+checksum embedded in the installer, and requires one exact release/revision/
+format/architecture match. It then downloads and verifies both the
+architecture-independent 1.1.0 application package and the matching
+6.1.4-r5 codec package before changing the router. The maintenance-capable
+application is installed first; only after that succeeds is the private codec
+runtime installed. The final step validates package registration, root-owned
+runtime metadata, executable safety, the native relay, and the renderer's exact
+software-only attestation.
+
+The application version `1.1.0` was also used by historical builds and is lower
+than a previously tested `1.2.0` source package. The installer therefore uses
+APK force-reinstall or IPK force-downgrade plus force-reinstall semantics rather
+than relying on normal version ordering. It refuses an already-installed APK
+when the router's `apk` implementation cannot perform a safe force-reinstall.
+The released APKs are unsigned and are installed with `--allow-untrusted`.
+Metadata, application, and codec downloads have separate bounded size limits
+to protect the router's RAM-backed `/tmp` filesystem. If application
+installation fails, the codec is not changed. If codec installation or final
+attestation fails, the command returns an error and Browser mode remains the
+recovery path.
 
 ### Current `main` APK (OpenWrt 25.12.5)
 
-To install the newest successfully tested `main` source instead of Release
-1.0.0, use the separate APK-only installer:
+To install the newest successfully tested `main` source instead of the fixed
+Release 1.1.0 package set, use the separate APK-only installer:
 
 ```sh
 (set -eu; installer="$(mktemp /tmp/install-videoplayer-main.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-main-apk.sh'); [ -s "$installer" ]; sh "$installer")
@@ -296,8 +305,8 @@ strict maintenance transaction. It refuses to proceed while a newer push is
 still being checked or if application verification fails. This path supports only `apk`; use
 the 1.1.0 application-plus-r5 local IPK procedure under
 **Installing a Prebuilt Local Package** on OpenWrt versions that still use
-`opkg`. The published-release installer above deliberately leaves those routers
-on browser-only 1.0.0.
+`opkg`. The published-release installer above supports both APK and IPK routers
+for the exact releases and revisions in Release 1.1.0.
 The current snapshot targets the exact OpenWrt 25.12.5 revision listed below
 and force-reinstalls the application when a newer snapshot still has the same
 package version, `1.1.0`. Because that number is also used by older builds and
@@ -318,9 +327,8 @@ folder. Other AArch64 routers may report `aarch64_cortex-a72`,
 `aarch64_cortex-a76`, or `aarch64_generic`; those are separate ABI folders
 with separately compiled codec binaries.
 
-The current-`main` installer performs this FFmpeg installation or update
-automatically after installing the maintenance-capable application. The
-browser-only 1.0.0 release installer deliberately does not. To
+Both the Release 1.1.0 installer and the current-`main` installer perform this
+FFmpeg installation after installing the maintenance-capable application. To
 install, update, or verify only the codec runtime independently, run:
 
 ```sh
@@ -781,6 +789,7 @@ openwrt-video-player/
 │   ├── install-from-github.sh
 │   ├── install-main-apk.sh
 │   ├── install-to-router.sh
+│   ├── release-1.1.0-codecs.tsv
 │   ├── verify_codec_package.py
 │   ├── verify-dist.py
 │   └── verify_packages.py

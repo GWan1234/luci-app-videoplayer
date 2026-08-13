@@ -10,6 +10,10 @@ fi
 
 root="$1"
 tmp="$(mktemp -d)"
+fail() {
+	printf '%s\n' "$*" >&2
+	exit 1
+}
 cleanup() {
 	rm -rf -- "$tmp"
 }
@@ -68,7 +72,7 @@ run_with_download_deadline \
 EOF
 
 mapfile -t bootstrap_commands < <(
-	grep -E '^\(set -eu; installer=' "$root/README.md"
+	grep -E '^\(set -eu; .*installer=' "$root/README.md"
 )
 if ((${#bootstrap_commands[@]} != 2)); then
 	printf 'README.md must contain exactly two one-line app installers.\n' >&2
@@ -130,15 +134,125 @@ if [[ ! "$codec_call_line" =~ ^[0-9]+$ ]] ||
 	exit 1
 fi
 
-if grep -Eq 'CODEC_INSTALLER|install-codec-runtime' \
-	"$root/scripts/install-from-github.sh"; then
-	printf '%s\n' \
-		'The browser-only 1.0.0 release installer must not attempt a strict r5 codec transaction.' >&2
-	exit 1
+python3 "$root/tests/release-installer.py" "$root"
+
+release_installer="$root/scripts/install-from-github.sh"
+release_installer_without_main="$tmp/install-from-github.without-main"
+sed '$d' "$release_installer" > "$release_installer_without_main"
+
+release_help="$(sh "$release_installer" --help)"
+grep -Fq 'Release 1.1.0' <<<"$release_help" ||
+	fail 'The release installer help does not identify Release 1.1.0.'
+grep -Fq '6.1.4-r5 software-CPU runtime' <<<"$release_help" ||
+	fail 'The release installer help does not identify the strict codec runtime.'
+grep -Fq 'OpenWrt 25.12.5 r33051-f5dae5ece4 (apk)' <<<"$release_help" ||
+	fail 'The release installer help omits its exact APK platform.'
+grep -Fq 'OpenWrt 24.10.8 r29233-443ec4032a (opkg)' <<<"$release_help" ||
+	fail 'The release installer help omits its exact IPK platform.'
+
+selected_apk="$tmp/selected-apk"
+sh -s -- "$release_installer_without_main" \
+	"$root/scripts/release-1.1.0-codecs.tsv" > "$selected_apk" <<'EOF'
+set -eu
+installer="$1"
+manifest="$2"
+# shellcheck disable=SC1090
+. "$installer"
+select_release_codec \
+	"$manifest" apk 25.12.5 r33051-f5dae5ece4 aarch64_cortex-a53
+printf '%s|%s|%s\n' \
+	"$CODEC_ASSET_FILE" "$CODEC_SHA256" "$CODEC_PACKAGE_FILE"
+EOF
+grep -Fx \
+	'luci-videoplayer-codec-runtime-6.1.4-r5_aarch64_cortex-a53.apk|2b04eeb65a9cece7dc4268ff6bccae0ae78bff783d355b37818096d8816d3436|luci-videoplayer-codec-runtime-6.1.4-r5.apk' \
+	"$selected_apk" >/dev/null ||
+	fail 'The release installer selected the wrong APK codec mapping.'
+
+selected_ipk="$tmp/selected-ipk"
+sh -s -- "$release_installer_without_main" \
+	"$root/scripts/release-1.1.0-codecs.tsv" > "$selected_ipk" <<'EOF'
+set -eu
+installer="$1"
+manifest="$2"
+# shellcheck disable=SC1090
+. "$installer"
+select_release_codec \
+	"$manifest" ipk 24.10.8 r29233-443ec4032a x86_64
+printf '%s|%s|%s\n' \
+	"$CODEC_ASSET_FILE" "$CODEC_SHA256" "$CODEC_PACKAGE_FILE"
+EOF
+grep -Fx \
+	'luci-videoplayer-codec-runtime_6.1.4-r5_x86_64.ipk|af21e9eab4761b2fb40ac043f0b60f5f1c727519f4cc61aa679bce3e9f7ca08b|luci-videoplayer-codec-runtime_6.1.4-r5_x86_64.ipk' \
+	"$selected_ipk" >/dev/null ||
+	fail 'The release installer selected the wrong IPK codec mapping.'
+
+duplicate_manifest="$tmp/duplicate-codec-manifest.tsv"
+{
+	grep '^#' "$root/scripts/release-1.1.0-codecs.tsv"
+	grep -F \
+		'apk|25.12.5|r33051-f5dae5ece4|aarch64_cortex-a53|' \
+		"$root/scripts/release-1.1.0-codecs.tsv"
+	grep -F \
+		'apk|25.12.5|r33051-f5dae5ece4|aarch64_cortex-a53|' \
+		"$root/scripts/release-1.1.0-codecs.tsv"
+} > "$duplicate_manifest"
+if sh -s -- "$release_installer_without_main" "$duplicate_manifest" \
+	>"$tmp/duplicate.stdout" 2>"$tmp/duplicate.stderr" <<'EOF'
+set -eu
+installer="$1"
+manifest="$2"
+# shellcheck disable=SC1090
+. "$installer"
+select_release_codec \
+	"$manifest" apk 25.12.5 r33051-f5dae5ece4 aarch64_cortex-a53
+EOF
+then
+	fail 'The release installer accepted an ambiguous codec mapping.'
 fi
-release_help="$(sh "$root/scripts/install-from-github.sh" --help)"
-grep -Fq 'browser-only' <<<"$release_help"
-grep -Fq 'does not install the strict CPU runtime' <<<"$release_help"
+grep -F 'No unique Release 1.1.0 codec exists' \
+	"$tmp/duplicate.stderr" >/dev/null ||
+	fail 'The ambiguous codec mapping returned the wrong error.'
+
+if sh -s -- "$release_installer_without_main" \
+	"$root/scripts/release-1.1.0-codecs.tsv" \
+	>"$tmp/unsupported.stdout" 2>"$tmp/unsupported.stderr" <<'EOF'
+set -eu
+installer="$1"
+manifest="$2"
+# shellcheck disable=SC1090
+. "$installer"
+select_release_codec \
+	"$manifest" apk 25.12.5 r33051-f5dae5ece4 unsupported_arch
+EOF
+then
+	fail 'The release installer accepted an unsupported architecture.'
+fi
+grep -F 'No unique Release 1.1.0 codec exists' \
+	"$tmp/unsupported.stderr" >/dev/null ||
+	fail 'The unsupported architecture returned the wrong error.'
+
+unsupported_format_manifest="$tmp/unsupported-format-manifest.tsv"
+cat > "$unsupported_format_manifest" <<'EOF'
+# test-only manifest
+tar|25.12.5|r33051-f5dae5ece4|x86_64|codec.tar|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|codec.tar
+EOF
+if sh -s -- "$release_installer_without_main" \
+	"$unsupported_format_manifest" \
+	>"$tmp/format.stdout" 2>"$tmp/format.stderr" <<'EOF'
+set -eu
+installer="$1"
+manifest="$2"
+# shellcheck disable=SC1090
+. "$installer"
+select_release_codec \
+	"$manifest" tar 25.12.5 r33051-f5dae5ece4 x86_64
+EOF
+then
+	fail 'The release installer accepted an unsupported package format.'
+fi
+grep -F 'Internal error: unsupported package format.' \
+	"$tmp/format.stderr" >/dev/null ||
+	fail 'The unsupported package format returned the wrong error.'
 
 main_installer="$root/scripts/install-main-apk.sh"
 main_installer_without_main="$tmp/install-main-apk.without-main"
@@ -339,6 +453,219 @@ if grep -Fx 'completed' "$tmp/apk-failed-add.stdout" >/dev/null; then
 	printf '%s\n' 'The installer reported completion after apk failed.' >&2
 	exit 1
 fi
+
+# These are literal source snippets; their dollar signs must not expand here.
+# shellcheck disable=SC2016
+release_app_apk_line="$(
+	grep -nF \
+		'if ! install_apk_package "$APP_INSTALL_MODE" "$APP_PACKAGE_PATH"; then' \
+		"$release_installer" | awk -F: 'NR == 1 { print $1 }'
+)"
+# shellcheck disable=SC2016
+release_codec_apk_line="$(
+	grep -nF \
+		'if ! install_apk_package "$CODEC_INSTALL_MODE" "$CODEC_PACKAGE_PATH"; then' \
+		"$release_installer" | awk -F: 'NR == 1 { print $1 }'
+)"
+# shellcheck disable=SC2016
+release_app_ipk_line="$(
+	grep -nF \
+		'opkg --force-downgrade --force-reinstall install "$APP_PACKAGE_PATH"' \
+		"$release_installer" | awk -F: 'NR == 1 { print $1 }'
+)"
+# shellcheck disable=SC2016
+release_codec_ipk_line="$(
+	grep -nF \
+		'opkg --force-downgrade --force-reinstall install "$CODEC_PACKAGE_PATH"' \
+		"$release_installer" | awk -F: 'NR == 1 { print $1 }'
+)"
+# shellcheck disable=SC2016
+mapfile -t release_app_registration_lines < <(
+	grep -nFx '		verify_registered_package "$APP_PACKAGE_NAME"' \
+		"$release_installer" | awk -F: '{ print $1 }'
+)
+# shellcheck disable=SC2016
+release_codec_registration_line="$(
+	grep -nFx 'verify_registered_package "$CODEC_PACKAGE_NAME"' \
+		"$release_installer" | awk -F: 'NR == 1 { print $1 }'
+)"
+release_attestation_line="$(
+	grep -nFx 'verify_installed_runtime' "$release_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
+if [[ ! "$release_app_apk_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$release_codec_apk_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$release_app_ipk_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$release_codec_ipk_line" =~ ^[0-9]+$ ]] ||
+	((${#release_app_registration_lines[@]} != 2)) ||
+	[[ ! "$release_codec_registration_line" =~ ^[0-9]+$ ]] ||
+	[[ ! "$release_attestation_line" =~ ^[0-9]+$ ]] ||
+	((release_app_apk_line >= release_app_registration_lines[0])) ||
+	((release_app_registration_lines[0] >= release_codec_apk_line)) ||
+	((release_app_ipk_line >= release_app_registration_lines[1])) ||
+	((release_app_registration_lines[1] >= release_codec_ipk_line)) ||
+	((release_codec_apk_line >= release_codec_registration_line)) ||
+	((release_codec_ipk_line >= release_codec_registration_line)) ||
+	((release_codec_registration_line >= release_attestation_line)); then
+	fail 'The release installer no longer installs and registers the application before the codec runtime and final attestation.'
+fi
+
+release_fake_apk_bin="$tmp/release-fake-apk-bin"
+mkdir "$release_fake_apk_bin"
+cat > "$release_fake_apk_bin/apk" <<'EOF'
+#!/bin/sh
+set -u
+: "${APK_TEST_LOG:?}"
+printf '%s\n' "$*" >> "$APK_TEST_LOG"
+
+if [ "$#" -eq 3 ] && [ "$1" = add ] &&
+	[ "$2" = --force-reinstall ] && [ "$3" = --help ]; then
+	[ "${APK_TEST_FORCE_SUPPORTED:-0}" = "1" ]
+	exit
+fi
+if [ "$#" -eq 3 ] && [ "$1" = info ] && [ "$2" = -e ]; then
+	case ",${APK_TEST_INSTALLED_NAMES:-}," in
+		*,"$3",*) exit 0 ;;
+		*) exit 1 ;;
+	esac
+fi
+if [ "${1:-}" = add ]; then
+	exit "${APK_TEST_ADD_STATUS:-0}"
+fi
+exit 99
+EOF
+chmod 0755 "$release_fake_apk_bin/apk"
+
+cat > "$tmp/probe-release-apk-install.sh" <<'EOF'
+#!/bin/sh
+set -eu
+installer="$1"
+# shellcheck disable=SC1090
+. "$installer"
+APK_FORCE_REINSTALL_SUPPORTED="${APK_TEST_FORCE_SUPPORTED:-0}"
+app_mode="$(select_apk_install_mode luci-app-videoplayer)"
+codec_mode="$(select_apk_install_mode luci-videoplayer-codec-runtime)"
+printf 'modes=%s,%s\n' "$app_mode" "$codec_mode"
+install_apk_package "$app_mode" /tmp/release-app.apk
+install_apk_package "$codec_mode" /tmp/release-codec.apk
+printf '%s\n' completed
+EOF
+chmod 0755 "$tmp/probe-release-apk-install.sh"
+
+release_force_log="$tmp/release-apk-force.log"
+release_force_output="$(
+	env PATH="$release_fake_apk_bin:$PATH" \
+		APK_TEST_LOG="$release_force_log" \
+		APK_TEST_FORCE_SUPPORTED=1 \
+		sh "$tmp/probe-release-apk-install.sh" \
+		"$release_installer_without_main"
+)"
+mapfile -t release_force_calls < "$release_force_log"
+if [[ "$release_force_output" != $'modes=force,force\ncompleted' ]] ||
+	((${#release_force_calls[@]} != 2)) ||
+	[[ "${release_force_calls[0]:-}" != \
+		'add --allow-untrusted --force-reinstall /tmp/release-app.apk' ]] ||
+	[[ "${release_force_calls[1]:-}" != \
+		'add --allow-untrusted --force-reinstall /tmp/release-codec.apk' ]]; then
+	fail 'The release installer does not force-reinstall both APK packages in application-first order.'
+fi
+
+release_plain_log="$tmp/release-apk-plain.log"
+release_plain_output="$(
+	env PATH="$release_fake_apk_bin:$PATH" \
+		APK_TEST_LOG="$release_plain_log" \
+		APK_TEST_FORCE_SUPPORTED=0 \
+		APK_TEST_INSTALLED_NAMES= \
+		sh "$tmp/probe-release-apk-install.sh" \
+		"$release_installer_without_main"
+)"
+mapfile -t release_plain_calls < "$release_plain_log"
+if [[ "$release_plain_output" != $'modes=plain,plain\ncompleted' ]] ||
+	((${#release_plain_calls[@]} != 4)) ||
+	[[ "${release_plain_calls[0]:-}" != 'info -e luci-app-videoplayer' ]] ||
+	[[ "${release_plain_calls[1]:-}" != \
+		'info -e luci-videoplayer-codec-runtime' ]] ||
+	[[ "${release_plain_calls[2]:-}" != \
+		'add --allow-untrusted /tmp/release-app.apk' ]] ||
+	[[ "${release_plain_calls[3]:-}" != \
+		'add --allow-untrusted /tmp/release-codec.apk' ]]; then
+	fail 'The release installer broke first installation with legacy apk.'
+fi
+
+for installed_package in \
+	luci-app-videoplayer \
+	luci-videoplayer-codec-runtime
+do
+	installed_package_log="$tmp/release-${installed_package}.log"
+	if env PATH="$release_fake_apk_bin:$PATH" \
+		APK_TEST_LOG="$installed_package_log" \
+		APK_TEST_FORCE_SUPPORTED=0 \
+		APK_TEST_INSTALLED_NAMES="$installed_package" \
+		sh "$tmp/probe-release-apk-install.sh" \
+		"$release_installer_without_main" \
+		>"$tmp/release-installed.stdout" \
+		2>"$tmp/release-installed.stderr"; then
+		fail "The release installer accepted unsafe legacy-apk replacement of $installed_package."
+	fi
+	grep -F "cannot safely reinstall $installed_package" \
+		"$tmp/release-installed.stderr" >/dev/null ||
+		fail "The legacy-apk refusal for $installed_package returned the wrong error."
+	if grep -F 'add --allow-untrusted' "$installed_package_log" >/dev/null; then
+		fail "The legacy-apk refusal attempted to install before rejecting $installed_package."
+	fi
+done
+
+# `stat` is supplied by the application's coreutils-stat dependency on minimal
+# supported OpenWrt images, so the installer must not require it before the
+# application transaction. It must require it before installing the codec.
+initial_command_loop="$(
+	sed -n '/^for required_command in /,/^done$/p' "$release_installer"
+)"
+if grep -Eq '(^|[[:space:]])stat([[:space:]]|$)' <<<"$initial_command_loop"; then
+	fail 'The release installer requires coreutils-stat before dependencies can be installed.'
+fi
+mapfile -t release_post_app_lines < <(
+	grep -nFx $'\t\trequire_post_app_commands' "$release_installer" |
+		awk -F: '{ print $1 }'
+)
+if ((${#release_post_app_lines[@]} != 2)) ||
+	((release_post_app_lines[0] <= release_app_registration_lines[0])) ||
+	((release_post_app_lines[0] >= release_codec_apk_line)) ||
+	((release_post_app_lines[1] <= release_app_registration_lines[1])) ||
+	((release_post_app_lines[1] >= release_codec_ipk_line)); then
+	fail 'The release installer does not validate coreutils-stat between the application and codec transactions.'
+fi
+
+missing_stat_bin="$tmp/release-missing-stat-bin"
+mkdir "$missing_stat_bin"
+if env PATH="$missing_stat_bin" /bin/sh -s -- \
+	"$release_installer_without_main" \
+	>"$tmp/missing-stat.stdout" 2>"$tmp/missing-stat.stderr" <<'EOF'
+set -eu
+installer="$1"
+# shellcheck disable=SC1090
+. "$installer"
+require_post_app_commands
+EOF
+then
+	fail 'The release installer accepted a missing post-application stat dependency.'
+fi
+grep -F 'did not provide its required coreutils-stat dependency' \
+	"$tmp/missing-stat.stderr" >/dev/null ||
+	fail 'The missing coreutils-stat dependency returned the wrong error.'
+cat > "$missing_stat_bin/stat" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 0755 "$missing_stat_bin/stat"
+env PATH="$missing_stat_bin" /bin/sh -s -- \
+	"$release_installer_without_main" <<'EOF'
+set -eu
+installer="$1"
+# shellcheck disable=SC1090
+. "$installer"
+require_post_app_commands
+EOF
 
 for specification in \
 	"scripts/install-from-github.sh|Usage: sh install-from-github.sh" \

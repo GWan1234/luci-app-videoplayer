@@ -42,6 +42,7 @@ jobs:
               Path("scripts/verify-dist.py"),
               Path("scripts/verify_packages.py"),
               Path("tests/codec-attestation.py"),
+              Path("tests/release-installer.py"),
           ):
               compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
