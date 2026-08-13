@@ -139,7 +139,81 @@ verify_sha256() {
 
 read_release_value() {
 	release_key="$1"
-	sed -n "s/^${release_key}='\([^']*\)'$/\1/p" /etc/openwrt_release
+	release_file="${2:-/etc/openwrt_release}"
+	sed -n "s/^${release_key}='\([^']*\)'$/\1/p" "$release_file"
+}
+
+read_apk_architecture_file() {
+	apk_architecture_path="$1"
+	[ -r "$apk_architecture_path" ] || return 1
+
+	while IFS= read -r apk_architecture_line ||
+		[ -n "$apk_architecture_line" ]; do
+		apk_architecture_line="$(
+			printf '%s\n' "$apk_architecture_line" |
+				sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+		)"
+		[ -n "$apk_architecture_line" ] || continue
+		printf '%s\n' "$apk_architecture_line"
+		return 0
+	done < "$apk_architecture_path"
+	return 1
+}
+
+verify_package_manager_architecture() {
+	architecture_format="$1"
+	wanted_architecture="$2"
+	apk_arch_file="${3:-/etc/apk/arch}"
+
+	case "$architecture_format" in
+		apk)
+			native_architecture="$(read_apk_architecture_file "$apk_arch_file")" ||
+				die "Could not read the APK package architecture from $apk_arch_file."
+			[ "$native_architecture" = "$wanted_architecture" ] ||
+				die "OpenWrt architecture metadata '$wanted_architecture' does not match the APK package architecture '$native_architecture'."
+			;;
+		ipk)
+			opkg_architectures="$(LC_ALL=C opkg print-architecture 2>/dev/null)" ||
+				die "Could not read the opkg package architectures."
+			opkg_architecture_matches="0"
+			while IFS=' ' read -r \
+				opkg_arch_keyword opkg_arch_name opkg_arch_priority opkg_arch_extra
+			do
+				[ "$opkg_arch_keyword" = "arch" ] || continue
+				[ "$opkg_arch_name" = "$wanted_architecture" ] || continue
+				[ -z "$opkg_arch_extra" ] ||
+					die "opkg returned malformed package architecture metadata."
+				case "$opkg_arch_priority" in
+					''|*[!0-9]*)
+						die "opkg returned malformed package architecture metadata."
+						;;
+				esac
+				[ "$opkg_arch_priority" -gt 0 ] ||
+					die "opkg returned a non-positive priority for architecture '$wanted_architecture'."
+				opkg_architecture_matches=$((opkg_architecture_matches + 1))
+			done <<EOF
+$opkg_architectures
+EOF
+			[ "$opkg_architecture_matches" -eq 1 ] ||
+				die "OpenWrt architecture metadata '$wanted_architecture' is not uniquely enabled in opkg."
+			;;
+		*)
+			die "Internal error: unsupported package format."
+			;;
+	esac
+}
+
+require_supported_platform() {
+	platform_format="$1"
+	platform_release="$2"
+	platform_revision="$3"
+	case "$platform_format|$platform_release|$platform_revision" in
+		'apk|25.12.5|r33051-f5dae5ece4'|\
+		'ipk|24.10.8|r29233-443ec4032a')
+			return 0
+			;;
+	esac
+	die "Release $RELEASE_VERSION does not provide packages for OpenWrt $platform_release $platform_revision with $platform_format."
 }
 
 require_safe_component() {
@@ -428,6 +502,10 @@ DISTRIB_ARCH_VALUE="$(read_release_value DISTRIB_ARCH)"
 require_safe_component "release" "$DISTRIB_RELEASE_VALUE"
 require_safe_component "revision" "$DISTRIB_REVISION_VALUE"
 require_safe_component "package architecture" "$DISTRIB_ARCH_VALUE"
+verify_package_manager_architecture \
+	"$PACKAGE_FORMAT" "$DISTRIB_ARCH_VALUE"
+require_supported_platform \
+	"$PACKAGE_FORMAT" "$DISTRIB_RELEASE_VALUE" "$DISTRIB_REVISION_VALUE"
 
 umask 077
 WORK_DIR="$(mktemp -d /tmp/luci-app-videoplayer-release.XXXXXX)" ||

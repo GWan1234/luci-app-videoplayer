@@ -259,8 +259,14 @@ and supports both package generations in that release:
 - OpenWrt `25.12.5` revision `r33051-f5dae5ece4` with `apk`;
 - OpenWrt `24.10.8` revision `r29233-443ec4032a` with `opkg`.
 
-It reads the exact `DISTRIB_ARCH` from `/etc/openwrt_release`, downloads the
-release's pinned 71-entry codec manifest, verifies that manifest against a
+It reads the exact package ABI from `DISTRIB_ARCH` in `/etc/openwrt_release`
+and corroborates it with the package database before any download:
+the primary `/etc/apk/arch` entry for APK, or one unique positive-priority
+entry from `opkg print-architecture` for IPK. It deliberately does not infer
+the package ABI from `uname -m` or normalize architecture aliases, because
+OpenWrt distinguishes optimized ABIs such as `aarch64_cortex-a53` from generic
+CPU-family names. The installer then downloads the release's pinned 71-entry
+codec manifest, verifies that manifest against a
 checksum embedded in the installer, and requires one exact release/revision/
 format/architecture match. It then downloads and verifies both the
 architecture-independent 1.1.0 application package and the matching
@@ -299,7 +305,8 @@ rebuilds the current source package and publishes the architecture-scoped
 `dist/` index, packages, SHA-256 values, and exact source commit to the
 generated `snapshot` branch. The installer resolves that branch immutably,
 matches the router's exact release, revision, and `DISTRIB_ARCH`, validates the
-indexed path and checksum, and confirms that the source commit still equals
+native APK package ABI, indexed path, and checksum, and confirms that the
+source commit still equals
 the current head of `main`. The installer checks the head of `main` again
 immediately before replacing the application package. Only after the verified
 1.1.0 maintenance helper is installed does it install or update the matching
@@ -352,7 +359,9 @@ install, update, or verify only the codec runtime independently, run:
 ```
 
 The installer detects `apk` or `opkg`, reads `DISTRIB_RELEASE`,
-`DISTRIB_REVISION`, and `DISTRIB_ARCH`, and selects exactly one entry from the
+`DISTRIB_REVISION`, and `DISTRIB_ARCH`, corroborates the native package ABI
+with `/etc/apk/arch` or `opkg print-architecture`, and selects exactly one
+entry from the
 immutable `codec-snapshot` index. It rejects malformed metadata, unknown
 architectures, mismatched revisions, duplicate entries, unexpected paths, and
 checksum failures before installation. It compares the installed and published

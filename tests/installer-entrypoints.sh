@@ -71,6 +71,78 @@ run_with_download_deadline \
 	/bin/sh -c 'printf deadline > "$1"' sh "$deadline_marker"
 EOF
 
+cat > "$tmp/probe-apk-architecture.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+wanted_architecture="$2"
+apk_arch_file="$3"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+verify_apk_architecture "$wanted_architecture" "$apk_arch_file"
+EOF
+
+cat > "$tmp/probe-package-architecture.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+package_format="$2"
+wanted_architecture="$3"
+apk_arch_file="$4"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+verify_package_manager_architecture \
+	"$package_format" "$wanted_architecture" "$apk_arch_file"
+EOF
+
+cat > "$tmp/probe-release-value.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+release_file="$2"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+read_release_value DISTRIB_ARCH "$release_file"
+EOF
+
+cat > "$tmp/probe-supported-platform.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+platform_kind="$2"
+platform_format="$3"
+platform_release="$4"
+platform_revision="$5"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+case "$platform_kind" in
+	main)
+		require_supported_apk_platform \
+			"$platform_release" "$platform_revision"
+		;;
+	release|codec)
+		require_supported_platform \
+			"$platform_format" "$platform_release" "$platform_revision"
+		;;
+	*) exit 2 ;;
+esac
+EOF
+
+architecture_test_bin="$tmp/architecture-test-bin"
+mkdir "$architecture_test_bin"
+cat > "$architecture_test_bin/opkg" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 1 ] && [ "$1" = print-architecture ]
+: "${OPKG_ARCHITECTURES_FILE:?}"
+cat "$OPKG_ARCHITECTURES_FILE"
+EOF
+chmod 0755 "$architecture_test_bin/opkg"
+
 expected_release_bootstrap='sh <(wget -O - https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh)'
 expected_main_bootstrap='sh <(wget -O - https://raw.githubusercontent.com/communism420/luci-app-videoplayer/refs/heads/main/scripts/install-main-apk.sh)'
 mapfile -t bootstrap_commands < <(
@@ -165,9 +237,105 @@ fi
 
 python3 "$root/tests/release-installer.py" "$root"
 
+for architecture_installer in \
+	scripts/install-from-github.sh \
+	scripts/install-main-apk.sh \
+	scripts/install-codec-runtime.sh
+do
+	if grep -F -- '--print-arch' "$root/$architecture_installer" >/dev/null ||
+		grep -F 'uname -m' "$root/$architecture_installer" >/dev/null; then
+		fail "$architecture_installer uses a CPU-family value instead of the OpenWrt package ABI."
+	fi
+done
+
+architecture_helper_reference="$tmp/architecture-helper-reference"
+sed -n \
+	'/^read_release_value() {/,/^require_supported_platform() {/p' \
+	"$root/scripts/install-from-github.sh" | sed '$d' \
+	> "$architecture_helper_reference"
+architecture_helper_candidate="$tmp/install-codec-runtime.sh.architecture-helper"
+sed -n \
+	'/^read_release_value() {/,/^require_supported_platform() {/p' \
+	"$root/scripts/install-codec-runtime.sh" | sed '$d' \
+	> "$architecture_helper_candidate"
+cmp -s "$architecture_helper_reference" "$architecture_helper_candidate" ||
+	fail 'scripts/install-codec-runtime.sh architecture helpers drifted from the release installer.'
+
 release_installer="$root/scripts/install-from-github.sh"
 release_installer_without_main="$tmp/install-from-github.without-main"
 sed '$d' "$release_installer" > "$release_installer_without_main"
+
+canonical_release_file="$tmp/openwrt-release-canonical"
+cat > "$canonical_release_file" <<'EOF'
+DISTRIB_ID='OpenWrt'
+DISTRIB_RELEASE='25.12.5'
+DISTRIB_REVISION='r33051-f5dae5ece4'
+DISTRIB_ARCH='aarch64_cortex-a53'
+EOF
+[[ "$(sh "$tmp/probe-release-value.sh" \
+	"$release_installer_without_main" "$canonical_release_file")" == \
+	'aarch64_cortex-a53' ]] ||
+	fail 'The release installer did not parse canonical OpenWrt architecture metadata.'
+
+apk_arch_file="$tmp/apk-arch"
+printf '%s\n' 'aarch64_cortex-a53' > "$apk_arch_file"
+sh "$tmp/probe-package-architecture.sh" \
+	"$release_installer_without_main" apk aarch64_cortex-a53 "$apk_arch_file"
+sh "$tmp/probe-supported-platform.sh" \
+	"$release_installer_without_main" release apk \
+	25.12.5 r33051-f5dae5ece4
+sh "$tmp/probe-supported-platform.sh" \
+	"$release_installer_without_main" release ipk \
+	24.10.8 r29233-443ec4032a
+if sh "$tmp/probe-supported-platform.sh" \
+	"$release_installer_without_main" release apk \
+	24.10.8 r29233-443ec4032a \
+	>"$tmp/release-platform-mismatch.stdout" \
+	2>"$tmp/release-platform-mismatch.stderr"; then
+	fail 'The release installer accepted an unsupported manager/release pair.'
+fi
+if sh "$tmp/probe-package-architecture.sh" \
+	"$release_installer_without_main" apk aarch64_generic "$apk_arch_file" \
+	>"$tmp/apk-arch-mismatch.stdout" 2>"$tmp/apk-arch-mismatch.stderr"; then
+	fail 'The release installer accepted mismatched APK architecture metadata.'
+fi
+grep -F 'does not match the APK package architecture' \
+	"$tmp/apk-arch-mismatch.stderr" >/dev/null ||
+	fail 'The APK architecture mismatch returned the wrong error.'
+printf '%s\n' '' '  aarch64_cortex-a53  ' 'aarch64_generic' > "$apk_arch_file"
+sh "$tmp/probe-package-architecture.sh" \
+	"$release_installer_without_main" apk aarch64_cortex-a53 "$apk_arch_file" ||
+	fail 'The release installer did not use the primary APK architecture.'
+
+opkg_architectures_file="$tmp/opkg-architectures"
+printf '%s\n' \
+	'arch all 1' \
+	'arch noarch 1' \
+	'arch mipsel_24kc 10' > "$opkg_architectures_file"
+PATH="$architecture_test_bin:$PATH" \
+	OPKG_ARCHITECTURES_FILE="$opkg_architectures_file" \
+	sh "$tmp/probe-package-architecture.sh" \
+		"$release_installer_without_main" ipk mipsel_24kc /unused
+if PATH="$architecture_test_bin:$PATH" \
+	OPKG_ARCHITECTURES_FILE="$opkg_architectures_file" \
+	sh "$tmp/probe-package-architecture.sh" \
+		"$release_installer_without_main" ipk mips_24kc /unused \
+	>"$tmp/opkg-arch-mismatch.stdout" 2>"$tmp/opkg-arch-mismatch.stderr"; then
+	fail 'The release installer accepted an architecture absent from opkg.'
+fi
+grep -F 'is not uniquely enabled in opkg' \
+	"$tmp/opkg-arch-mismatch.stderr" >/dev/null ||
+	fail 'The opkg architecture mismatch returned the wrong error.'
+printf '%s\n' \
+	'arch mipsel_24kc 10' \
+	'arch mipsel_24kc 20' > "$opkg_architectures_file"
+if PATH="$architecture_test_bin:$PATH" \
+	OPKG_ARCHITECTURES_FILE="$opkg_architectures_file" \
+	sh "$tmp/probe-package-architecture.sh" \
+		"$release_installer_without_main" ipk mipsel_24kc /unused \
+	>"$tmp/opkg-arch-duplicate.stdout" 2>"$tmp/opkg-arch-duplicate.stderr"; then
+	fail 'The release installer accepted duplicate opkg architecture entries.'
+fi
 
 release_help="$(sh "$release_installer" --help)"
 grep -Fq 'Release 1.1.0' <<<"$release_help" ||
@@ -214,6 +382,40 @@ grep -Fx \
 	'luci-videoplayer-codec-runtime_6.1.4-r5_x86_64.ipk|af21e9eab4761b2fb40ac043f0b60f5f1c727519f4cc61aa679bce3e9f7ca08b|luci-videoplayer-codec-runtime_6.1.4-r5_x86_64.ipk' \
 	"$selected_ipk" >/dev/null ||
 	fail 'The release installer selected the wrong IPK codec mapping.'
+
+sh -s -- \
+	"$release_installer_without_main" \
+	"$root/scripts/release-1.1.0-codecs.tsv" \
+	"$tmp/single-codec-row.tsv" <<'EOF'
+set -eu
+installer="$1"
+manifest="$2"
+single_row_manifest="$3"
+# shellcheck disable=SC1090
+. "$installer"
+checked_rows="0"
+while IFS='|' read -r \
+	expected_format expected_release expected_revision expected_arch \
+	expected_asset expected_row_sha256 expected_package expected_extra
+do
+	case "$expected_format" in
+		\#*|"") continue ;;
+	esac
+	[ -z "$expected_extra" ]
+	printf '%s|%s|%s|%s|%s|%s|%s\n' \
+		"$expected_format" "$expected_release" "$expected_revision" \
+		"$expected_arch" "$expected_asset" "$expected_row_sha256" \
+		"$expected_package" > "$single_row_manifest"
+	select_release_codec \
+		"$single_row_manifest" "$expected_format" "$expected_release" \
+		"$expected_revision" "$expected_arch"
+	[ "$CODEC_ASSET_FILE" = "$expected_asset" ]
+	[ "$CODEC_SHA256" = "$expected_row_sha256" ]
+	[ "$CODEC_PACKAGE_FILE" = "$expected_package" ]
+	checked_rows=$((checked_rows + 1))
+done < "$manifest"
+[ "$checked_rows" -eq 71 ]
+EOF
 
 duplicate_manifest="$tmp/duplicate-codec-manifest.tsv"
 {
@@ -286,6 +488,44 @@ grep -F 'Internal error: unsupported package format.' \
 main_installer="$root/scripts/install-main-apk.sh"
 main_installer_without_main="$tmp/install-main-apk.without-main"
 sed '$d' "$main_installer" > "$main_installer_without_main"
+[[ "$(sh "$tmp/probe-release-value.sh" \
+	"$main_installer_without_main" "$canonical_release_file")" == \
+	'aarch64_cortex-a53' ]] ||
+	fail 'The current-main installer did not parse canonical OpenWrt architecture metadata.'
+release_execution_marker="$tmp/openwrt-release-executed"
+noncanonical_release_file="$tmp/openwrt-release-noncanonical"
+# shellcheck disable=SC2016
+printf '%s\n' \
+	'DISTRIB_ARCH="$(touch '"$release_execution_marker"')"' \
+	> "$noncanonical_release_file"
+[[ -z "$(sh "$tmp/probe-release-value.sh" \
+	"$main_installer_without_main" "$noncanonical_release_file")" ]] ||
+	fail 'The current-main installer parsed noncanonical architecture metadata.'
+[[ ! -e "$release_execution_marker" ]] ||
+	fail 'The current-main installer executed OpenWrt release metadata.'
+printf '%s\n' '' '  aarch64_cortex-a53  ' 'aarch64_generic' > "$apk_arch_file"
+sh "$tmp/probe-apk-architecture.sh" \
+	"$main_installer_without_main" aarch64_cortex-a53 "$apk_arch_file" ||
+	fail 'The current-main installer did not use the primary APK architecture.'
+sh "$tmp/probe-supported-platform.sh" \
+	"$main_installer_without_main" main apk \
+	25.12.5 r33051-f5dae5ece4
+if sh "$tmp/probe-supported-platform.sh" \
+	"$main_installer_without_main" main apk \
+	24.10.8 r29233-443ec4032a \
+	>"$tmp/main-platform-mismatch.stdout" \
+	2>"$tmp/main-platform-mismatch.stderr"; then
+	fail 'The current-main installer accepted an unsupported OpenWrt release.'
+fi
+if sh "$tmp/probe-apk-architecture.sh" \
+	"$main_installer_without_main" aarch64_generic "$apk_arch_file" \
+	>"$tmp/main-apk-arch-mismatch.stdout" \
+	2>"$tmp/main-apk-arch-mismatch.stderr"; then
+	fail 'The current-main installer accepted mismatched APK architecture metadata.'
+fi
+grep -F 'does not match the APK package architecture' \
+	"$tmp/main-apk-arch-mismatch.stderr" >/dev/null ||
+	fail 'The current-main architecture mismatch returned the wrong error.'
 current_commit="1111111111111111111111111111111111111111"
 stale_commit="2222222222222222222222222222222222222222"
 sh -s -- "$main_installer_without_main" "$current_commit" <<'EOF'
@@ -798,6 +1038,30 @@ printf '%s\n' "$main_help" | grep -Fq 'current main branch first' ||
 codec_installer_without_main="$tmp/install-codec-runtime.without-main"
 sed '$d' "$root/scripts/install-codec-runtime.sh" \
 	> "$codec_installer_without_main"
+[[ "$(sh "$tmp/probe-release-value.sh" \
+	"$codec_installer_without_main" "$canonical_release_file")" == \
+	'aarch64_cortex-a53' ]] ||
+	fail 'The codec installer did not parse canonical OpenWrt architecture metadata.'
+printf '%s\n' '' '  aarch64_cortex-a53  ' 'aarch64_generic' > "$apk_arch_file"
+sh "$tmp/probe-package-architecture.sh" \
+	"$codec_installer_without_main" apk aarch64_cortex-a53 "$apk_arch_file" ||
+	fail 'The codec installer did not use the primary APK architecture.'
+sh "$tmp/probe-supported-platform.sh" \
+	"$codec_installer_without_main" codec ipk \
+	24.10.8 r29233-443ec4032a
+if sh "$tmp/probe-supported-platform.sh" \
+	"$codec_installer_without_main" codec ipk \
+	25.12.5 r33051-f5dae5ece4 \
+	>"$tmp/codec-platform-mismatch.stdout" \
+	2>"$tmp/codec-platform-mismatch.stderr"; then
+	fail 'The codec installer accepted an unsupported manager/release pair.'
+fi
+if sh "$tmp/probe-package-architecture.sh" \
+	"$codec_installer_without_main" apk aarch64_generic "$apk_arch_file" \
+	>"$tmp/codec-apk-arch-mismatch.stdout" \
+	2>"$tmp/codec-apk-arch-mismatch.stderr"; then
+	fail 'The codec installer accepted mismatched APK architecture metadata.'
+fi
 for action_case in \
 	"<|0|upgrade" \
 	"<|1|upgrade" \

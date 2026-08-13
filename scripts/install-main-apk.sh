@@ -12,7 +12,7 @@ APP_VERSION="1.1.0"
 SNAPSHOT_APK="luci-app-videoplayer-$APP_VERSION.apk"
 SNAPSHOT_INDEX="INDEX.tsv"
 CODEC_INSTALLER_OBJECT="scripts/install-codec-runtime.sh"
-CODEC_INSTALLER_SHA256="4a6e08a833e7acf7c0ec462d33043eb25161e3b441bfc9009cf58814b1187c99"
+CODEC_INSTALLER_SHA256="a5f3b50310e7551958158fcc9b84d69c984e94194c7718321f6c01be21224dab"
 API_BASE_URL="https://api.github.com/repos/$REPOSITORY"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
@@ -183,6 +183,43 @@ verify_sha256() {
 		die "The downloaded $description failed SHA-256 verification."
 }
 
+read_release_value() {
+	release_key="$1"
+	release_file="${2:-/etc/openwrt_release}"
+	sed -n "s/^${release_key}='\([^']*\)'$/\1/p" "$release_file"
+}
+
+read_apk_architecture_file() {
+	apk_architecture_path="$1"
+	[ -r "$apk_architecture_path" ] || return 1
+
+	while IFS= read -r apk_architecture_line ||
+		[ -n "$apk_architecture_line" ]; do
+		apk_architecture_line="$(
+			printf '%s\n' "$apk_architecture_line" |
+				sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+		)"
+		[ -n "$apk_architecture_line" ] || continue
+		printf '%s\n' "$apk_architecture_line"
+		return 0
+	done < "$apk_architecture_path"
+	return 1
+}
+
+verify_apk_architecture() {
+	wanted_architecture="$1"
+	apk_arch_file="${2:-/etc/apk/arch}"
+	native_architecture="$(read_apk_architecture_file "$apk_arch_file")" ||
+		die "Could not read the APK package architecture from $apk_arch_file."
+	[ "$native_architecture" = "$wanted_architecture" ] ||
+		die "OpenWrt architecture metadata '$wanted_architecture' does not match the APK package architecture '$native_architecture'."
+}
+
+require_supported_apk_platform() {
+	[ "$1" = "25.12.5" ] && [ "$2" = "r33051-f5dae5ece4" ] ||
+		die "No current-main APK is published for OpenWrt $1 $2."
+}
+
 require_current_snapshot() {
 	[ "$1" = "$2" ] ||
 		die "The verified APK does not match current main. Wait for the package checks and retry."
@@ -267,18 +304,19 @@ command -v sha256sum >/dev/null 2>&1 ||
 	die "The sha256sum command is required to verify the package."
 command -v mktemp >/dev/null 2>&1 ||
 	die "The mktemp command is required."
+command -v sed >/dev/null 2>&1 ||
+	die "The sed command is required."
 command -v tr >/dev/null 2>&1 ||
 	die "The tr command is required."
 command -v wc >/dev/null 2>&1 ||
 	die "The wc command is required."
 detect_working_timeout
 
-# shellcheck disable=SC1091
-. /etc/openwrt_release
-OPENWRT_RELEASE="${DISTRIB_RELEASE:-}"
-OPENWRT_REVISION="${DISTRIB_REVISION:-}"
-OPENWRT_ARCH="${DISTRIB_ARCH:-}"
-[ "${DISTRIB_ID:-}" = "OpenWrt" ] ||
+OPENWRT_ID="$(read_release_value DISTRIB_ID)"
+OPENWRT_RELEASE="$(read_release_value DISTRIB_RELEASE)"
+OPENWRT_REVISION="$(read_release_value DISTRIB_REVISION)"
+OPENWRT_ARCH="$(read_release_value DISTRIB_ARCH)"
+[ "$OPENWRT_ID" = "OpenWrt" ] ||
 	die "This installer supports OpenWrt only."
 for field in "$OPENWRT_RELEASE" "$OPENWRT_REVISION" "$OPENWRT_ARCH"; do
 	case "$field" in
@@ -287,6 +325,8 @@ for field in "$OPENWRT_RELEASE" "$OPENWRT_REVISION" "$OPENWRT_ARCH"; do
 			;;
 	esac
 done
+verify_apk_architecture "$OPENWRT_ARCH"
+require_supported_apk_platform "$OPENWRT_RELEASE" "$OPENWRT_REVISION"
 
 umask 077
 WORK_DIR="$(mktemp -d /tmp/luci-app-videoplayer-main.XXXXXX)" ||
