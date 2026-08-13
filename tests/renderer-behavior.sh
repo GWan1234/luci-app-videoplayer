@@ -137,6 +137,7 @@ cleanup() {
 		"${worker2:-}" "${ffmpeg2:-}" "${chunker2:-}" \
 		"${finite_worker:-}" "${finite_ffmpeg:-}" \
 		"${finite_media_worker:-}" "${finite_audio_cgi:-}" \
+		"${missing_audio_state_worker:-}" \
 		"${long_audio_worker:-}" "${long_audio_ffmpeg:-}" \
 		"${long_audio_cgi:-}" \
 		"${identity_worker:-}" "${identity_ffmpeg:-}" \
@@ -149,7 +150,7 @@ cleanup() {
 		"${chunker_failure_worker:-}" "${chunker_failure_ffmpeg:-}" \
 		"${chunker_failure_chunker:-}" "${chunker_failure_cgi:-}" \
 		"${chunker_failure_video_cgi:-}" \
-		"${audio_clean_eof_video_cgi:-}" \
+		"${audio_clean_eof_worker:-}" "${audio_clean_eof_video_cgi:-}" \
 		"${maintenance_enter_pid:-}" \
 		"${blocked_probe_start_pid:-}" "${blocked_probe_worker:-}" \
 		"${blocked_probe_ffmpeg:-}" \
@@ -314,6 +315,11 @@ if [ -n "${VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_READY:-}" ] &&\
 \twhile [ ! -e "$VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_RELEASE" ]; do\
 \t\tsleep 0.05\
 \tdone\
+fi' \
+	-e '/^[[:space:]]*if ! finalize_audio_state "\$rc" "\$chunker_rc"; then$/i\
+if [ -n "${VIDEOPLAYER_TEST_REMOVE_AUDIO_STATE_TOKEN:-}" ] &&\
+   [ "$VIDEOPLAYER_TEST_REMOVE_AUDIO_STATE_TOKEN" = "$token" ]; then\
+\trm -f -- "$dir/audio-state"\
 fi' \
 	-e '/^[[:space:]]*state="\$(cmd_status "\$token")" || return 1$/a\
 if [ -n "${VIDEOPLAYER_TEST_STATUS_TOUCH_READY:-}" ]; then\
@@ -2235,6 +2241,7 @@ identity_fail_closed=58585858585858585858585858585858
 finite_audio=36363636363636363636363636363636
 chunker_failure=37373737373737373737373737373737
 finite_media=38383838383838383838383838383838
+missing_audio_state=60606060606060606060606060606060
 fast_producer=50505050505050505050505050505050
 quality_producer=51515151515151515151515151515151
 fast_av_producer=52525252525252525252525252525252
@@ -3316,6 +3323,8 @@ assert_eq \
 	"$(sed -n '2p' "$runtime/s-$finite_media/audio-state")" \
 	ended \
 	"finite-media audio state"
+assert_eq "$("$helper" has-audio "$finite_media")" 1 \
+	"finite-media ended source audio capability"
 run_audio_cgi GET "$finite_media" live "$work/audio-response"
 finite_media_audio_sequence="$(
 	check_audio_response "$work/audio-response" GET
@@ -3325,6 +3334,41 @@ run_audio_cgi \
 	"$work/audio-response"
 check_status_line "$work/audio-response" "204 No Content"
 assert_eq "$("$helper" stop "$finite_media")" stopped "finite-media stop"
+
+# Missing or malformed persisted state is not evidence that a strict audio
+# pipeline completed successfully. Finalization must fail closed even when
+# FFmpeg and the chunker both exit 0 and leave a valid final PCM chunk.
+assert_eq \
+	"$(
+		VIDEOPLAYER_TEST_REMOVE_AUDIO_STATE_TOKEN="$missing_audio_state" \
+			"$helper" start \
+				"$missing_audio_state" "$work/media/finite-media.mp4"
+	)" \
+	started \
+	"missing final audio state start"
+missing_audio_state_worker="$(session_pid "$missing_audio_state" worker)"
+run_mjpeg_cgi \
+	"$missing_audio_state" 1-1 "$work/missing-audio-state-mjpeg"
+for _ in {1..200}; do
+	[[ "$("$helper" status "$missing_audio_state")" == error ]] && break
+	sleep 0.05
+done
+assert_eq "$("$helper" status "$missing_audio_state")" error \
+	"missing final audio state session status"
+wait_dead "$missing_audio_state_worker"
+missing_audio_state_worker=""
+assert_eq \
+	"$(sed -n '2p' "$runtime/s-$missing_audio_state/audio-state")" \
+	error \
+	"missing final audio state persisted error"
+if "$helper" has-audio "$missing_audio_state" \
+	> "$work/missing-state-has-audio"; then
+	fail "missing final audio state was relabelled as a source capability"
+fi
+[[ ! -s "$work/missing-state-has-audio" ]] ||
+	fail "missing final audio state emitted a false no-audio value"
+assert_eq "$("$helper" stop "$missing_audio_state")" stopped \
+	"missing final audio state stop"
 
 # A PCM failure after successful startup is fatal to the whole strict CPU
 # session. It must never preserve video as a partial CPU-rendering session.
@@ -3351,6 +3395,7 @@ assert_eq \
 	"$("$helper" start "$audio_clean_eof" "$work/media/audio-clean-eof.mp4")" \
 	started \
 	"clean early PCM EOF start"
+audio_clean_eof_worker="$(session_pid "$audio_clean_eof" worker)"
 # Keep the video tee slave flowing until the fake closes only its PCM slave;
 # otherwise a small host FIFO could backpressure video before the fourth chunk.
 run_mjpeg_cgi \
@@ -3364,6 +3409,12 @@ assert_eq "$("$helper" status "$audio_clean_eof")" error \
 	"clean early PCM EOF strict session status"
 assert_eq "$("$helper" audio-state "$audio_clean_eof")" error \
 	"clean early PCM EOF strict audio state"
+wait_dead "$audio_clean_eof_worker"
+audio_clean_eof_worker=""
+assert_eq \
+	"$(sed -n '2p' "$runtime/s-$audio_clean_eof/audio-state")" \
+	error \
+	"clean early PCM EOF persisted audio state"
 if "$helper" has-audio "$audio_clean_eof" > "$work/failed-has-audio"; then
 	fail "failed advertised audio was relabelled as a source capability"
 fi

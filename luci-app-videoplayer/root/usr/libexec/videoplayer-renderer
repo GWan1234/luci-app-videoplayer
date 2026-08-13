@@ -2826,10 +2826,27 @@ cmd_worker() {
 
 	finalize_audio_state() {
 		local producer_rc="$1" final_chunker_rc="$2" final_state
+		local prior_audio_state=""
 
 		rm -f -- "$dir/audio" "$dir/chunker" "$audio_pipe" \
 			2>/dev/null || :
-		if [ "$producer_rc" -eq 0 ] &&
+		if load_audio_state "$token" 2>/dev/null; then
+			case "$AUDIO_STATE" in
+				starting|running) prior_audio_state="$AUDIO_STATE" ;;
+				*) prior_audio_state="" ;;
+			esac
+		fi
+		# A clean child exit and a valid last PCM chunk cannot rehabilitate a
+		# pipeline which was already declared failed. In particular, an early
+		# exit-0 chunker EOF records error before stopping FFmpeg; preserve that
+		# fail-closed state instead of relabelling it as a successful end.
+		if [ "$stopping" -ne 0 ] ||
+		   [ -n "${failure_reason:-}" ]; then
+			final_state=error
+		elif [ -z "$prior_audio_state" ]; then
+			final_state=error
+			failure_reason="Strict CPU audio state became invalid"
+		elif [ "$producer_rc" -eq 0 ] &&
 		   [ "$final_chunker_rc" -eq 0 ] &&
 		   audio_sequence_bounds "$token"; then
 			last_audio="$dir/audio-$(printf '%08d' "$AUDIO_HIGHEST").pcm"
