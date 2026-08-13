@@ -213,9 +213,10 @@ select_release_codec() {
 			die "Internal error: unsupported package format."
 			;;
 	esac
-	[ "$CODEC_ASSET_FILE" = "$expected_asset" ] &&
-		[ "$CODEC_PACKAGE_FILE" = "$expected_package" ] ||
+	if [ "$CODEC_ASSET_FILE" != "$expected_asset" ] ||
+		[ "$CODEC_PACKAGE_FILE" != "$expected_package" ]; then
 		die "The release codec manifest returned an unexpected package name."
+	fi
 }
 
 apk_force_reinstall_supported() {
@@ -295,14 +296,16 @@ require_build_info_field() {
 		sed -n "s/^${field_name}=//p" "$PRIVATE_BUILD_INFO" |
 			wc -l | tr -d '[:space:]'
 	)"
-	[ "$field_count" = "1" ] && [ "$field_value" = "$expected_value" ] ||
+	if [ "$field_count" != "1" ] || [ "$field_value" != "$expected_value" ]; then
 		die "The installed codec metadata has an invalid $field_name value."
+	fi
 }
 
 verify_installed_runtime() {
-	[ -f "$PRIVATE_BUILD_INFO" ] && [ ! -L "$PRIVATE_BUILD_INFO" ] &&
-		[ "$(stat -c '%u:%a' "$PRIVATE_BUILD_INFO" 2>/dev/null)" = "0:644" ] ||
+	if [ ! -f "$PRIVATE_BUILD_INFO" ] || [ -L "$PRIVATE_BUILD_INFO" ] ||
+		[ "$(stat -c '%u:%a' "$PRIVATE_BUILD_INFO" 2>/dev/null)" != "0:644" ]; then
 		die "The installed codec metadata is missing or unsafe."
+	fi
 	[ "$(wc -l < "$PRIVATE_BUILD_INFO" | tr -d '[:space:]')" = "24" ] ||
 		die "The installed codec metadata has an unexpected schema."
 
@@ -326,10 +329,11 @@ verify_installed_runtime() {
 	require_build_info_field private_binary "$PRIVATE_FFMPEG"
 
 	for executable_path in "$PRIVATE_FFMPEG" "$PRIVATE_RELAY" "$RENDERER_HELPER"; do
-		[ -f "$executable_path" ] && [ ! -L "$executable_path" ] &&
-			[ -x "$executable_path" ] &&
-			[ "$(stat -c '%u:%a' "$executable_path" 2>/dev/null)" = "0:755" ] ||
+		if [ ! -f "$executable_path" ] || [ -L "$executable_path" ] ||
+			[ ! -x "$executable_path" ] ||
+			[ "$(stat -c '%u:%a' "$executable_path" 2>/dev/null)" != "0:755" ]; then
 			die "The installed executable is missing or unsafe: $executable_path"
+		fi
 	done
 
 	relay_status="0"

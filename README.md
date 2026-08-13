@@ -240,7 +240,7 @@ After preparing the storage, connect to the router over SSH as `root`. The
 router must have working HTTPS access to GitHub:
 
 ```sh
-(set -eu; expected='af67d1280ae2b48c57a90e498afc6409533829105875227a6537ce903dbfa1ca'; installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh'); [ -s "$installer" ]; actual="$(sha256sum "$installer")"; actual="${actual%% *}"; [ "$actual" = "$expected" ]; sh "$installer")
+(set -eu; expected='19f4b61c973524485d283156cca7773f187ad2c0fa95b57900bdf3fb8da8cb54'; installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh'); [ -s "$installer" ]; actual="$(sha256sum "$installer")"; actual="${actual%% *}"; [ "$actual" = "$expected" ]; sh "$installer")
 ```
 
 This one-line bootstrap downloads the complete installer into a private,
