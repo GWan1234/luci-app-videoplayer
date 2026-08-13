@@ -76,15 +76,16 @@ def main() -> None:
         "bad manifest SHA-256 pin",
     )
 
-    installer_sha256 = hashlib.sha256(installer_path.read_bytes()).hexdigest()
-    bootstrap_pins = re.findall(
-        r"expected='([0-9a-f]{64})';[^\n]*"
-        r"releases/download/1\.1\.0/install-from-github\.sh",
+    release_bootstraps = re.findall(
+        r"^sh <\(wget -O - "
+        r"https://github\.com/communism420/luci-app-videoplayer/"
+        r"releases/download/1\.1\.0/install-from-github\.sh\)$",
         readme,
+        re.MULTILINE,
     )
     require(
-        bootstrap_pins == [installer_sha256],
-        "README release bootstrap does not pin the exact installer bytes",
+        len(release_bootstraps) == 1,
+        "README does not contain exactly one short Release 1.1.0 bootstrap",
     )
 
     require(Path(manifest_name).name == manifest_name, "unsafe manifest filename")

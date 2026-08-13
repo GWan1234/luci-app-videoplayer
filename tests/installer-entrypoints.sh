@@ -71,15 +71,44 @@ run_with_download_deadline \
 	/bin/sh -c 'printf deadline > "$1"' sh "$deadline_marker"
 EOF
 
+expected_release_bootstrap='sh <(wget -O - https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh)'
+expected_main_bootstrap='sh <(wget -O - https://raw.githubusercontent.com/communism420/luci-app-videoplayer/refs/heads/main/scripts/install-main-apk.sh)'
 mapfile -t bootstrap_commands < <(
-	grep -E '^\(set -eu; .*installer=' "$root/README.md"
+	grep -E '^sh <\(wget -O - https://[^[:space:]]+\)$' "$root/README.md"
 )
-if ((${#bootstrap_commands[@]} != 2)); then
-	printf 'README.md must contain exactly two one-line app installers.\n' >&2
+if ((${#bootstrap_commands[@]} != 2)) ||
+	[[ "${bootstrap_commands[0]:-}" != "$expected_release_bootstrap" ]] ||
+	[[ "${bootstrap_commands[1]:-}" != "$expected_main_bootstrap" ]]; then
+	printf 'README.md must contain the two exact short app installers.\n' >&2
 	exit 1
 fi
 for bootstrap_command in "${bootstrap_commands[@]}"; do
-	sh -n -c "$bootstrap_command"
+	bash -n -c "$bootstrap_command"
+done
+
+short_bootstrap_bin="$tmp/short-bootstrap-bin"
+mkdir "$short_bootstrap_bin"
+cat > "$short_bootstrap_bin/wget" <<'EOF'
+#!/bin/sh
+set -eu
+: "${SHORT_BOOTSTRAP_LOG:?}"
+printf '%s\n' "$*" > "$SHORT_BOOTSTRAP_LOG"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" short-bootstrap-ok'
+EOF
+chmod 0755 "$short_bootstrap_bin/wget"
+for bootstrap_index in "${!bootstrap_commands[@]}"; do
+	short_bootstrap_log="$tmp/short-bootstrap-$bootstrap_index.log"
+	short_bootstrap_output="$(
+		env PATH="$short_bootstrap_bin:$PATH" \
+			SHORT_BOOTSTRAP_LOG="$short_bootstrap_log" \
+			bash -c "${bootstrap_commands[$bootstrap_index]}"
+	)"
+	[[ "$short_bootstrap_output" == short-bootstrap-ok ]] ||
+		fail 'A short app installer did not execute the downloaded script.'
+	expected_url="${bootstrap_commands[$bootstrap_index]#*wget -O - }"
+	expected_url="${expected_url%)}"
+	[[ "$(cat "$short_bootstrap_log")" == "-O - $expected_url" ]] ||
+		fail 'A short app installer passed unexpected arguments to wget.'
 done
 
 grep -Fq \

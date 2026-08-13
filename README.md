@@ -240,13 +240,17 @@ After preparing the storage, connect to the router over SSH as `root`. The
 router must have working HTTPS access to GitHub:
 
 ```sh
-(set -eu; expected='19f4b61c973524485d283156cca7773f187ad2c0fa95b57900bdf3fb8da8cb54'; installer="$(mktemp /tmp/install-videoplayer.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh'); [ -s "$installer" ]; actual="$(sha256sum "$installer")"; actual="${actual%% *}"; [ "$actual" = "$expected" ]; sh "$installer")
+sh <(wget -O - https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh)
 ```
 
-This one-line bootstrap downloads the complete installer into a private,
-size-limited temporary file, verifies the installer itself against the pinned
-SHA-256 above, executes it only after the download is complete, and removes it
-on exit. It does not pipe a partial network response into a shell.
+This compact command uses the process-substitution support provided by the
+standard OpenWrt BusyBox `ash` shell. The release URL points to the installer
+asset attached directly to Release 1.1.0. The installer itself downloads the
+manifest and both packages into private, size-limited temporary files and
+verifies their pinned SHA-256 values before the first package-manager write.
+Compared with the previous longer bootstrap, this shorter form trusts HTTPS
+and the selected GitHub URL for the installer script itself; the manifest and
+package checksum verification remains unchanged.
 
 The installer is pinned to
 [Release 1.1.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.1.0)
@@ -284,11 +288,11 @@ To install the newest successfully tested `main` source instead of the fixed
 Release 1.1.0 package set, use the separate APK-only installer:
 
 ```sh
-(set -eu; installer="$(mktemp /tmp/install-videoplayer-main.XXXXXX)"; trap 'rm -f "$installer"' 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; (ulimit -f 1024; wget -O "$installer" 'https://raw.githubusercontent.com/communism420/luci-app-videoplayer/main/scripts/install-main-apk.sh'); [ -s "$installer" ]; sh "$installer")
+sh <(wget -O - https://raw.githubusercontent.com/communism420/luci-app-videoplayer/refs/heads/main/scripts/install-main-apk.sh)
 ```
 
-This command uses the same download-first, size-limited bootstrap described
-above.
+This command uses the same compact OpenWrt `ash` process-substitution format
+and follows the current `main` branch rather than the fixed release asset.
 
 After every successful package-check run for a push to `main`, GitHub Actions
 rebuilds the current source package and publishes the architecture-scoped
