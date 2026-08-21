@@ -11,5 +11,7 @@ config videoplayer 'main'
 	option router_fps '8'
 	# CPU renderer preset: fast favors throughput on low-end routers; quality keeps 640x360
 	option router_profile 'fast'
+	# Opt in to maximum supported decode/filter/MJPEG work at normal scheduler priority
+	option router_max_threads '0'
 	# Max depth when browsing local folders
 	option max_depth '8'

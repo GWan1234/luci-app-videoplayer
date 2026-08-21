@@ -22,7 +22,7 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DIST = ROOT / ".staging" / "app"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.1.0"
+PKG_VERSION = "1.1.1"
 PKG_ARCH_IPK = "all"
 PKG_ARCH_APK = "noarch"
 PKG_LICENSE = "GPL-2.0-or-later"

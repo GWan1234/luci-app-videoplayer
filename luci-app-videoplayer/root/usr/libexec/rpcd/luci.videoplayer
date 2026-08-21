@@ -83,13 +83,14 @@ normalize_decimal() {
 
 load_renderer_media_info() {
 	local token="$1" info tab duration_ms remainder total_frames fps profile
-	local backend marker hwaccel
+	local backend marker hwaccel max_threads
 	local expected_frames
 
 	RENDERER_DURATION_MS=""
 	RENDERER_TOTAL_FRAMES=""
 	RENDERER_FPS=""
 	RENDERER_PROFILE=""
+	RENDERER_MAX_THREADS=""
 	valid_token "$token" || return 1
 	info="$("$RENDERER_HELPER" media-info "$token" 2>/dev/null)" || return 1
 	tab="$(printf '\t')"
@@ -113,8 +114,11 @@ load_renderer_media_info() {
 	remainder="${remainder#*"$tab"}"
 	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
 	marker="${remainder%%"$tab"*}"
-	hwaccel="${remainder#*"$tab"}"
-	case "$hwaccel" in *"$tab"*) return 1 ;; esac
+	remainder="${remainder#*"$tab"}"
+	case "$remainder" in *"$tab"*) ;; *) return 1 ;; esac
+	hwaccel="${remainder%%"$tab"*}"
+	max_threads="${remainder#*"$tab"}"
+	case "$max_threads" in *"$tab"*) return 1 ;; esac
 	duration_ms="$(normalize_decimal "$duration_ms" 2>/dev/null)" || return 1
 	total_frames="$(normalize_decimal "$total_frames" 2>/dev/null)" || return 1
 	fps="$(normalize_decimal "$fps" 2>/dev/null)" || return 1
@@ -127,6 +131,10 @@ load_renderer_media_info() {
 	esac
 	case "$profile" in
 		fast|quality) ;;
+		*) return 1 ;;
+	esac
+	case "$max_threads" in
+		0|1) ;;
 		*) return 1 ;;
 	esac
 	[ "$backend" = "$RENDERER_BACKEND" ] || return 1
@@ -142,6 +150,7 @@ load_renderer_media_info() {
 	RENDERER_TOTAL_FRAMES="$total_frames"
 	RENDERER_FPS="$fps"
 	RENDERER_PROFILE="$profile"
+	RENDERER_MAX_THREADS="$max_threads"
 	return 0
 }
 
@@ -303,6 +312,17 @@ get_router_profile() {
 	case "$value" in
 		quality) printf 'quality\n' ;;
 		*) printf 'fast\n' ;;
+	esac
+}
+
+get_router_max_threads() {
+	local value
+
+	value="$(uci -q get videoplayer.main.router_max_threads 2>/dev/null)" ||
+		value=""
+	case "$value" in
+		1) printf '1\n' ;;
+		*) printf '0\n' ;;
 	esac
 }
 
@@ -739,7 +759,8 @@ normalize_list_args() {
 
 cmd_get_status() {
 	local configured root valid=0 enabled allow_remote exists=0 readable=0
-	local render_mode router_fps router_profile renderer_available=0 renderer_reason
+	local render_mode router_fps router_profile router_max_threads
+	local renderer_available=0 renderer_reason
 
 	configured="$(get_configured_media_path)"
 	root="$(canonicalize_media_root "$configured" 2>/dev/null)" && valid=1
@@ -749,6 +770,7 @@ cmd_get_status() {
 	render_mode="$(get_render_mode)"
 	router_profile="$(get_router_profile)"
 	router_fps="$(get_router_fps "$router_profile")"
+	router_max_threads="$(get_router_max_threads)"
 	if [ -x "$RENDERER_HELPER" ]; then
 		if load_renderer_attestation; then
 			renderer_available=1
@@ -779,6 +801,7 @@ cmd_get_status() {
 	json_add_string "render_mode" "$render_mode"
 	json_add_string "router_profile" "$router_profile"
 	json_add_int "router_fps" "$router_fps"
+	json_add_boolean "router_max_threads" "$router_max_threads"
 	json_add_boolean "renderer_available" "$renderer_available"
 	if [ "$renderer_available" -eq 1 ]; then
 		json_add_renderer_attestation
@@ -1026,7 +1049,8 @@ cmd_resolve() {
 	local raw="$1" requested_mode="${2:-browser}"
 	local rel root path canonical_rel parent depth max_depth token name mime
 	local render_mode renderer_message renderer_result
-	local has_audio=0 audio_state="" router_fps router_profile frame_interval duration_ms=0 total_frames=0
+	local has_audio=0 audio_state="" router_fps router_profile router_max_threads
+	local frame_interval duration_ms=0 total_frames=0
 
 	[ "$(get_enabled)" = "1" ] || {
 		json_error "video player disabled"
@@ -1134,6 +1158,7 @@ cmd_resolve() {
 			total_frames="$RENDERER_TOTAL_FRAMES"
 			router_fps="$RENDERER_FPS"
 			router_profile="$RENDERER_PROFILE"
+			router_max_threads="$RENDERER_MAX_THREADS"
 		else
 			"$RENDERER_HELPER" stop "$token" >/dev/null 2>&1 || :
 			json_error "router CPU renderer returned invalid media info"
@@ -1188,6 +1213,7 @@ cmd_resolve() {
 		json_add_boolean "seekable" 0
 		json_add_string "router_profile" "$router_profile"
 		json_add_int "router_fps" "$router_fps"
+		json_add_boolean "router_max_threads" "$router_max_threads"
 		json_add_int "frame_interval_ms" "$frame_interval"
 	else
 		json_add_string "stream_url" "/cgi-bin/videoplayer-stream?token=$token"
@@ -1203,7 +1229,7 @@ cmd_resolve() {
 cmd_renderer_status() {
 	local raw="$1" state reason="" duration_ms=0 total_frames=0 router_fps=0
 	local attested=0
-	local router_profile=""
+	local router_profile="" router_max_threads=""
 
 	parse_request "$raw" || {
 		json_error "invalid JSON request"
@@ -1235,6 +1261,7 @@ cmd_renderer_status() {
 		total_frames="$RENDERER_TOTAL_FRAMES"
 		router_fps="$RENDERER_FPS"
 		router_profile="$RENDERER_PROFILE"
+		router_max_threads="$RENDERER_MAX_THREADS"
 	else
 		state="error"
 		[ -n "$reason" ] || reason="renderer session attestation is invalid"
@@ -1250,6 +1277,8 @@ cmd_renderer_status() {
 	[ "$router_fps" -le 0 ] || json_add_int "router_fps" "$router_fps"
 	[ -z "$router_profile" ] || \
 		json_add_string "router_profile" "$router_profile"
+	[ -z "$router_max_threads" ] || \
+		json_add_boolean "router_max_threads" "$router_max_threads"
 	[ -z "$reason" ] || json_add_string "reason" "$reason"
 	json_dump
 }

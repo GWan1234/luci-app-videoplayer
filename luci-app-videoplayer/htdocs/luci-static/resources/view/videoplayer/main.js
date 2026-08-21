@@ -287,6 +287,9 @@ return view.extend({
 		const configuredRenderMode = uci.get('videoplayer', 'main', 'render_mode');
 		const configuredRouterProfile = uci.get('videoplayer', 'main', 'router_profile');
 		const configuredRouterFps = uci.get('videoplayer', 'main', 'router_fps');
+		const configuredRouterMaxThreads = uci.get(
+			'videoplayer', 'main', 'router_max_threads'
+		);
 		const formMediaPath = configuredMediaPath !== undefined
 			? String(configuredMediaPath)
 			: (status.media_path || '/mnt/video');
@@ -308,6 +311,9 @@ return view.extend({
 			configuredRouterFps !== undefined ? configuredRouterFps : status.router_fps,
 			formRouterProfile
 		);
+		const formRouterMaxThreads = configuredRouterMaxThreads !== undefined
+			? flagOn(configuredRouterMaxThreads)
+			: flagOn(status.router_max_threads);
 		/*
 		 * LuCI Save stages UCI changes without activating them. Keep the form on
 		 * those staged values, while the player continues to reflect the active
@@ -331,6 +337,9 @@ return view.extend({
 			status.router_fps !== undefined ? status.router_fps : formRouterFps,
 			activeRouterProfile
 		);
+		const activeRouterMaxThreads = status.router_max_threads !== undefined
+			? flagOn(status.router_max_threads)
+			: formRouterMaxThreads;
 		const rendererAvailable = status.renderer_available === undefined
 			? null
 			: flagOn(status.renderer_available) && hasStrictCpuAttestation(status);
@@ -353,6 +362,7 @@ return view.extend({
 		self._renderMode = activeRenderMode;
 		self._routerProfile = activeRouterProfile;
 		self._routerFps = activeRouterFps;
+		self._routerMaxThreads = activeRouterMaxThreads;
 		self._rendererAvailable = rendererAvailable;
 		self._canWriteSettings = canWriteSettings;
 		self._statusLoadError = statusResult.error || null;
@@ -363,6 +373,7 @@ return view.extend({
 			render_mode: activeRenderMode,
 			router_profile: activeRouterProfile,
 			router_fps: activeRouterFps,
+			router_max_threads: activeRouterMaxThreads,
 			renderer_available: status.renderer_available,
 			renderer_reason: status.renderer_reason,
 			renderer_backend: status.renderer_backend,
@@ -526,6 +537,30 @@ return view.extend({
 								? _('Router CPU rendering is unavailable: %s').format(
 									status.renderer_reason || _('FFmpeg capability check failed'))
 								: '')
+						])
+					]),
+					E('div', { class: 'cbi-value' }, [
+						E('label', {
+							class: 'cbi-value-title',
+							for: 'vp-router-max-threads'
+						}, _('Maximum-resource multithreading')),
+						E('div', { class: 'cbi-value-field' }, [
+							E('input', {
+								id: 'vp-router-max-threads',
+								type: 'checkbox',
+								checked: formRouterMaxThreads ? 'checked' : null,
+								disabled: canWriteSettings ? null : 'disabled',
+								'aria-describedby': 'vp-router-max-threads-desc vp-router-max-threads-warning'
+							}),
+							E('div', {
+								id: 'vp-router-max-threads-desc',
+								class: 'cbi-value-description'
+							}, _('Uses the maximum parallelism supported by the private FFmpeg runtime: every detected online CPU thread up to 64 for filtering and MJPEG encoding, and up to 16 for video decoding, at normal scheduler priority. When disabled, the renderer keeps its bounded thread count and reduced priority.')),
+							E('div', {
+								id: 'vp-router-max-threads-warning',
+								class: 'cbi-value-description alert-message warning',
+								role: 'note'
+							}, _('Warning: maximum-resource multithreading can consume all available router CPU capacity. The router may become unstable or unresponsive, internet access may be interrupted, and other router services may fail while CPU rendering is active.'))
 						])
 					]),
 					E('div', { class: 'cbi-value' }, [
@@ -971,6 +1006,7 @@ return view.extend({
 		const renderModeEl = document.getElementById('vp-render-mode');
 		const routerProfileEl = document.getElementById('vp-router-profile');
 		const routerFpsEl = document.getElementById('vp-router-fps');
+		const routerMaxThreadsEl = document.getElementById('vp-router-max-threads');
 		let path = (pathEl && pathEl.value || '').trim();
 		const renderMode = normalizeRenderMode(renderModeEl && renderModeEl.value);
 		const routerProfile = normalizeRouterProfile(
@@ -1017,6 +1053,9 @@ return view.extend({
 
 		const localEnabled = !!(enabledEl && enabledEl.checked);
 		const remoteAllowed = !!(remoteEl && remoteEl.checked);
+		const routerMaxThreads = !!(
+			routerMaxThreadsEl && routerMaxThreadsEl.checked
+		);
 
 		uci.set('videoplayer', 'main', 'enabled', localEnabled ? '1' : '0');
 		uci.set('videoplayer', 'main', 'media_path', path);
@@ -1024,6 +1063,10 @@ return view.extend({
 		uci.set('videoplayer', 'main', 'render_mode', renderMode);
 		uci.set('videoplayer', 'main', 'router_profile', routerProfile);
 		uci.set('videoplayer', 'main', 'router_fps', String(routerFps));
+		uci.set(
+			'videoplayer', 'main', 'router_max_threads',
+			routerMaxThreads ? '1' : '0'
+		);
 
 		return uci.save().then(function () {
 			/* Active player state changes only after LuCI applies and reloads. */
@@ -1052,12 +1095,16 @@ return view.extend({
 		const renderModeEl = document.getElementById('vp-render-mode');
 		const routerProfileEl = document.getElementById('vp-router-profile');
 		const routerFpsEl = document.getElementById('vp-router-fps');
+		const routerMaxThreadsEl = document.getElementById('vp-router-max-threads');
 		const stagedEnabled = uci.get('videoplayer', 'main', 'enabled');
 		const stagedPath = uci.get('videoplayer', 'main', 'media_path');
 		const stagedAllowRemote = uci.get('videoplayer', 'main', 'allow_remote');
 		const stagedRenderMode = uci.get('videoplayer', 'main', 'render_mode');
 		const stagedRouterProfile = uci.get('videoplayer', 'main', 'router_profile');
 		const stagedRouterFps = uci.get('videoplayer', 'main', 'router_fps');
+		const stagedRouterMaxThreads = uci.get(
+			'videoplayer', 'main', 'router_max_threads'
+		);
 		const stagedProfile = normalizeRouterProfile(
 			stagedRouterProfile !== undefined
 				? stagedRouterProfile
@@ -1092,6 +1139,12 @@ return view.extend({
 			routerProfileEl.value = stagedProfile;
 		if (routerFpsEl)
 			routerFpsEl.value = String(stagedFps);
+		if (routerMaxThreadsEl)
+			routerMaxThreadsEl.checked = flagOn(
+				stagedRouterMaxThreads !== undefined
+					? stagedRouterMaxThreads
+					: this._routerMaxThreads
+			);
 
 		this._clearFieldError(pathEl, 'vp-media-path-error');
 		this._syncRouterProfileControls();

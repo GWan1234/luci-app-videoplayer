@@ -10,4 +10,7 @@ config videoplayer 'main'
 	option router_profile 'fast'
 	# Router CPU renderer FPS: 5, 8, 12, 15, 20, 24, 30, 48, 50, or 60
 	option router_fps '8'
+	# WARNING: 1 uses maximum FFmpeg-supported CPU parallelism and can make the
+	# router unstable or interrupt internet access while rendering.
+	option router_max_threads '0'
 	option max_depth '8'

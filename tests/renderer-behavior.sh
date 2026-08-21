@@ -68,11 +68,12 @@ export VIDEOPLAYER_TEST_MEDIA_ROOT="$work/media"
 export VIDEOPLAYER_TEST_RUNTIME="$runtime"
 export VIDEOPLAYER_TEST_ROUTER_FPS=60
 export VIDEOPLAYER_TEST_ROUTER_PROFILE=fast
+export VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=0
 export VIDEOPLAYER_EXPECT_PROFILE=fast
 export VIDEOPLAYER_EXPECT_FPS=8
 VIDEOPLAYER_EXPECT_DECODER_THREADS="$(
-	awk '/^processor[[:space:]]*:/ { count++ } END { print count + 0 }' \
-		/proc/cpuinfo 2>/dev/null
+	awk '/^cpu[0-9]+[[:space:]]/ { count++ } END { print count + 0 }' \
+		/proc/stat 2>/dev/null
 )" || VIDEOPLAYER_EXPECT_DECODER_THREADS=""
 if [[ ! "$VIDEOPLAYER_EXPECT_DECODER_THREADS" =~ ^[0-9]+$ ]] ||
    [[ "$VIDEOPLAYER_EXPECT_DECODER_THREADS" -lt 1 ]]; then
@@ -81,6 +82,8 @@ elif [[ "$VIDEOPLAYER_EXPECT_DECODER_THREADS" -gt 4 ]]; then
 	VIDEOPLAYER_EXPECT_DECODER_THREADS=4
 fi
 export VIDEOPLAYER_EXPECT_DECODER_THREADS
+VIDEOPLAYER_BOUNDED_DECODER_THREADS="$VIDEOPLAYER_EXPECT_DECODER_THREADS"
+export VIDEOPLAYER_BOUNDED_DECODER_THREADS
 export VIDEOPLAYER_TEST_REQUIRE_NATIVE_RELAY=1
 export VIDEOPLAYER_TEST_DELAY_CGI_IDENTITY=1
 export VIDEOPLAYER_TEST_AUDIO_CAPACITY_RACE_READY="$audio_capacity_race_ready"
@@ -220,15 +223,17 @@ if grep -Eq '(^|[[:space:]"])-(re|readrate[^[:space:]"]*)($|[[:space:]"])' \
 	fail "renderer contains an input wall-clock pacing option"
 fi
 
-# Keep the decoder parallelism portable across single-core and multi-core
-# targets, including the conservative fallback for an unusual /proc format.
-decoder_thread_functions="$work/decoder-thread-functions.sh"
+# Keep thread selection portable across single-core and multi-core targets.
+# Normal mode retains its conservative fallback; maximum-resource mode uses
+# the whole supported online pool and fails closed when that inventory is bad.
+thread_functions="$work/thread-functions.sh"
 awk '
-	/^renderer_decoder_threads\(\) \{/ { copying = 1 }
+	/^renderer_online_threads\(\) \{/ { copying = 1 }
 	copying { print }
-	copying && /^}/ { exit }
-' "$source_helper" > "$decoder_thread_functions"
-bash -s -- "$decoder_thread_functions" <<'BASH'
+	copying && /^}/ { closed++ }
+	copying && closed == 2 { exit }
+' "$source_helper" > "$thread_functions"
+bash -s -- "$thread_functions" <<'BASH'
 set -Eeuo pipefail
 functions=$1
 valid_decimal() {
@@ -238,13 +243,28 @@ valid_decimal() {
 . "$functions"
 awk() { printf '%s\n' "$FAKE_CPU_COUNT"; }
 FAKE_CPU_COUNT=1
-[[ "$(renderer_decoder_threads)" == 1 ]]
+[[ "$(renderer_online_threads 0)" == 1 ]]
 FAKE_CPU_COUNT=4
-[[ "$(renderer_decoder_threads)" == 4 ]]
+[[ "$(renderer_online_threads 0)" == 4 ]]
 FAKE_CPU_COUNT=64
-[[ "$(renderer_decoder_threads)" == 4 ]]
+[[ "$(renderer_online_threads 0)" == 4 ]]
 FAKE_CPU_COUNT=invalid
-[[ "$(renderer_decoder_threads)" == 2 ]]
+[[ "$(renderer_online_threads 0)" == 2 ]]
+FAKE_CPU_COUNT=1
+[[ "$(renderer_online_threads 1)" == 1 ]]
+FAKE_CPU_COUNT=8
+[[ "$(renderer_online_threads 1)" == 8 ]]
+FAKE_CPU_COUNT=64
+[[ "$(renderer_online_threads 1)" == 64 ]]
+FAKE_CPU_COUNT=128
+[[ "$(renderer_online_threads 1)" == 64 ]]
+FAKE_CPU_COUNT=1000
+[[ "$(renderer_online_threads 1)" == 64 ]]
+FAKE_CPU_COUNT=invalid
+! renderer_online_threads 1 >/dev/null
+[[ "$(renderer_decoder_threads 8 1)" == 8 ]]
+[[ "$(renderer_decoder_threads 64 1)" == 16 ]]
+[[ "$(renderer_decoder_threads 4 0)" == 4 ]]
 BASH
 
 # The production helper runs in BusyBox ash, whose `read -t` keeps the bounded
@@ -278,7 +298,7 @@ if [ -n "${VIDEOPLAYER_TEST_PRODUCER_IDENTITY_READY:-}" ] &&\
 else\
 \tsleep 0.05\
 fi' \
-	-e '/^renderer_decoder_threads() {$/a\
+	-e '/^renderer_online_threads() {$/a\
 if [ -n "${VIDEOPLAYER_TEST_DECODER_THREADS:-}" ]; then\
 \tprintf "%s\\n" "$VIDEOPLAYER_TEST_DECODER_THREADS"\
 \treturn 0\
@@ -578,7 +598,7 @@ printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" >> "$RPC_RENDERER_CALL_LOG"
 case "${1:-}" in
 	start) printf 'started\n' ;;
 	attest) printf 'private-software-cpu\tsoftware-cpu-v1\tnone\n' ;;
-	media-info) printf '125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone\n' ;;
+	media-info) printf '125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t0\n' ;;
 	has-audio) printf '1\n' ;;
 	audio-state) printf 'ready\n' ;;
 	status-touch) printf 'running\n' ;;
@@ -622,6 +642,9 @@ case "${2:-}" in
 	videoplayer.main.router_profile)
 		printf '%s\n' "${VIDEOPLAYER_TEST_ROUTER_PROFILE:-fast}"
 		;;
+	videoplayer.main.router_max_threads)
+		printf '%s\n' "${VIDEOPLAYER_TEST_ROUTER_MAX_THREADS:-0}"
+		;;
 	*)
 		exit 1
 		;;
@@ -662,6 +685,19 @@ static int has_arg(int argc, char **argv, const char *wanted)
 			return 1;
 
 	return 0;
+}
+
+static int valid_thread_count(const char *value, unsigned long maximum)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (value == NULL || value[0] == '\0')
+		return 0;
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	return errno == 0 && end != value && *end == '\0' && parsed >= 1 &&
+	       parsed <= maximum;
 }
 
 static int has_arg_prefix(int argc, char **argv, const char *prefix)
@@ -1066,25 +1102,24 @@ int main(int argc, char **argv)
 
 	expected_private_lib = getenv("VIDEOPLAYER_EXPECT_PRIVATE_LIB");
 	expected_decoder_threads = getenv("VIDEOPLAYER_EXPECT_DECODER_THREADS");
+	expected_pipeline_threads = getenv("VIDEOPLAYER_EXPECT_PIPELINE_THREADS");
 	expected_fps = getenv("VIDEOPLAYER_EXPECT_FPS");
 	expected_profile = getenv("VIDEOPLAYER_EXPECT_PROFILE");
-	if (expected_decoder_threads == NULL ||
-	    (strcmp(expected_decoder_threads, "1") != 0 &&
-	     strcmp(expected_decoder_threads, "2") != 0 &&
-	     strcmp(expected_decoder_threads, "3") != 0 &&
-	     strcmp(expected_decoder_threads, "4") != 0))
+	if (!valid_thread_count(expected_decoder_threads, 16))
 		return 78;
 	if (expected_profile == NULL || expected_profile[0] == '\0')
 		expected_profile = "fast";
 	if (strcmp(expected_profile, "fast") == 0) {
-		expected_pipeline_threads = expected_decoder_threads;
+		if (expected_pipeline_threads == NULL)
+			expected_pipeline_threads = expected_decoder_threads;
 		expected_huffman = "default";
 		expected_quality = "12";
 		expected_width = "480";
 		expected_height = "270";
 	} else if (strcmp(expected_profile, "quality") == 0) {
-		expected_pipeline_threads = strcmp(expected_decoder_threads, "1") == 0
-			? "1" : "2";
+		if (expected_pipeline_threads == NULL)
+			expected_pipeline_threads =
+				strcmp(expected_decoder_threads, "1") == 0 ? "1" : "2";
 		expected_huffman = "optimal";
 		expected_quality = "8";
 		expected_width = "640";
@@ -1092,6 +1127,8 @@ int main(int argc, char **argv)
 	} else {
 		return 78;
 	}
+	if (!valid_thread_count(expected_pipeline_threads, 64))
+		return 78;
 	library_path = getenv("LD_LIBRARY_PATH");
 	if (expected_fps == NULL || expected_fps[0] == '\0')
 		expected_fps = "8";
@@ -1625,6 +1662,10 @@ chmod 0755 "$bin/ffmpeg"
 # spuriously fail this deterministic launch.
 cat > "$bin/nice" <<'SH'
 #!/bin/sh
+if [ -n "${VIDEOPLAYER_TEST_EXPECT_NICE:-}" ]; then
+	[ "${1:-}" = "-n" ] &&
+		[ "${2:-}" = "$VIDEOPLAYER_TEST_EXPECT_NICE" ] || exit 96
+fi
 case " $* " in
 	*"videoplayer-${VIDEOPLAYER_TEST_NICE_DELAY_TOKEN:-not-a-token}"*)
 		: > "$VIDEOPLAYER_TEST_NICE_DELAY_MARKER"
@@ -1716,12 +1757,16 @@ printf '%s\n' "$rpc_start_fields" | grep -Fxq $'string\trouter_profile\tfast' ||
 	fail "start_renderer omitted effective renderer profile"
 printf '%s\n' "$rpc_start_fields" | grep -Fxq $'int\trouter_fps\t8' ||
 	fail "fast profile did not cap configured 60 FPS to 8 FPS"
+printf '%s\n' "$rpc_start_fields" |
+	grep -Fxq $'boolean\trouter_max_threads\t0' ||
+	fail "start_renderer omitted frozen maximum-resource mode"
 
 rpc_quality_status_fields="$(
 	# These overrides are deliberately isolated from the main lifecycle fixture.
 	# shellcheck disable=SC2030,SC2031,SC2317,SC2329
 	(
 		export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
+		export VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=1
 		# shellcheck disable=SC1090
 		source "$rpc_harness"
 		PATH="$bin:$PATH"
@@ -1738,6 +1783,9 @@ printf '%s\n' "$rpc_quality_status_fields" |
 	fail "get_status omitted the quality renderer profile"
 printf '%s\n' "$rpc_quality_status_fields" | grep -Fxq $'int\trouter_fps\t60' ||
 	fail "quality profile did not preserve configured 60 FPS"
+printf '%s\n' "$rpc_quality_status_fields" |
+	grep -Fxq $'boolean\trouter_max_threads\t1' ||
+	fail "get_status omitted enabled maximum-resource mode"
 
 rpc_status_fields="$(
 	# These harness overrides are invoked indirectly by the sourced status handler.
@@ -1753,6 +1801,7 @@ rpc_status_fields="$(
 		json_dump() { :; }
 		json_error() { printf 'error\t%s\n' "$1"; }
 		export VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
+		export VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=1
 		cmd_renderer_status '{}'
 	)
 )"
@@ -1767,6 +1816,9 @@ printf '%s\n' "$rpc_status_fields" | grep -Fxq $'int\trouter_fps\t8' ||
 printf '%s\n' "$rpc_status_fields" |
 	grep -Fxq $'string\trouter_profile\tfast' ||
 	fail "renderer_status omitted frozen renderer profile"
+printf '%s\n' "$rpc_status_fields" |
+	grep -Fxq $'boolean\trouter_max_threads\t0' ||
+	fail "renderer_status relabelled the frozen maximum-resource mode"
 grep -Fq $'status-touch\t57575757575757575757575757575757\t' \
 	"$rpc_call_log" || fail "renderer_status did not renew the renderer lease"
 
@@ -2244,6 +2296,7 @@ finite_media=38383838383838383838383838383838
 missing_audio_state=60606060606060606060606060606060
 fast_producer=50505050505050505050505050505050
 quality_producer=51515151515151515151515151515151
+max_threads_producer=61616161616161616161616161616161
 fast_av_producer=52525252525252525252525252525252
 instant_media=39393939393939393939393939393939
 lease_touch=42424242424242424242424242424242
@@ -2839,7 +2892,7 @@ assert_eq \
 	"video-only start"
 assert_eq \
 	"$("$helper" media-info "$no_audio")" \
-	$'125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
+	$'125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t0' \
 	"video-only duration metadata"
 assert_eq "$("$helper" has-audio "$no_audio")" 0 "video-only audio capability"
 assert_eq "$("$helper" audio-state "$no_audio")" absent \
@@ -3000,7 +3053,7 @@ assert_eq \
 quality_worker="$(session_pid "$quality_producer" worker)"
 assert_eq \
 	"$("$helper" media-info "$quality_producer")" \
-	$'125500\t7530\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
+	$'125500\t7530\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t0' \
 	"quality profile preserved configured FPS"
 run_mjpeg_cgi "$quality_producer" 51-1 "$work/quality-producer"
 IFS=: read -r quality_parts quality_first quality_last quality_preamble <<< "$(
@@ -3016,6 +3069,42 @@ assert_eq \
 	"quality producer stop"
 wait_dead "$quality_worker"
 quality_worker=""
+
+# Maximum-resource multithreading deliberately removes the default Quality
+# pipeline cap and reduced scheduler priority. Simulate a 32-thread router:
+# filters and MJPEG receive all 32 threads, while decoder safety stays capped
+# at FFmpeg 6.1.4's 16-thread limit. The frozen media-info flag must survive
+# any later UCI change.
+# shellcheck disable=SC2031
+export VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=1
+export VIDEOPLAYER_TEST_DECODER_THREADS=32
+export VIDEOPLAYER_EXPECT_DECODER_THREADS=16
+export VIDEOPLAYER_EXPECT_PIPELINE_THREADS=32
+export VIDEOPLAYER_TEST_EXPECT_NICE=0
+assert_eq \
+	"$("$helper" start "$max_threads_producer" "$work/media/fast-producer.mp4")" \
+	started \
+	"maximum-resource producer start"
+max_threads_worker="$(session_pid "$max_threads_producer" worker)"
+assert_eq \
+	"$("$helper" media-info "$max_threads_producer")" \
+	$'125500\t7530\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t1' \
+	"maximum-resource mode was not frozen in media info"
+export VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=0
+assert_eq \
+	"$("$helper" media-info "$max_threads_producer")" \
+	$'125500\t7530\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t1' \
+	"active maximum-resource session followed a later UCI change"
+assert_eq \
+	"$("$helper" stop "$max_threads_producer")" \
+	stopped \
+	"maximum-resource producer stop"
+wait_dead "$max_threads_worker"
+max_threads_worker=""
+unset VIDEOPLAYER_TEST_DECODER_THREADS
+unset VIDEOPLAYER_EXPECT_PIPELINE_THREADS
+unset VIDEOPLAYER_TEST_EXPECT_NICE
+export VIDEOPLAYER_EXPECT_DECODER_THREADS="$VIDEOPLAYER_BOUNDED_DECODER_THREADS"
 export VIDEOPLAYER_TEST_ROUTER_PROFILE=fast
 export VIDEOPLAYER_EXPECT_PROFILE=fast
 export VIDEOPLAYER_EXPECT_FPS=8
@@ -3029,7 +3118,7 @@ assert_eq \
 	"unknown-duration start"
 assert_eq \
 	"$("$helper" media-info "$duration_unknown")" \
-	$'0\t0\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
+	$'0\t0\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t0' \
 	"unknown-duration metadata"
 assert_eq \
 	"$("$helper" stop "$duration_unknown")" \
@@ -3485,7 +3574,7 @@ assert_eq "$("$helper" start "$token1" "$media")" started "start"
 assert_eq "$("$helper" status "$token1")" running "status after start"
 assert_eq \
 	"$("$helper" media-info "$token1")" \
-	$'125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone' \
+	$'125500\t1004\t8\tfast\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t0' \
 	"validated renderer media metadata"
 assert_eq \
 	"$(stat -c '%u:%a' -- "$runtime/s-$token1/media-info")" \

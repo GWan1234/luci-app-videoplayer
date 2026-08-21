@@ -191,6 +191,7 @@ source "$rpc_harness"
 
 VIDEOPLAYER_TEST_ROUTER_FPS=8
 VIDEOPLAYER_TEST_ROUTER_PROFILE=quality
+VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=0
 uci() {
 	[[ "$#" -eq 3 && "$1" == "-q" && "$2" == "get" ]] || return 1
 	case "$3" in
@@ -199,6 +200,9 @@ uci() {
 			;;
 		videoplayer.main.router_profile)
 			printf '%s\n' "$VIDEOPLAYER_TEST_ROUTER_PROFILE"
+			;;
+		videoplayer.main.router_max_threads)
+			printf '%s\n' "$VIDEOPLAYER_TEST_ROUTER_MAX_THREADS"
 			;;
 		*) return 1 ;;
 	esac
@@ -288,7 +292,7 @@ case "${1:-}" in
 		;;
 	media-info)
 		[ "$#" -eq 2 ] || exit 2
-		printf '0\t0\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone\n'
+		printf '0\t0\t60\tquality\tprivate-software-cpu\tsoftware-cpu-v1\tnone\t0\n'
 		;;
 	*) exit 2 ;;
 esac
@@ -394,6 +398,15 @@ for invalid_router_fps in 31 61; do
 		"unsupported router FPS $invalid_router_fps fallback"
 done
 VIDEOPLAYER_TEST_ROUTER_FPS=60
+VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=1
+assert_eq "$(get_router_max_threads)" "1" \
+	"exact maximum-resource setting"
+for invalid_max_threads in 0 yes 2 -1 ''; do
+	VIDEOPLAYER_TEST_ROUTER_MAX_THREADS="$invalid_max_threads"
+	assert_eq "$(get_router_max_threads)" "0" \
+		"invalid maximum-resource setting '$invalid_max_threads' fallback"
+done
+VIDEOPLAYER_TEST_ROUTER_MAX_THREADS=0
 cmd_resolve '{}' router >/dev/null
 [[ -z "$RESOLVE_ERROR" ]] ||
 	fail "router resolve returned an error: $RESOLVE_ERROR"
@@ -434,6 +447,8 @@ assert_eq "${json_fields[audio_ring_chunks]:-}" "8" \
 	"router audio ring size"
 assert_eq "${json_fields[router_profile]:-}" "quality" "router profile"
 assert_eq "${json_fields[router_fps]:-}" "60" "router FPS"
+assert_eq "${json_fields[router_max_threads]:-}" "0" \
+	"frozen maximum-resource setting"
 assert_eq "${json_fields[frame_interval_ms]:-}" "17" \
 	"router frame interval"
 assert_eq "${json_fields[mime]:-}" "multipart/x-mixed-replace" \

@@ -2752,7 +2752,8 @@ async function main() {
 		allow_remote: '1',
 		render_mode: 'router',
 		router_profile: 'fast',
-		router_fps: '60'
+		router_fps: '60',
+		router_max_threads: '0'
 	};
 	const activeSettings = {
 		enabled: '1',
@@ -2760,7 +2761,8 @@ async function main() {
 		allow_remote: '1',
 		render_mode: 'router',
 		router_profile: 'fast',
-		router_fps: '8'
+		router_fps: '8',
+		router_max_threads: '0'
 	};
 	const profileControl = { value: 'fast' };
 	const fpsControl = {
@@ -2780,6 +2782,7 @@ async function main() {
 	elements['vp-render-mode'] = { value: 'router' };
 	elements['vp-router-profile'] = profileControl;
 	elements['vp-router-fps'] = fpsControl;
+	elements['vp-router-max-threads'] = { checked: true };
 	uci.get = (config, section, option) => stagedSettings[option];
 	uci.set = (config, section, option, value) => {
 		stagedSettings[option] = String(value);
@@ -2801,6 +2804,7 @@ async function main() {
 	app._renderMode = 'router';
 	app._routerProfile = 'fast';
 	app._routerFps = 8;
+	app._routerMaxThreads = false;
 	app._status = { media_path: '/mnt/video', renderer_available: 1 };
 	app._browseRequestId = 0;
 	app._cwd = '';
@@ -2823,8 +2827,10 @@ async function main() {
 	check(await app.handleSave() === true,
 		'native Save did not report successful UCI staging');
 	check(stagedSettings.router_profile === 'fast' &&
-		stagedSettings.router_fps === '8' && app._routerFps === 8,
-		'fast profile save persisted a stale FPS above its effective cap');
+		stagedSettings.router_fps === '8' &&
+		stagedSettings.router_max_threads === '1' &&
+		app._routerFps === 8 && app._routerMaxThreads === false,
+		'Save did not stage maximum threads or changed the active CPU settings');
 	check(uciSaveCalls === 1 && rawUciApplyCalls === 0 &&
 		nativeApplyCalls.length === 0 && profileStops === 0,
 		'native Save applied settings or changed active player state');
@@ -2855,14 +2861,17 @@ async function main() {
 	elements['vp-render-mode'].value = 'browser';
 	profileControl.value = 'fast';
 	fpsControl.value = '5';
+	elements['vp-router-max-threads'].checked = false;
 	await app.handleReset();
 	check(elements['vp-enabled'].checked === true &&
 		elements['vp-media-path'].value === '/mnt/video' &&
 		elements['vp-allow-remote'].checked === true &&
 		elements['vp-render-mode'].value === 'router' &&
 		profileControl.value === 'quality' && fpsControl.value === '60' &&
+		elements['vp-router-max-threads'].checked === true &&
 		app._routerProfile === activeSettings.router_profile &&
-		app._routerFps === Number(activeSettings.router_fps),
+		app._routerFps === Number(activeSettings.router_fps) &&
+		app._routerMaxThreads === false,
 		'native Reset did not restore staged controls without changing runtime');
 
 	/* Validation and save failures must never fall through into Apply. */
@@ -2896,7 +2905,8 @@ async function main() {
 		allow_remote: '0',
 		render_mode: 'browser',
 		router_profile: 'quality',
-		router_fps: '60'
+		router_fps: '60',
+		router_max_threads: '1'
 	});
 	Object.assign(activeSettings, {
 		enabled: '1',
@@ -2904,7 +2914,8 @@ async function main() {
 		allow_remote: '1',
 		render_mode: 'router',
 		router_profile: 'fast',
-		router_fps: '8'
+		router_fps: '8',
+		router_max_threads: '0'
 	});
 	Object.keys(renderedElements).forEach(key => delete renderedElements[key]);
 	const originalWindowSetTimeoutForRender = window.setTimeout;
@@ -2944,15 +2955,27 @@ async function main() {
 		renderedElements['vp-allow-remote'].attrs.checked == null &&
 		selectedSetting('vp-render-mode') === 'browser' &&
 		selectedSetting('vp-router-profile') === 'quality' &&
-		selectedSetting('vp-router-fps') === '60',
+		selectedSetting('vp-router-fps') === '60' &&
+		renderedElements['vp-router-max-threads'].attrs.checked === 'checked',
 		'native settings form did not render staged UCI values');
 	check(app._localEnabled === true && app._allowRemote === true &&
 		app._renderMode === 'router' && app._routerProfile === 'fast' &&
-		app._routerFps === 8 && app._status.media_path === '/mnt/active' &&
+		app._routerFps === 8 && app._routerMaxThreads === false &&
+		app._status.media_path === '/mnt/active' &&
 		renderedElements['videoplayer-remote-url'].attrs.disabled === 'disabled' &&
 		renderedElements['vp-play-remote-btn'].attrs.disabled === 'disabled' &&
 		renderedElements['vp-root-btn'].attrs.disabled == null,
 		'staged UCI values changed active player state before Apply');
+	check(renderedElements['vp-router-max-threads'].attrs['aria-describedby'] ===
+			'vp-router-max-threads-desc vp-router-max-threads-warning' &&
+		renderedElements['vp-router-max-threads-warning'].attrs.class ===
+			'cbi-value-description alert-message warning' &&
+		renderedElements['vp-router-max-threads-warning'].attrs.role === 'note' &&
+		String(renderedElements['vp-router-max-threads-warning'].children)
+			.includes('router may become unstable') &&
+		String(renderedElements['vp-router-max-threads-warning'].children)
+			.includes('internet access may be interrupted'),
+		'maximum-resource warning or accessibility linkage is incomplete');
 	window.setTimeout = originalWindowSetTimeoutForRender;
 	window.addEventListener = originalWindowAddEventListener;
 	window.removeEventListener = originalWindowRemoveEventListener;
@@ -2983,6 +3006,7 @@ async function main() {
 	delete elements['vp-render-mode'];
 	delete elements['vp-router-profile'];
 	delete elements['vp-router-fps'];
+	delete elements['vp-router-max-threads'];
 
 	process.stdout.write('web-audio-test: ok\n');
 }

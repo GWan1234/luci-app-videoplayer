@@ -250,6 +250,10 @@ for hook in preinst postinst prerm postrm; do
 done
 grep -Fq 'maintenance-enter' "$makefile"
 grep -Fq 'maintenance-exit' "$makefile"
+grep -Fq "option router_max_threads '0'" \
+	"$root/luci-app-videoplayer/root/etc/config/videoplayer"
+grep -Fq 'ensure_option router_max_threads 0' \
+	"$root/luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer"
 if grep -Eq 'videoplayer-renderer cleanup.*\|\| true|rm -f /tmp/videoplayer-render-v1(\.worker)?\.lock|flock .* -w' \
 	"$makefile" "$root/luci-app-videoplayer/root/etc/uci-defaults/80_luci-videoplayer"
 then

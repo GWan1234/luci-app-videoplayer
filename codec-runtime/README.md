@@ -21,13 +21,13 @@ CPU:
 dist/
 └── aarch64_cortex-a53/
     ├── openwrt-25.12.5-r33051-f5dae5ece4/
-    │   ├── luci-app-videoplayer-1.1.0.apk
+    │   ├── luci-app-videoplayer-1.1.1.apk
     │   ├── luci-videoplayer-codec-runtime-6.1.4-r5.apk
     │   ├── BUILD_INFO
     │   ├── PACKAGE_SET.json
     │   └── SHA256SUMS
     └── openwrt-24.10.8-r29233-443ec4032a/
-        ├── luci-app-videoplayer_1.1.0_all.ipk
+        ├── luci-app-videoplayer_1.1.1_all.ipk
         ├── luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
         ├── BUILD_INFO
         ├── PACKAGE_SET.json
