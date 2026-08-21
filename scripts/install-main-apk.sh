@@ -9,10 +9,11 @@ REPOSITORY="communism420/luci-app-videoplayer"
 MAIN_BRANCH="main"
 SNAPSHOT_BRANCH="snapshot"
 APP_VERSION="1.1.1"
+APP_PACKAGE_NAME="luci-app-videoplayer"
 SNAPSHOT_APK="luci-app-videoplayer-$APP_VERSION.apk"
 SNAPSHOT_INDEX="INDEX.tsv"
 CODEC_INSTALLER_OBJECT="scripts/install-codec-runtime.sh"
-CODEC_INSTALLER_SHA256="a5f3b50310e7551958158fcc9b84d69c984e94194c7718321f6c01be21224dab"
+CODEC_INSTALLER_SHA256="1d39cd9bb32e83bca99349d984f0fa2cff14b60c7643c9f5961f9703269e93d5"
 API_BASE_URL="https://api.github.com/repos/$REPOSITORY"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPOSITORY"
 
@@ -222,6 +223,16 @@ require_supported_apk_platform() {
 	die "No current-main APK is published for OpenWrt $1 $2."
 }
 
+require_safe_component() {
+	value_label="$1"
+	value="$2"
+	case "$value" in
+		""|"."|".."|*".."*|*[!a-zA-Z0-9._+-]*)
+			die "OpenWrt returned an unsafe $value_label value."
+			;;
+	esac
+}
+
 require_current_snapshot() {
 	[ "$1" = "$2" ] ||
 		die "The verified APK does not match current main. Wait for the package checks and retry."
@@ -234,7 +245,7 @@ select_apk_install_mode() {
 	fi
 
 	apk_info_status="0"
-	apk info -e luci-app-videoplayer >/dev/null 2>&1 ||
+	apk info -e "$APP_PACKAGE_NAME" >/dev/null 2>&1 ||
 		apk_info_status="$?"
 	case "$apk_info_status" in
 		0)
@@ -248,6 +259,12 @@ select_apk_install_mode() {
 			die "Could not determine whether luci-app-videoplayer is already installed."
 			;;
 	esac
+}
+
+verify_registered_apk_package() {
+	package_name="$1"
+	apk info -e "$package_name" >/dev/null 2>&1 ||
+		die "apk completed without registering $package_name."
 }
 
 install_apk_package() {
@@ -320,13 +337,9 @@ OPENWRT_REVISION="$(read_release_value DISTRIB_REVISION)"
 OPENWRT_ARCH="$(read_release_value DISTRIB_ARCH)"
 [ "$OPENWRT_ID" = "OpenWrt" ] ||
 	die "This installer supports OpenWrt only."
-for field in "$OPENWRT_RELEASE" "$OPENWRT_REVISION" "$OPENWRT_ARCH"; do
-	case "$field" in
-		""|*[!a-zA-Z0-9._+-]*)
-			die "OpenWrt returned unsafe release or architecture metadata."
-			;;
-	esac
-done
+require_safe_component "release" "$OPENWRT_RELEASE"
+require_safe_component "revision" "$OPENWRT_REVISION"
+require_safe_component "package architecture" "$OPENWRT_ARCH"
 verify_apk_architecture "$OPENWRT_ARCH"
 require_supported_apk_platform "$OPENWRT_RELEASE" "$OPENWRT_REVISION"
 
@@ -468,6 +481,7 @@ require_current_snapshot "$SOURCE_COMMIT" "$FINAL_MAIN_COMMIT"
 
 printf 'Installing %s with apk...\n' "$SNAPSHOT_APK"
 install_apk_package "$APK_INSTALL_MODE" "$APK_PATH"
+verify_registered_apk_package "$APP_PACKAGE_NAME"
 
 printf '%s\n' \
 	"Installing or updating the architecture-specific FFmpeg runtime after the strict application maintenance helper..."

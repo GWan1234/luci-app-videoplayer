@@ -32,7 +32,7 @@ MAX_PACKAGE_BLOCKS="131072"
 MAX_REPORT_BLOCKS="512"
 DOWNLOAD_TIMEOUT_SECONDS="30"
 DOWNLOAD_DEADLINE_SECONDS="180"
-FFMPEG_PROBE_DEADLINE_SECONDS="30"
+RUNTIME_PROBE_DEADLINE_SECONDS="30"
 HAS_WORKING_TIMEOUT="0"
 WORK_DIR=""
 
@@ -363,7 +363,7 @@ run_ffmpeg_report() (
 		exit 1
 	fi
 	if [ "$HAS_WORKING_TIMEOUT" = "1" ]; then
-		timeout "$FFMPEG_PROBE_DEADLINE_SECONDS" \
+		timeout "$RUNTIME_PROBE_DEADLINE_SECONDS" \
 			"$PRIVATE_FFMPEG" -hide_banner "$report_option" \
 			>"$report_output" 2>"$report_error"
 	else
@@ -371,6 +371,16 @@ run_ffmpeg_report() (
 			>"$report_output" 2>"$report_error"
 	fi
 )
+
+run_relay_probe() {
+	relay_path="$1"
+	if [ "$HAS_WORKING_TIMEOUT" = "1" ]; then
+		timeout "$RUNTIME_PROBE_DEADLINE_SECONDS" \
+			"$relay_path" </dev/null >/dev/null 2>&1
+	else
+		"$relay_path" </dev/null >/dev/null 2>&1
+	fi
+}
 
 check_component() {
 	component_report="$1"
@@ -459,7 +469,7 @@ done
 detect_working_timeout
 if [ "$HAS_WORKING_TIMEOUT" != "1" ]; then
 	warn \
-		"A working timeout command is unavailable; bounded file-size checks remain active, but network and FFmpeg probe deadlines cannot be enforced."
+		"A working timeout command is unavailable; bounded file-size checks remain active, but network and runtime probe deadlines cannot be enforced."
 fi
 if ! command -v uclient-fetch >/dev/null 2>&1 &&
 	! command -v wget >/dev/null 2>&1 &&
@@ -780,7 +790,7 @@ if [ ! -f "$PRIVATE_RELAY" ] ||
 	die "The installed MJPEG relay is missing or unsafe: $PRIVATE_RELAY"
 fi
 RELAY_PROBE_RC="0"
-"$PRIVATE_RELAY" </dev/null >/dev/null 2>&1 || RELAY_PROBE_RC="$?"
+run_relay_probe "$PRIVATE_RELAY" || RELAY_PROBE_RC="$?"
 [ "$RELAY_PROBE_RC" -eq 64 ] ||
 	die "The installed MJPEG relay failed its executable probe."
 

@@ -132,6 +132,61 @@ case "$platform_kind" in
 esac
 EOF
 
+cat > "$tmp/probe-safe-component.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+value_label="$2"
+value="$3"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+require_safe_component "$value_label" "$value"
+EOF
+
+cat > "$tmp/probe-apk-registration.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+package_name="$2"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+verify_registered_apk_package "$package_name"
+EOF
+
+cat > "$tmp/probe-relay.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+relay_path="$2"
+has_working_timeout="$3"
+probe_deadline="$4"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+HAS_WORKING_TIMEOUT="$has_working_timeout"
+RUNTIME_PROBE_DEADLINE_SECONDS="$probe_deadline"
+probe_rc="0"
+run_relay_probe "$relay_path" || probe_rc="$?"
+printf '%s\n' "$probe_rc"
+EOF
+
+cat > "$tmp/probe-renderer-attestation.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+installer_without_main="$1"
+renderer_path="$2"
+has_working_timeout="$3"
+probe_deadline="$4"
+# shellcheck disable=SC1090
+. "$installer_without_main"
+HAS_WORKING_TIMEOUT="$has_working_timeout"
+RUNTIME_PROBE_DEADLINE_SECONDS="$probe_deadline"
+run_renderer_attestation "$renderer_path"
+EOF
+
 architecture_test_bin="$tmp/architecture-test-bin"
 mkdir "$architecture_test_bin"
 cat > "$architecture_test_bin/opkg" <<'EOF'
@@ -143,7 +198,7 @@ cat "$OPKG_ARCHITECTURES_FILE"
 EOF
 chmod 0755 "$architecture_test_bin/opkg"
 
-expected_release_bootstrap='sh <(wget -O - https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh)'
+expected_release_bootstrap='sh <(wget -O - https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.1/install-from-github.sh)'
 expected_main_bootstrap='sh <(wget -O - https://raw.githubusercontent.com/communism420/luci-app-videoplayer/refs/heads/main/scripts/install-main-apk.sh)'
 mapfile -t bootstrap_commands < <(
 	grep -E '^sh <\(wget -O - https://[^[:space:]]+\)$' "$root/README.md"
@@ -197,6 +252,22 @@ grep -Fq \
 		'README.md must force-downgrade and force-reinstall the current local IPK.' >&2
 	exit 1
 }
+grep -Fq \
+	'apk add --allow-untrusted --force-reinstall /tmp/luci-videoplayer-codec-runtime-6.1.4-r5.apk' \
+	"$root/README.md" ||
+	fail 'README.md must force-reinstall the current local codec APK.'
+grep -Fq \
+	'opkg --force-downgrade --force-reinstall install /tmp/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk' \
+	"$root/README.md" ||
+	fail 'README.md must force-downgrade and force-reinstall the current local codec IPK.'
+if grep -Eq '^\.[[:space:]]+/etc/openwrt_release([[:space:]]|$)' \
+	"$root/README.md"; then
+	fail 'README.md sources OpenWrt metadata instead of parsing it as data.'
+fi
+grep -Fq \
+	'sed -n "s/^DISTRIB_ARCH='"'"'\([^'"'"']*\)'"'"'$/\1/p" /etc/openwrt_release' \
+	"$root/README.md" ||
+	fail 'README.md does not show strict DISTRIB_ARCH extraction.'
 
 codec_installer_sha="$(
 	sha256sum "$root/scripts/install-codec-runtime.sh" |
@@ -227,10 +298,18 @@ app_install_line="$(
 	grep -nF "$app_install_marker" "$root/$app_installer" |
 		awk -F: 'NR == 1 { print $1 }'
 )"
+app_registration_line="$(
+	grep -nF \
+		"verify_registered_apk_package \"\$APP_PACKAGE_NAME\"" \
+		"$root/$app_installer" |
+		awk -F: 'NR == 1 { print $1 }'
+)"
 if [[ ! "$codec_call_line" =~ ^[0-9]+$ ]] ||
 	[[ ! "$app_install_line" =~ ^[0-9]+$ ]] ||
-	((app_install_line >= codec_call_line)); then
-	printf '%s does not install the strict application maintenance helper before FFmpeg.\n' \
+	[[ ! "$app_registration_line" =~ ^[0-9]+$ ]] ||
+	((app_install_line >= app_registration_line)) ||
+	((app_registration_line >= codec_call_line)); then
+	printf '%s does not install and confirm the strict application maintenance helper before FFmpeg.\n' \
 		"$app_installer" >&2
 	exit 1
 fi
@@ -264,6 +343,52 @@ cmp -s "$architecture_helper_reference" "$architecture_helper_candidate" ||
 release_installer="$root/scripts/install-from-github.sh"
 release_installer_without_main="$tmp/install-from-github.without-main"
 sed '$d' "$release_installer" > "$release_installer_without_main"
+main_installer_without_main="$tmp/install-main-apk.without-main"
+sed '$d' "$root/scripts/install-main-apk.sh" > "$main_installer_without_main"
+codec_installer_without_main="$tmp/install-codec-runtime.without-main"
+sed '$d' "$root/scripts/install-codec-runtime.sh" \
+	> "$codec_installer_without_main"
+
+for safe_component_installer in \
+	"$release_installer_without_main" \
+	"$main_installer_without_main" \
+	"$codec_installer_without_main"
+do
+	sh "$tmp/probe-safe-component.sh" \
+		"$safe_component_installer" "package architecture" \
+		'aarch64_cortex-a53'
+	for unsafe_component in \
+		'' '.' '..' 'a..b' 'bad/value' 'bad value' $'bad\nvalue'
+	do
+		if sh "$tmp/probe-safe-component.sh" \
+			"$safe_component_installer" "package architecture" \
+			"$unsafe_component" \
+			>"$tmp/unsafe-component.stdout" \
+			2>"$tmp/unsafe-component.stderr"; then
+			fail "$(basename "$safe_component_installer") accepted unsafe OpenWrt metadata."
+		fi
+	done
+done
+for safe_component_script in \
+	scripts/install-from-github.sh \
+	scripts/install-main-apk.sh \
+	scripts/install-codec-runtime.sh
+do
+	safe_component_line="$(
+		grep -nF 'require_safe_component "package architecture"' \
+			"$root/$safe_component_script" |
+			awk -F: 'END { print $1 }'
+	)"
+	temporary_directory_line="$(
+		grep -nF 'umask 077' "$root/$safe_component_script" |
+			awk -F: 'NR == 1 { print $1 }'
+	)"
+	if [[ ! "$safe_component_line" =~ ^[0-9]+$ ]] ||
+		[[ ! "$temporary_directory_line" =~ ^[0-9]+$ ]] ||
+		((safe_component_line >= temporary_directory_line)); then
+		fail "$safe_component_script does not reject unsafe metadata before creating download state."
+	fi
+done
 
 canonical_release_file="$tmp/openwrt-release-canonical"
 cat > "$canonical_release_file" <<'EOF'
@@ -338,8 +463,8 @@ if PATH="$architecture_test_bin:$PATH" \
 fi
 
 release_help="$(sh "$release_installer" --help)"
-grep -Fq 'Release 1.1.0' <<<"$release_help" ||
-	fail 'The release installer help does not identify Release 1.1.0.'
+grep -Fq 'Release 1.1.1' <<<"$release_help" ||
+	fail 'The release installer help does not identify Release 1.1.1.'
 grep -Fq '6.1.4-r5 software-CPU runtime' <<<"$release_help" ||
 	fail 'The release installer help does not identify the strict codec runtime.'
 grep -Fq 'OpenWrt 25.12.5 r33051-f5dae5ece4 (apk)' <<<"$release_help" ||
@@ -349,7 +474,7 @@ grep -Fq 'OpenWrt 24.10.8 r29233-443ec4032a (opkg)' <<<"$release_help" ||
 
 selected_apk="$tmp/selected-apk"
 sh -s -- "$release_installer_without_main" \
-	"$root/scripts/release-1.1.0-codecs.tsv" > "$selected_apk" <<'EOF'
+	"$root/scripts/release-1.1.1-codecs.tsv" > "$selected_apk" <<'EOF'
 set -eu
 installer="$1"
 manifest="$2"
@@ -367,7 +492,7 @@ grep -Fx \
 
 selected_ipk="$tmp/selected-ipk"
 sh -s -- "$release_installer_without_main" \
-	"$root/scripts/release-1.1.0-codecs.tsv" > "$selected_ipk" <<'EOF'
+	"$root/scripts/release-1.1.1-codecs.tsv" > "$selected_ipk" <<'EOF'
 set -eu
 installer="$1"
 manifest="$2"
@@ -385,7 +510,7 @@ grep -Fx \
 
 sh -s -- \
 	"$release_installer_without_main" \
-	"$root/scripts/release-1.1.0-codecs.tsv" \
+	"$root/scripts/release-1.1.1-codecs.tsv" \
 	"$tmp/single-codec-row.tsv" <<'EOF'
 set -eu
 installer="$1"
@@ -419,13 +544,13 @@ EOF
 
 duplicate_manifest="$tmp/duplicate-codec-manifest.tsv"
 {
-	grep '^#' "$root/scripts/release-1.1.0-codecs.tsv"
+	grep '^#' "$root/scripts/release-1.1.1-codecs.tsv"
 	grep -F \
 		'apk|25.12.5|r33051-f5dae5ece4|aarch64_cortex-a53|' \
-		"$root/scripts/release-1.1.0-codecs.tsv"
+		"$root/scripts/release-1.1.1-codecs.tsv"
 	grep -F \
 		'apk|25.12.5|r33051-f5dae5ece4|aarch64_cortex-a53|' \
-		"$root/scripts/release-1.1.0-codecs.tsv"
+		"$root/scripts/release-1.1.1-codecs.tsv"
 } > "$duplicate_manifest"
 if sh -s -- "$release_installer_without_main" "$duplicate_manifest" \
 	>"$tmp/duplicate.stdout" 2>"$tmp/duplicate.stderr" <<'EOF'
@@ -440,12 +565,12 @@ EOF
 then
 	fail 'The release installer accepted an ambiguous codec mapping.'
 fi
-grep -F 'No unique Release 1.1.0 codec exists' \
+grep -F 'No unique Release 1.1.1 codec exists' \
 	"$tmp/duplicate.stderr" >/dev/null ||
 	fail 'The ambiguous codec mapping returned the wrong error.'
 
 if sh -s -- "$release_installer_without_main" \
-	"$root/scripts/release-1.1.0-codecs.tsv" \
+	"$root/scripts/release-1.1.1-codecs.tsv" \
 	>"$tmp/unsupported.stdout" 2>"$tmp/unsupported.stderr" <<'EOF'
 set -eu
 installer="$1"
@@ -458,7 +583,7 @@ EOF
 then
 	fail 'The release installer accepted an unsupported architecture.'
 fi
-grep -F 'No unique Release 1.1.0 codec exists' \
+grep -F 'No unique Release 1.1.1 codec exists' \
 	"$tmp/unsupported.stderr" >/dev/null ||
 	fail 'The unsupported architecture returned the wrong error.'
 
@@ -486,8 +611,6 @@ grep -F 'Internal error: unsupported package format.' \
 	fail 'The unsupported package format returned the wrong error.'
 
 main_installer="$root/scripts/install-main-apk.sh"
-main_installer_without_main="$tmp/install-main-apk.without-main"
-sed '$d' "$main_installer" > "$main_installer_without_main"
 [[ "$(sh "$tmp/probe-release-value.sh" \
 	"$main_installer_without_main" "$canonical_release_file")" == \
 	'aarch64_cortex-a53' ]] ||
@@ -526,6 +649,37 @@ fi
 grep -F 'does not match the APK package architecture' \
 	"$tmp/main-apk-arch-mismatch.stderr" >/dev/null ||
 	fail 'The current-main architecture mismatch returned the wrong error.'
+main_registration_bin="$tmp/main-registration-bin"
+mkdir "$main_registration_bin"
+cat > "$main_registration_bin/apk" <<'EOF'
+#!/bin/sh
+set -eu
+: "${APK_REGISTRATION_LOG:?}"
+printf '%s\n' "$*" > "$APK_REGISTRATION_LOG"
+[ "$#" -eq 3 ] && [ "$1" = info ] && [ "$2" = -e ]
+exit "${APK_REGISTRATION_STATUS:-0}"
+EOF
+chmod 0755 "$main_registration_bin/apk"
+registration_log="$tmp/main-registration.log"
+PATH="$main_registration_bin" \
+	APK_REGISTRATION_LOG="$registration_log" \
+	APK_REGISTRATION_STATUS=0 \
+	/bin/sh "$tmp/probe-apk-registration.sh" \
+		"$main_installer_without_main" luci-app-videoplayer
+[[ "$(cat "$registration_log")" == 'info -e luci-app-videoplayer' ]] ||
+	fail 'The current-main installer used the wrong application registration query.'
+if PATH="$main_registration_bin" \
+	APK_REGISTRATION_LOG="$registration_log" \
+	APK_REGISTRATION_STATUS=1 \
+	/bin/sh "$tmp/probe-apk-registration.sh" \
+		"$main_installer_without_main" luci-app-videoplayer \
+		>"$tmp/main-registration.stdout" \
+		2>"$tmp/main-registration.stderr"; then
+	fail 'The current-main installer accepted an unregistered application.'
+fi
+grep -F 'apk completed without registering luci-app-videoplayer.' \
+	"$tmp/main-registration.stderr" >/dev/null ||
+	fail 'The current-main installer returned the wrong registration error.'
 current_commit="1111111111111111111111111111111111111111"
 stale_commit="2222222222222222222222222222222222222222"
 sh -s -- "$main_installer_without_main" "$current_commit" <<'EOF'
@@ -884,14 +1038,15 @@ do
 	fi
 done
 
-# `stat` is supplied by the application's coreutils-stat dependency on minimal
-# supported OpenWrt images, so the installer must not require it before the
-# application transaction. It must require it before installing the codec.
+# `stat` and `timeout` are supplied by application dependencies on minimal
+# supported OpenWrt images, so the installer must not require them before the
+# application transaction. It must require them before installing the codec.
 initial_command_loop="$(
 	sed -n '/^for required_command in /,/^done$/p' "$release_installer"
 )"
-if grep -Eq '(^|[[:space:]])stat([[:space:]]|$)' <<<"$initial_command_loop"; then
-	fail 'The release installer requires coreutils-stat before dependencies can be installed.'
+if grep -Eq '(^|[[:space:]])(stat|timeout)([[:space:]]|$)' \
+	<<<"$initial_command_loop"; then
+	fail 'The release installer requires application-provided coreutils before dependencies can be installed.'
 fi
 mapfile -t release_post_app_lines < <(
 	grep -nFx $'\t\trequire_post_app_commands' "$release_installer" |
@@ -902,7 +1057,7 @@ if ((${#release_post_app_lines[@]} != 2)) ||
 	((release_post_app_lines[0] >= release_codec_apk_line)) ||
 	((release_post_app_lines[1] <= release_app_registration_lines[1])) ||
 	((release_post_app_lines[1] >= release_codec_ipk_line)); then
-	fail 'The release installer does not validate coreutils-stat between the application and codec transactions.'
+	fail 'The release installer does not validate application-provided coreutils between the application and codec transactions.'
 fi
 
 missing_stat_bin="$tmp/release-missing-stat-bin"
@@ -927,6 +1082,28 @@ cat > "$missing_stat_bin/stat" <<'EOF'
 exit 0
 EOF
 chmod 0755 "$missing_stat_bin/stat"
+if env PATH="$missing_stat_bin" /bin/sh -s -- \
+	"$release_installer_without_main" \
+	>"$tmp/missing-timeout.stdout" 2>"$tmp/missing-timeout.stderr" <<'EOF'
+set -eu
+installer="$1"
+# shellcheck disable=SC1090
+. "$installer"
+require_post_app_commands
+EOF
+then
+	fail 'The release installer accepted a missing post-application timeout dependency.'
+fi
+grep -F 'did not provide its required coreutils-timeout dependency' \
+	"$tmp/missing-timeout.stderr" >/dev/null ||
+	fail 'The missing coreutils-timeout dependency returned the wrong error.'
+cat > "$missing_stat_bin/timeout" <<'EOF'
+#!/bin/sh
+set -eu
+shift
+exec "$@"
+EOF
+chmod 0755 "$missing_stat_bin/timeout"
 env PATH="$missing_stat_bin" /bin/sh -s -- \
 	"$release_installer_without_main" <<'EOF'
 set -eu
@@ -1035,9 +1212,6 @@ main_help="$(sh "$root/scripts/install-main-apk.sh" --help)"
 printf '%s\n' "$main_help" | grep -Fq 'current main branch first' ||
 	fail "current-main installer help does not document app-first ordering"
 
-codec_installer_without_main="$tmp/install-codec-runtime.without-main"
-sed '$d' "$root/scripts/install-codec-runtime.sh" \
-	> "$codec_installer_without_main"
 [[ "$(sh "$tmp/probe-release-value.sh" \
 	"$codec_installer_without_main" "$canonical_release_file")" == \
 	'aarch64_cortex-a53' ]] ||
@@ -1062,6 +1236,115 @@ if sh "$tmp/probe-package-architecture.sh" \
 	2>"$tmp/codec-apk-arch-mismatch.stderr"; then
 	fail 'The codec installer accepted mismatched APK architecture metadata.'
 fi
+[ "$(grep -Fxc $'\trun_relay_probe "$PRIVATE_RELAY" || relay_status="$?"' \
+	"$release_installer")" = 1 ] ||
+	fail 'The release installer final verification bypasses the bounded relay probe.'
+[ "$(grep -Fxc $'\tattestation_output="$(run_renderer_attestation "$RENDERER_HELPER")" ||' \
+	"$release_installer")" = 1 ] ||
+	fail 'The release installer final verification bypasses bounded renderer attestation.'
+[ "$(grep -Fxc $'run_relay_probe "$PRIVATE_RELAY" || RELAY_PROBE_RC="$?"' \
+	"$root/scripts/install-codec-runtime.sh")" = 1 ] ||
+	fail 'The standalone codec installer final verification bypasses the bounded relay probe.'
+relay_probe="$tmp/relay-probe"
+cat > "$relay_probe" <<'EOF'
+#!/bin/sh
+set -eu
+: "${RELAY_EXECUTION_LOG:?}"
+printf x >> "$RELAY_EXECUTION_LOG"
+exit 64
+EOF
+chmod 0755 "$relay_probe"
+relay_execution_log="$tmp/relay-execution.log"
+: > "$relay_execution_log"
+[[ "$(RELAY_EXECUTION_LOG="$relay_execution_log" \
+	/bin/sh "$tmp/probe-relay.sh" \
+		"$codec_installer_without_main" "$relay_probe" 0 17)" == 64 ]] ||
+	fail 'The codec installer rejected the relay executable probe fallback.'
+[[ "$(cat "$relay_execution_log")" == x ]] ||
+	fail 'The codec installer did not execute the relay fallback probe.'
+rejecting_timeout_bin="$tmp/rejecting-timeout-bin"
+mkdir "$rejecting_timeout_bin"
+cat > "$rejecting_timeout_bin/timeout" <<'EOF'
+#!/bin/sh
+set -eu
+: "${RELAY_TIMEOUT_LOG:?}"
+printf '%s\n' "$*" > "$RELAY_TIMEOUT_LOG"
+exit 124
+EOF
+chmod 0755 "$rejecting_timeout_bin/timeout"
+for relay_installer_case in \
+	"codec|$codec_installer_without_main" \
+	"release|$release_installer_without_main"
+do
+	IFS='|' read -r relay_installer_label relay_installer_path \
+		<<< "$relay_installer_case"
+	: > "$relay_execution_log"
+	relay_timeout_log="$tmp/$relay_installer_label-relay-timeout.log"
+	: > "$relay_timeout_log"
+	[[ "$(PATH="$working_timeout_bin:$PATH" \
+		TIMEOUT_PROBE_LOG="$relay_timeout_log" \
+		RELAY_EXECUTION_LOG="$relay_execution_log" \
+		/bin/sh "$tmp/probe-relay.sh" \
+			"$relay_installer_path" "$relay_probe" 1 17)" == 64 ]] ||
+		fail "The $relay_installer_label installer rejected a successful bounded relay probe."
+	[[ "$(cat "$relay_timeout_log")" == x ]] ||
+		fail "The $relay_installer_label installer did not bound the relay probe with timeout."
+	[[ "$(cat "$relay_execution_log")" == x ]] ||
+		fail "The bounded $relay_installer_label relay probe did not execute the relay."
+
+	: > "$relay_execution_log"
+	relay_timeout_args="$tmp/$relay_installer_label-relay-timeout-args.log"
+	[[ "$(PATH="$rejecting_timeout_bin" \
+		RELAY_TIMEOUT_LOG="$relay_timeout_args" \
+		RELAY_EXECUTION_LOG="$relay_execution_log" \
+		/bin/sh "$tmp/probe-relay.sh" \
+			"$relay_installer_path" "$relay_probe" 1 17)" == 124 ]] ||
+		fail "The $relay_installer_label installer did not propagate a relay probe timeout."
+	[[ "$(cat "$relay_timeout_args")" == "17 $relay_probe" ]] ||
+		fail "The $relay_installer_label installer used the wrong relay probe timeout arguments."
+	[[ ! -s "$relay_execution_log" ]] ||
+		fail "The timed-out $relay_installer_label relay probe unexpectedly executed the relay."
+done
+
+renderer_probe="$tmp/renderer-probe"
+cat > "$renderer_probe" <<'EOF'
+#!/bin/sh
+set -eu
+: "${RENDERER_EXECUTION_LOG:?}"
+[ "$#" -eq 1 ] && [ "$1" = attest ]
+printf x >> "$RENDERER_EXECUTION_LOG"
+printf 'private-software-cpu\tsoftware-cpu-v1\tnone\n'
+EOF
+chmod 0755 "$renderer_probe"
+renderer_execution_log="$tmp/renderer-execution.log"
+: > "$renderer_execution_log"
+renderer_timeout_log="$tmp/renderer-timeout.log"
+: > "$renderer_timeout_log"
+[[ "$(PATH="$working_timeout_bin:$PATH" \
+	TIMEOUT_PROBE_LOG="$renderer_timeout_log" \
+	RENDERER_EXECUTION_LOG="$renderer_execution_log" \
+	/bin/sh "$tmp/probe-renderer-attestation.sh" \
+		"$release_installer_without_main" "$renderer_probe" 1 17)" == \
+	$'private-software-cpu\tsoftware-cpu-v1\tnone' ]] ||
+	fail 'The release installer rejected a successful bounded renderer attestation.'
+[[ "$(cat "$renderer_timeout_log")" == x ]] ||
+	fail 'The release installer did not bound renderer attestation with timeout.'
+[[ "$(cat "$renderer_execution_log")" == x ]] ||
+	fail 'The bounded renderer attestation did not execute the renderer.'
+: > "$renderer_execution_log"
+renderer_timeout_args="$tmp/renderer-timeout-args.log"
+if PATH="$rejecting_timeout_bin" \
+	RELAY_TIMEOUT_LOG="$renderer_timeout_args" \
+	RENDERER_EXECUTION_LOG="$renderer_execution_log" \
+	/bin/sh "$tmp/probe-renderer-attestation.sh" \
+		"$release_installer_without_main" "$renderer_probe" 1 17 \
+		>"$tmp/renderer-timeout.stdout" 2>"$tmp/renderer-timeout.stderr"; then
+	fail 'The release installer accepted a renderer attestation timeout.'
+fi
+[[ "$(cat "$renderer_timeout_args")" == "17 $renderer_probe attest" ]] ||
+	fail 'The release installer used the wrong renderer attestation timeout arguments.'
+[[ ! -s "$renderer_execution_log" ]] ||
+	fail 'The timed-out renderer attestation unexpectedly executed the renderer.'
 for action_case in \
 	"<|0|upgrade" \
 	"<|1|upgrade" \
