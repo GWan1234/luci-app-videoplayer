@@ -30,7 +30,7 @@ PKG_DIR = ROOT / "luci-app-videoplayer"
 DEFAULT_DIST = ROOT / ".staging" / "app"
 
 PKG_NAME = "luci-app-videoplayer"
-PKG_VERSION = "1.1.0"
+PKG_VERSION = "1.1.1"
 PKG_DESC = "LuCI video player with browser and strict router CPU rendering"
 PKG_LICENSE = "GPL-2.0-or-later"
 PKG_MAINTAINER = "openwrt-video-player contributors"

@@ -1,9 +1,9 @@
 {
   "application": {
-    "apk_filename": "luci-app-videoplayer-1.1.0.apk",
-    "ipk_filename": "luci-app-videoplayer_1.1.0_all.ipk",
+    "apk_filename": "luci-app-videoplayer-1.1.1.apk",
+    "ipk_filename": "luci-app-videoplayer_1.1.1_all.ipk",
     "name": "luci-app-videoplayer",
-    "version": "1.1.0"
+    "version": "1.1.1"
   },
   "codec": {
     "name": "luci-videoplayer-codec-runtime",

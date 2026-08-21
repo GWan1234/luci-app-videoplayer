@@ -150,6 +150,17 @@ get_router_profile() {
 	esac
 }
 
+get_router_max_threads() {
+	local value
+
+	value="$(uci -q get videoplayer.main.router_max_threads 2>/dev/null)" ||
+		value=""
+	case "$value" in
+		1) printf '1\n' ;;
+		*) printf '0\n' ;;
+	esac
+}
+
 get_configured_media_path() {
 	local path
 
@@ -561,6 +572,7 @@ load_status() {
 
 write_media_info() {
 	local token="$1" duration_ms="$2" total_frames="$3" fps="$4" profile="$5"
+	local max_threads="$6"
 	local dir tmp expected_frames
 
 	valid_token "$token" || return 1
@@ -573,6 +585,10 @@ write_media_info() {
 	esac
 	case "$profile" in
 		fast|quality) ;;
+		*) return 1 ;;
+	esac
+	case "$max_threads" in
+		0|1) ;;
 		*) return 1 ;;
 	esac
 	if [ "$duration_ms" -eq 0 ]; then
@@ -588,10 +604,10 @@ write_media_info() {
 	rm -f -- "$tmp" || return 1
 	if ! (
 		umask 077
-		printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+		printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
 			"$LAYOUT" "$duration_ms" "$total_frames" "$fps" \
 			"$profile" "$RENDERER_BACKEND" "$EXECUTION_BACKEND" \
-			"$HARDWARE_ACCELERATION" > "$tmp"
+			"$HARDWARE_ACCELERATION" "$max_threads" > "$tmp"
 	); then
 		rm -f -- "$tmp"
 		return 1
@@ -605,7 +621,7 @@ write_media_info() {
 
 load_media_info() {
 	local token="$1" dir version duration_ms total_frames fps profile
-	local renderer_backend execution_backend hardware_acceleration extra
+	local renderer_backend execution_backend hardware_acceleration max_threads extra
 	local expected_frames
 
 	MEDIA_DURATION_MS=""
@@ -615,6 +631,7 @@ load_media_info() {
 	MEDIA_RENDERER_BACKEND=""
 	MEDIA_EXECUTION_BACKEND=""
 	MEDIA_HARDWARE_ACCELERATION=""
+	MEDIA_MAX_THREADS=""
 	valid_token "$token" || return 1
 	dir="$RUNTIME_DIR/s-$token"
 	session_dir_is_safe "$token" || return 1
@@ -652,6 +669,10 @@ load_media_info() {
 		exec 7<&-
 		return 1
 	}
+	IFS= read -r max_threads <&7 || {
+		exec 7<&-
+		return 1
+	}
 	if IFS= read -r extra <&7; then
 		: "$extra"
 		exec 7<&-
@@ -671,6 +692,10 @@ load_media_info() {
 		fast|quality) ;;
 		*) return 1 ;;
 	esac
+	case "$max_threads" in
+		0|1) ;;
+		*) return 1 ;;
+	esac
 	[ "$renderer_backend" = "$RENDERER_BACKEND" ] &&
 		[ "$execution_backend" = "$EXECUTION_BACKEND" ] &&
 		[ "$hardware_acceleration" = "$HARDWARE_ACCELERATION" ] ||
@@ -688,6 +713,7 @@ load_media_info() {
 	MEDIA_RENDERER_BACKEND="$renderer_backend"
 	MEDIA_EXECUTION_BACKEND="$execution_backend"
 	MEDIA_HARDWARE_ACCELERATION="$hardware_acceleration"
+	MEDIA_MAX_THREADS="$max_threads"
 	return 0
 }
 
@@ -1932,7 +1958,8 @@ duration_ms_from_probe_log() {
 }
 
 probe_source_media_info() {
-	local token="$1" fps="$2" profile="$3" dir log tmp size
+	local token="$1" fps="$2" profile="$3" max_threads="$4"
+	local dir log tmp size
 	local duration_ms=0 total_frames=0
 
 	valid_token "$token" || return 1
@@ -1942,6 +1969,10 @@ probe_source_media_info() {
 	esac
 	case "$profile" in
 		fast|quality) ;;
+		*) return 1 ;;
+	esac
+	case "$max_threads" in
+		0|1) ;;
 		*) return 1 ;;
 	esac
 	dir="$RUNTIME_DIR/s-$token"
@@ -2044,7 +2075,8 @@ probe_source_media_info() {
 	fi
 	rm -f -- "$log" "$tmp" 2>/dev/null || :
 	write_media_info \
-		"$token" "$duration_ms" "$total_frames" "$fps" "$profile"
+		"$token" "$duration_ms" "$total_frames" "$fps" "$profile" \
+		"$max_threads"
 }
 
 probe_source_audio() {
@@ -2516,22 +2548,44 @@ worker_current() {
 	return 0
 }
 
-renderer_decoder_threads() {
-	local count
+renderer_online_threads() {
+	local count maximum="${1:-0}" limit
 
-	# Decoding is the expensive stage for the common H.264/HEVC inputs. Use the
-	# online processor count but cap it at four so tiny OpenWrt systems keep a
-	# deterministic memory bound. /proc/cpuinfo is available on every supported
-	# Linux target. An unusual format keeps the previous two-thread baseline
-	# instead of silently reducing renderer throughput.
+	# Start from the online processor count. Normal mode caps it at four so tiny
+	# OpenWrt systems retain a deterministic memory bound. The explicit
+	# maximum-resource mode raises the shared filtering/MJPEG pool to FFmpeg
+	# 6.1.4's 64-thread limit. /proc/stat exposes
+	# online CPU rows on every supported Linux target. An unusual format keeps the
+	# previous two-thread baseline in normal mode instead of silently reducing
+	# throughput. Maximum-resource mode fails closed if the kernel inventory
+	# cannot be read, because silently guessing would violate its all-core claim.
+	case "$maximum" in
+		1) limit=64 ;;
+		*) limit=4 ;;
+	esac
 	count="$(
-		awk '/^processor[[:space:]]*:/ { count++ } END { print count + 0 }' \
-			/proc/cpuinfo 2>/dev/null
+		awk '/^cpu[0-9]+[[:space:]]/ { count++ } END { print count + 0 }' \
+			/proc/stat 2>/dev/null
 	)" || count=""
-	if ! valid_decimal "$count" 3 || [ "$count" -lt 1 ]; then
+	if ! valid_decimal "$count" 5 || [ "$count" -lt 1 ]; then
+		[ "$maximum" != 1 ] || return 1
 		count=2
-	elif [ "$count" -gt 4 ]; then
-		count=4
+	elif [ "$count" -gt "$limit" ]; then
+		count="$limit"
+	fi
+	printf '%s\n' "$count"
+}
+
+renderer_decoder_threads() {
+	local count="$1" maximum="${2:-0}"
+
+	valid_decimal "$count" 3 && [ "$count" -ge 1 ] &&
+		[ "$count" -le 64 ] || return 1
+	# FFmpeg 6.1.4 deliberately limits automatic codec threading to 16 because
+	# some H.264 streams are unreliable above it. Filtering and the native MJPEG
+	# encoder can still use the full (at most 64) online pool.
+	if [ "$maximum" = 1 ] && [ "$count" -gt 16 ]; then
+		count=16
 	fi
 	printf '%s\n' "$count"
 }
@@ -2638,7 +2692,8 @@ cmd_worker() {
 	local audio_pipe audio_capable=0 audio_running_written=0 audio_finalized=0
 	local chunker_launching=0 audio_anchor_open=0
 	local audio_standby_open=0 audio_file last_audio router_fps router_profile
-	local decoder_threads pipeline_threads scale_width scale_height
+	local router_max_threads
+	local online_threads decoder_threads pipeline_threads scale_width scale_height
 	local video_quality video_huffman nice_level
 	local ffmpeg_launching=0
 	local audio_path_metadata audio_standby_metadata
@@ -2673,7 +2728,25 @@ cmd_worker() {
 	fi
 	router_profile="$(get_router_profile)"
 	router_fps="$(get_router_fps "$router_profile")"
-	decoder_threads="$(renderer_decoder_threads)"
+	router_max_threads="$(get_router_max_threads)"
+	online_threads="$(
+		renderer_online_threads "$router_max_threads"
+	)" || {
+		write_status \
+			"$token" error \
+			"Cannot determine online CPUs for maximum-resource multithreading" \
+			2>/dev/null || :
+		exec 3<&-
+		exit 1
+	}
+	decoder_threads="$(
+		renderer_decoder_threads "$online_threads" "$router_max_threads"
+	)" || {
+		write_status "$token" error "Cannot select safe CPU thread counts" \
+			2>/dev/null || :
+		exec 3<&-
+		exit 1
+	}
 	case "$router_profile" in
 		fast)
 			pipeline_threads="$decoder_threads"
@@ -2693,6 +2766,14 @@ cmd_worker() {
 			nice_level=10
 			;;
 	esac
+	if [ "$router_max_threads" -eq 1 ]; then
+		# This opt-in path deliberately gives the full supported online pool to
+		# filtering and MJPEG encoding (the decoder has its separate safe cap) and
+		# removes the normal positive nice value. The LuCI control carries an
+		# explicit stability/connectivity warning because this can starve the router.
+		pipeline_threads="$online_threads"
+		nice_level=0
+	fi
 	dir="$RUNTIME_DIR/s-$token"
 	video_pipe="$dir/video.pipe"
 	boundary="videoplayer-$token"
@@ -2714,7 +2795,8 @@ cmd_worker() {
 		fi
 		rm -f -- "$audio_file" 2>/dev/null || :
 	done
-	if ! probe_source_media_info "$token" "$router_fps" "$router_profile"; then
+	if ! probe_source_media_info \
+		"$token" "$router_fps" "$router_profile" "$router_max_threads"; then
 		write_status "$token" error "Cannot publish media duration" 2>/dev/null || :
 		exec 3<&-
 		exit 1
@@ -3887,10 +3969,11 @@ cmd_media_info() {
 	load_current || return 1
 	[ "$CURRENT_TOKEN" = "$token" ] || return 1
 	load_media_info "$token" || return 1
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 		"$MEDIA_DURATION_MS" "$MEDIA_TOTAL_FRAMES" "$MEDIA_FPS" \
 		"$MEDIA_PROFILE" "$MEDIA_RENDERER_BACKEND" \
-		"$MEDIA_EXECUTION_BACKEND" "$MEDIA_HARDWARE_ACCELERATION"
+		"$MEDIA_EXECUTION_BACKEND" "$MEDIA_HARDWARE_ACCELERATION" \
+		"$MEDIA_MAX_THREADS"
 }
 
 cmd_reason() {

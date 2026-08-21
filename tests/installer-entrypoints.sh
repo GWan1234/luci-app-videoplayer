@@ -184,14 +184,14 @@ for bootstrap_index in "${!bootstrap_commands[@]}"; do
 done
 
 grep -Fq \
-	'apk add --allow-untrusted --force-reinstall /tmp/luci-app-videoplayer-1.1.0.apk' \
+	'apk add --allow-untrusted --force-reinstall /tmp/luci-app-videoplayer-1.1.1.apk' \
 	"$root/README.md" || {
 	printf '%s\n' \
 		'README.md must force-reinstall the current local APK.' >&2
 	exit 1
 }
 grep -Fq \
-	'opkg --force-downgrade --force-reinstall install /tmp/luci-app-videoplayer_1.1.0_all.ipk' \
+	'opkg --force-downgrade --force-reinstall install /tmp/luci-app-videoplayer_1.1.1_all.ipk' \
 	"$root/README.md" || {
 	printf '%s\n' \
 		'README.md must force-downgrade and force-reinstall the current local IPK.' >&2

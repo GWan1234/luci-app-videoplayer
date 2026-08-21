@@ -15,7 +15,7 @@ and audio-device implementation are outside a web application's control and
 are therefore not claimed to be CPU-only. Playback stays inside LuCI and does
 not use the router's HDMI or framebuffer.
 
-Current source package version: **1.1.0**. The latest published GitHub release
+Current source package version: **1.1.1**. The latest published GitHub release
 is **1.1.0**. Its release installer installs the application and the exact
 architecture-specific private codec runtime together. A separate APK-only
 installer follows the latest successfully tested `main` source.
@@ -105,12 +105,15 @@ two independent demux contexts on the same validated, immutable source
 descriptor: one selects video and one selects audio. This prevents a much
 longer audio track in one container from hiding video EOF until global input
 EOF. The process produces MJPEG and PCM from the same normalized input
-timeline. Video decoding uses the detected online CPU count, capped at four
-threads to bound memory on embedded targets. The Fast profile uses the same
-bounded count for filtering and MJPEG encoding; Quality uses one thread on a
-single-core router and at most two elsewhere. FFmpeg remains at reduced
-scheduler priority so it yields to LuCI and network traffic under load, but no
-input pacing option limits how quickly it can use otherwise idle CPU.
+timeline. By default, video decoding uses the detected online CPU count capped
+at four threads to bound memory on embedded targets. Fast uses the same bounded
+count for filtering and MJPEG encoding; Quality uses one thread on a
+single-core router and at most two elsewhere. The default FFmpeg process stays
+at reduced scheduler priority so it yields to LuCI and network traffic under
+load. The optional maximum-resource multithreading setting instead uses every
+detected online CPU thread, up to FFmpeg's 64-thread filter/MJPEG limit and
+16-thread decoder safety limit, at normal scheduler priority. No input pacing
+option limits how quickly either mode can use otherwise idle CPU.
 Its unified `tee` output pads a short audio track with silence
 and stops an overlong audio track when video ends, so video is the authoritative
 timeline and neither length mismatch can stall the producer. LuCI immediately
@@ -309,21 +312,20 @@ native APK package ABI, indexed path, and checksum, and confirms that the
 source commit still equals
 the current head of `main`. The installer checks the head of `main` again
 immediately before replacing the application package. Only after the verified
-1.1.0 maintenance helper is installed does it install or update the matching
+1.1.1 maintenance helper is installed does it install or update the matching
 architecture-specific private FFmpeg runtime. This ordering safely migrates
 legacy helpers and prevents the r5 codec package from being changed outside a
 strict maintenance transaction. It refuses to proceed while a newer push is
 still being checked or if application verification fails. This path supports only `apk`; use
-the 1.1.0 application-plus-r5 local IPK procedure under
+the 1.1.1 application-plus-r5 local IPK procedure under
 **Installing a Prebuilt Local Package** on OpenWrt versions that still use
 `opkg`. The published-release installer above supports both APK and IPK routers
 for the exact releases and revisions in Release 1.1.0.
 The current snapshot targets the exact OpenWrt 25.12.5 revision listed below
 and force-reinstalls the application when a newer snapshot still has the same
-package version, `1.1.0`. Because that number is also used by older builds and
-is lower than a previously tested source package, the installer
-performs an explicit replacement instead of relying on ordinary version
-ordering.
+package version, `1.1.1`. Forced replacement also covers migration from
+historical pre-maintenance 1.1.0 builds and the previously tested 1.2.0 source
+package instead of relying on ordinary version ordering.
 
 ### Architecture-specific Codec Runtime (APK or IPK)
 
@@ -451,10 +453,10 @@ dist/
 ├── SOURCE_COMMIT
 ├── aarch64_cortex-a53/
 │   ├── openwrt-25.12.5-r33051-f5dae5ece4/
-│   │   ├── luci-app-videoplayer-1.1.0.apk
+│   │   ├── luci-app-videoplayer-1.1.1.apk
 │   │   └── luci-videoplayer-codec-runtime-6.1.4-r5.apk
 │   └── openwrt-24.10.8-r29233-443ec4032a/
-│       ├── luci-app-videoplayer_1.1.0_all.ipk
+│       ├── luci-app-videoplayer_1.1.1_all.ipk
 │       └── luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
 ├── aarch64_cortex-a72/
 ├── …
@@ -480,11 +482,11 @@ OpenWrt 25.12.5 on `aarch64_cortex-a53`:
 
 ```sh
 scp -O \
-  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.1.0.apk \
+  dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-app-videoplayer-1.1.1.apk \
   dist/aarch64_cortex-a53/openwrt-25.12.5-r33051-f5dae5ece4/luci-videoplayer-codec-runtime-6.1.4-r5.apk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-apk add --allow-untrusted --force-reinstall /tmp/luci-app-videoplayer-1.1.0.apk
+apk add --allow-untrusted --force-reinstall /tmp/luci-app-videoplayer-1.1.1.apk
 apk add --allow-untrusted /tmp/luci-videoplayer-codec-runtime-6.1.4-r5.apk
 ```
 
@@ -492,15 +494,15 @@ OpenWrt 24.10.8 on `aarch64_cortex-a53`:
 
 ```sh
 scp -O \
-  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.1.0_all.ipk \
+  dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-app-videoplayer_1.1.1_all.ipk \
   dist/aarch64_cortex-a53/openwrt-24.10.8-r29233-443ec4032a/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
-opkg --force-downgrade --force-reinstall install /tmp/luci-app-videoplayer_1.1.0_all.ipk
+opkg --force-downgrade --force-reinstall install /tmp/luci-app-videoplayer_1.1.1_all.ipk
 opkg install /tmp/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
 ```
 
-Keep this order when replacing an existing installation: the current 1.1.0
+Keep this order when replacing an existing installation: the current 1.1.1
 application installs the maintenance-capable helper first, then the r5 codec
 package replaces the private FFmpeg while that helper holds the strict
 maintenance gate.
@@ -509,10 +511,10 @@ If your `scp` implementation does not support `-O`, omit that option. After
 installation, sign out of LuCI and sign in again if the new menu item does not
 appear.
 
-The numeric version `1.1.0` is shared with historical builds that do not have
-the strict maintenance helper, and it is lower than a previously tested source
-package. Use the forced replacement commands above (or remove the
-old application package first); an ordinary install may retain the wrong build.
+Historical `1.1.0` builds do not have the strict maintenance helper, and the
+current `1.1.1` version is lower than a previously tested `1.2.0` source
+package. Use the forced replacement commands above (or remove the old
+application package first); an ordinary install may retain the wrong build.
 
 Direct URL:
 `http://<router-ip>/cgi-bin/luci/admin/services/videoplayer`.
@@ -531,7 +533,7 @@ is configured in `luci-app-videoplayer/Makefile`; set a specific maintainer
 contact there before submitting it to an official package feed. The ordinary
 OpenWrt package hook intentionally refuses a direct replacement from a legacy
 helper without strict maintenance because it cannot close that helper's startup
-race. Run the current verified standalone 1.1.0 package once to perform that
+race. Run the current verified standalone 1.1.1 package once to perform that
 migration, after which normal package upgrades use the strict maintenance
 protocol.
 
@@ -553,7 +555,7 @@ helper, the script requires the strict maintenance acknowledgement, quiesces
 the session, and preserves the global lock inodes. Renderer startup resumes
 only after the new helper revalidates the maintenance state; removal leaves the
 durable gate active. A legacy helper must first be migrated by the current
-verified standalone 1.1.0 package.
+verified standalone 1.1.1 package.
 
 To remove only the program files installed manually:
 
@@ -575,6 +577,7 @@ config videoplayer 'main'
 	option render_mode 'browser'
 	option router_profile 'fast'
 	option router_fps '8'
+	option router_max_threads '0'
 	option max_depth '8'
 ```
 
@@ -586,6 +589,7 @@ config videoplayer 'main'
 | `render_mode` | Local playback mode: `browser` or `router`; unknown values safely fall back to `browser` |
 | `router_profile` | Router CPU profile: `fast` (default, 480×270 JPEG q12 with decoder speed optimizations and an 8 FPS cap) or `quality` (640×360 JPEG q8); unknown values safely fall back to `fast` |
 | `router_fps` | Router CPU output frame rate: `5`, `8` (default), `12`, `15`, `20`, `24`, `30`, `48`, `50`, or `60` (maximum); Fast accepts 5 or 8 and clamps stale higher values to 8, while Quality permits the full list |
+| `router_max_threads` | Opt-in maximum-resource multithreading. Exact `1` uses up to 64 online CPU threads for filters/MJPEG, up to 16 for decoding, and normal scheduler priority; missing, `0`, or invalid values keep bounded threads and reduced priority |
 | `max_depth` | Maximum traversal depth for nested directories |
 
 The LuCI page uses the standard OpenWrt configuration footer. **Save** stages
@@ -699,7 +703,10 @@ whether the file has been modified.
 - Router CPU mode can cause high CPU use, heat, stutter, and temporary LuCI
   slowdown. Reducing the output frame rate does not prevent FFmpeg from
   decoding the source stream, so high-resolution media may still overwhelm a
-  low-powered router.
+  low-powered router. **Maximum-resource multithreading is deliberately
+  aggressive:** it can consume all available router CPU capacity, make the
+  router unstable or unresponsive, interrupt internet access, and disrupt
+  other router services while rendering is active.
 - The source file is read incrementally through a validated file descriptor;
   it is not copied wholesale into router RAM. FFmpeg still needs working memory
   for compressed packets, decoded frames, reference frames, scaling, and JPEG

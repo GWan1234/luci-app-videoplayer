@@ -14,7 +14,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MATRIX = ROOT / "codec-runtime" / "matrix.json"
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 CODEC_VERSION = "6.1.4"
 CODEC_RELEASE = 5
 CODEC_SOURCE_SHA256 = "a231e3d5742c44b1cdaebfb98ad7b6200d12763e0b6db9e1e2c5891f2c083a18"

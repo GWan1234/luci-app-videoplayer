@@ -50,19 +50,21 @@ def main() -> None:
 
     require(matrix.get("schema_version") == 1, "unexpected codec matrix schema")
     require(matrix.get("folder_key") == "DISTRIB_ARCH", "wrong matrix folder key")
-    application = matrix["application"]
     codec = matrix["codec"]
-    require(release_version == application["version"] == "1.1.0", "version drift")
+    # This validator covers the frozen Release 1.1.0 assets. The matrix's
+    # application fields intentionally follow current main and may be newer;
+    # only its unchanged codec/platform inventory is shared with the release.
+    require(release_version == "1.1.0", "release version drift")
     require(
         app_apk == "luci-app-videoplayer-$RELEASE_VERSION.apk"
         and app_apk.replace("$RELEASE_VERSION", release_version)
-        == application["apk_filename"],
+        == "luci-app-videoplayer-1.1.0.apk",
         "APK filename drift",
     )
     require(
         app_ipk == "luci-app-videoplayer_${RELEASE_VERSION}_all.ipk"
         and app_ipk.replace("${RELEASE_VERSION}", release_version)
-        == application["ipk_filename"],
+        == "luci-app-videoplayer_1.1.0_all.ipk",
         "IPK filename drift",
     )
     require(codec_name == codec["name"], "codec package name drift")
