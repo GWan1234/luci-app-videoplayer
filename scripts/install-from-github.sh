@@ -1,27 +1,27 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Install luci-app-videoplayer 1.1.0 and its exact architecture-specific
-# software-CPU codec runtime directly from GitHub Release 1.1.0.
+# Install luci-app-videoplayer 1.1.1 and its exact architecture-specific
+# software-CPU codec runtime directly from GitHub Release 1.1.1.
 
 set -eu
 
 REPOSITORY="communism420/luci-app-videoplayer"
-RELEASE_VERSION="1.1.0"
-RELEASE_SOURCE_COMMIT="80a4045b8fedc431467de9ad60416314b789fa79"
+RELEASE_VERSION="1.1.1"
+RELEASE_SOURCE_COMMIT="5a7ab33e60e382e652d08039d888a2b34c225cbb"
 RELEASE_BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION"
 
 APK_FILE="luci-app-videoplayer-$RELEASE_VERSION.apk"
-APK_SHA256="d695b52241ba5391f637ae4f09d0cc8a4f1e4d7f3f2d537b99bdfbd645f26da9"
+APK_SHA256="64347c95bd647e503c6fc3ec4fc86a1ceb4a48522bce8397bdcd0763793139ad"
 IPK_FILE="luci-app-videoplayer_${RELEASE_VERSION}_all.ipk"
-IPK_SHA256="f037d5c34acc27b4c70903ad6d2ea6e49dd2b41b81b8778e8a678a70735ad582"
+IPK_SHA256="cca48c544662109f721f176e2f8232927f33fe0e01aefb6ef02f83a4e6c20d48"
 
 CODEC_VERSION="6.1.4-r5"
 CODEC_PACKAGE_NAME="luci-videoplayer-codec-runtime"
-CODEC_MANIFEST_FILE="release-1.1.0-codecs.tsv"
+CODEC_MANIFEST_FILE="release-1.1.1-codecs.tsv"
 # Updated after the release manifest is generated; tests require an exact
-# match with scripts/release-1.1.0-codecs.tsv.
-CODEC_MANIFEST_SHA256="91e77695cb7262053d4722b825c603dc207ad98a2368a39e4bc35f6cad1e2d89"
+# match with scripts/release-1.1.1-codecs.tsv.
+CODEC_MANIFEST_SHA256="a6667a1e829d61afaa2cb04428def2250bf76733bef717acfa82c395660bc5e6"
 
 PRIVATE_BUILD_INFO="/usr/share/luci-videoplayer-codec-runtime/build-info"
 PRIVATE_FFMPEG="/usr/libexec/videoplayer-ffmpeg/ffmpeg"
@@ -32,11 +32,12 @@ EXPECTED_ATTESTATION="private-software-cpu	software-cpu-v1	none"
 # POSIX ulimit -f counts 512-byte blocks.
 MAX_METADATA_BLOCKS="128"
 MAX_APP_PACKAGE_BLOCKS="8192"
-# The largest frozen Release 1.1.0 codec is below 4.6 MiB. Keep enough headroom
+# The largest frozen Release 1.1.1 codec is below 4.6 MiB. Keep enough headroom
 # for the verified asset without allowing an oversized response to fill /tmp.
 MAX_CODEC_PACKAGE_BLOCKS="16384"
 DOWNLOAD_TIMEOUT_SECONDS="30"
 DOWNLOAD_DEADLINE_SECONDS="180"
+RUNTIME_PROBE_DEADLINE_SECONDS="30"
 HAS_WORKING_TIMEOUT="0"
 WORK_DIR=""
 
@@ -217,11 +218,11 @@ require_supported_platform() {
 }
 
 require_safe_component() {
-	component_name="$1"
-	component_value="$2"
-	case "$component_value" in
-		''|*[!a-zA-Z0-9._+-]*)
-			die "OpenWrt returned an unsafe or empty $component_name value."
+	value_label="$1"
+	value="$2"
+	case "$value" in
+		""|"."|".."|*".."*|*[!a-zA-Z0-9._+-]*)
+			die "OpenWrt returned an unsafe $value_label value."
 			;;
 	esac
 }
@@ -353,11 +354,28 @@ verify_registered_package() {
 }
 
 require_post_app_commands() {
-	# coreutils-stat is an application dependency and is not part of a minimal
-	# BusyBox installation on every supported OpenWrt release.  Check it only
-	# after the package manager has installed the application dependencies.
+	# These coreutils commands are application dependencies and are not part of
+	# every minimal BusyBox image. Check them only after the package manager has
+	# installed the application and its dependencies.
 	command -v stat >/dev/null 2>&1 ||
 		die "The application transaction did not provide its required coreutils-stat dependency."
+	detect_working_timeout
+	[ "$HAS_WORKING_TIMEOUT" = "1" ] ||
+		die "The application transaction did not provide its required coreutils-timeout dependency."
+}
+
+run_runtime_probe() {
+	timeout "$RUNTIME_PROBE_DEADLINE_SECONDS" "$@"
+}
+
+run_relay_probe() {
+	relay_path="$1"
+	run_runtime_probe "$relay_path" </dev/null >/dev/null 2>&1
+}
+
+run_renderer_attestation() {
+	renderer_path="$1"
+	run_runtime_probe "$renderer_path" attest
 }
 
 require_build_info_field() {
@@ -411,11 +429,11 @@ verify_installed_runtime() {
 	done
 
 	relay_status="0"
-	"$PRIVATE_RELAY" </dev/null >/dev/null 2>&1 || relay_status="$?"
+	run_relay_probe "$PRIVATE_RELAY" || relay_status="$?"
 	[ "$relay_status" -eq 64 ] ||
 		die "The installed MJPEG relay failed its executable probe."
 
-	attestation_output="$("$RENDERER_HELPER" attest)" ||
+	attestation_output="$(run_renderer_attestation "$RENDERER_HELPER")" ||
 		die "The installed Router CPU runtime failed software-only attestation."
 	[ "$attestation_output" = "$EXPECTED_ATTESTATION" ] ||
 		die "The installed Router CPU runtime returned an unexpected attestation."
@@ -462,7 +480,7 @@ done
 detect_working_timeout
 if [ "$HAS_WORKING_TIMEOUT" != "1" ]; then
 	warn \
-		"A working timeout command is unavailable; bounded file-size checks remain active, but network deadlines cannot be enforced."
+		"A working timeout command is unavailable before application dependencies are installed; bounded file-size checks remain active, but initial network deadlines cannot be enforced."
 fi
 if ! command -v uclient-fetch >/dev/null 2>&1 &&
 	! command -v wget >/dev/null 2>&1 &&

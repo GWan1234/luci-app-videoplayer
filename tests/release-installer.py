@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the frozen Release 1.1.0 installer manifest against the codec matrix."""
+"""Validate the frozen Release 1.1.1 installer manifest against the codec matrix."""
 
 from __future__ import annotations
 
@@ -42,7 +42,9 @@ def main() -> None:
     release_version = assignment("RELEASE_VERSION")
     source_commit = assignment("RELEASE_SOURCE_COMMIT")
     app_apk = assignment("APK_FILE")
+    app_apk_sha256 = assignment("APK_SHA256")
     app_ipk = assignment("IPK_FILE")
+    app_ipk_sha256 = assignment("IPK_SHA256")
     codec_version = assignment("CODEC_VERSION")
     codec_name = assignment("CODEC_PACKAGE_NAME")
     manifest_name = assignment("CODEC_MANIFEST_FILE")
@@ -51,43 +53,61 @@ def main() -> None:
     require(matrix.get("schema_version") == 1, "unexpected codec matrix schema")
     require(matrix.get("folder_key") == "DISTRIB_ARCH", "wrong matrix folder key")
     codec = matrix["codec"]
-    # This validator covers the frozen Release 1.1.0 assets. The matrix's
+    # This validator covers the frozen Release 1.1.1 assets. The matrix's
     # application fields intentionally follow current main and may be newer;
     # only its unchanged codec/platform inventory is shared with the release.
-    require(release_version == "1.1.0", "release version drift")
+    require(release_version == "1.1.1", "release version drift")
+    require(
+        source_commit == "5a7ab33e60e382e652d08039d888a2b34c225cbb",
+        "release source commit drift",
+    )
     require(
         app_apk == "luci-app-videoplayer-$RELEASE_VERSION.apk"
         and app_apk.replace("$RELEASE_VERSION", release_version)
-        == "luci-app-videoplayer-1.1.0.apk",
+        == "luci-app-videoplayer-1.1.1.apk",
         "APK filename drift",
+    )
+    require(
+        app_apk_sha256
+        == "64347c95bd647e503c6fc3ec4fc86a1ceb4a48522bce8397bdcd0763793139ad",
+        "APK SHA-256 drift",
     )
     require(
         app_ipk == "luci-app-videoplayer_${RELEASE_VERSION}_all.ipk"
         and app_ipk.replace("${RELEASE_VERSION}", release_version)
-        == "luci-app-videoplayer_1.1.0_all.ipk",
+        == "luci-app-videoplayer_1.1.1_all.ipk",
         "IPK filename drift",
+    )
+    require(
+        app_ipk_sha256
+        == "cca48c544662109f721f176e2f8232927f33fe0e01aefb6ef02f83a4e6c20d48",
+        "IPK SHA-256 drift",
     )
     require(codec_name == codec["name"], "codec package name drift")
     require(
         codec_version == f"{codec['version']}-r{codec['release']}",
         "codec version drift",
     )
-    require(re.fullmatch(r"[0-9a-f]{40}", source_commit) is not None, "bad source SHA")
     require(
-        re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is not None,
-        "bad manifest SHA-256 pin",
+        manifest_name == "release-1.1.1-codecs.tsv",
+        "release manifest filename drift",
+    )
+    require(
+        manifest_sha256
+        == "a6667a1e829d61afaa2cb04428def2250bf76733bef717acfa82c395660bc5e6",
+        "release manifest SHA-256 drift",
     )
 
     release_bootstraps = re.findall(
         r"^sh <\(wget -O - "
         r"https://github\.com/communism420/luci-app-videoplayer/"
-        r"releases/download/1\.1\.0/install-from-github\.sh\)$",
+        r"releases/download/1\.1\.1/install-from-github\.sh\)$",
         readme,
         re.MULTILINE,
     )
     require(
         len(release_bootstraps) == 1,
-        "README does not contain exactly one short Release 1.1.0 bootstrap",
+        "README does not contain exactly one short Release 1.1.1 bootstrap",
     )
 
     require(Path(manifest_name).name == manifest_name, "unsafe manifest filename")
@@ -174,7 +194,7 @@ def main() -> None:
         assets.append(asset)
     require(len(set(assets)) == 71, "release asset names are not globally unique")
 
-    print("Release 1.1.0 manifest and codec-matrix checks passed.")
+    print("Release 1.1.1 manifest and codec-matrix checks passed.")
 
 
 if __name__ == "__main__":

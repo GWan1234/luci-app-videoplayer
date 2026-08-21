@@ -16,7 +16,7 @@ are therefore not claimed to be CPU-only. Playback stays inside LuCI and does
 not use the router's HDMI or framebuffer.
 
 Current source package version: **1.1.1**. The latest published GitHub release
-is **1.1.0**. Its release installer installs the application and the exact
+is **1.1.1**. Its release installer installs the application and the exact
 architecture-specific private codec runtime together. A separate APK-only
 installer follows the latest successfully tested `main` source.
 
@@ -113,8 +113,12 @@ at reduced scheduler priority so it yields to LuCI and network traffic under
 load. The optional maximum-resource multithreading setting instead uses every
 detected online CPU thread, up to FFmpeg's 64-thread filter/MJPEG limit and
 16-thread decoder safety limit, at normal scheduler priority. No input pacing
-option limits how quickly either mode can use otherwise idle CPU.
-Its unified `tee` output pads a short audio track with silence
+option limits how quickly either mode can use otherwise idle CPU. If the online
+CPU inventory cannot be validated, bounded mode uses a conservative two-thread
+fallback, while maximum-resource mode fails closed instead of guessing. The
+selected thread policy is frozen in the validated renderer session metadata;
+UCI changes apply to the next session rather than altering one already running.
+The FFmpeg process's unified `tee` output pads a short audio track with silence
 and stops an overlong audio track when video ends, so video is the authoritative
 timeline and neither length mismatch can stall the producer. LuCI immediately
 drains sequential PCM batches and complete JPEG frames into bounded browser
@@ -243,12 +247,12 @@ After preparing the storage, connect to the router over SSH as `root`. The
 router must have working HTTPS access to GitHub:
 
 ```sh
-sh <(wget -O - https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.0/install-from-github.sh)
+sh <(wget -O - https://github.com/communism420/luci-app-videoplayer/releases/download/1.1.1/install-from-github.sh)
 ```
 
 This compact command uses the process-substitution support provided by the
 standard OpenWrt BusyBox `ash` shell. The release URL points to the installer
-asset attached directly to Release 1.1.0. The installer itself downloads the
+asset attached directly to Release 1.1.1. The installer itself downloads the
 manifest and both packages into private, size-limited temporary files and
 verifies their pinned SHA-256 values before the first package-manager write.
 Compared with the previous longer bootstrap, this shorter form trusts HTTPS
@@ -256,7 +260,7 @@ and the selected GitHub URL for the installer script itself; the manifest and
 package checksum verification remains unchanged.
 
 The installer is pinned to
-[Release 1.1.0](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.1.0)
+[Release 1.1.1](https://github.com/communism420/luci-app-videoplayer/releases/tag/1.1.1)
 and supports both package generations in that release:
 
 - OpenWrt `25.12.5` revision `r33051-f5dae5ece4` with `apk`;
@@ -272,18 +276,19 @@ CPU-family names. The installer then downloads the release's pinned 71-entry
 codec manifest, verifies that manifest against a
 checksum embedded in the installer, and requires one exact release/revision/
 format/architecture match. It then downloads and verifies both the
-architecture-independent 1.1.0 application package and the matching
+architecture-independent 1.1.1 application package and the matching
 6.1.4-r5 codec package before changing the router. The maintenance-capable
 application is installed first; only after that succeeds is the private codec
 runtime installed. The final step validates package registration, root-owned
 runtime metadata, executable safety, the native relay, and the renderer's exact
 software-only attestation.
 
-The application version `1.1.0` was also used by historical builds and is lower
-than a previously tested `1.2.0` source package. The installer therefore uses
-APK force-reinstall or IPK force-downgrade plus force-reinstall semantics rather
-than relying on normal version ordering. It refuses an already-installed APK
-when the router's `apk` implementation cannot perform a safe force-reinstall.
+Release `1.1.1` may replace an already installed copy of the same version or a
+historical pre-maintenance `1.1.0` build, and it is lower than a previously
+tested `1.2.0` source package. The installer therefore uses APK force-reinstall
+or IPK force-downgrade plus force-reinstall semantics rather than relying on
+normal version ordering. It refuses an already-installed APK when the router's
+`apk` implementation cannot perform a safe force-reinstall.
 The released APKs are unsigned and are installed with `--allow-untrusted`.
 Metadata, application, and codec downloads have separate bounded size limits
 to protect the router's RAM-backed `/tmp` filesystem. If application
@@ -294,7 +299,7 @@ recovery path.
 ### Current `main` APK (OpenWrt 25.12.5)
 
 To install the newest successfully tested `main` source instead of the fixed
-Release 1.1.0 package set, use the separate APK-only installer:
+Release 1.1.1 package set, use the separate APK-only installer:
 
 ```sh
 sh <(wget -O - https://raw.githubusercontent.com/communism420/luci-app-videoplayer/refs/heads/main/scripts/install-main-apk.sh)
@@ -320,7 +325,7 @@ still being checked or if application verification fails. This path supports onl
 the 1.1.1 application-plus-r5 local IPK procedure under
 **Installing a Prebuilt Local Package** on OpenWrt versions that still use
 `opkg`. The published-release installer above supports both APK and IPK routers
-for the exact releases and revisions in Release 1.1.0.
+for the exact releases and revisions in Release 1.1.1.
 The current snapshot targets the exact OpenWrt 25.12.5 revision listed below
 and force-reinstalls the application when a newer snapshot still has the same
 package version, `1.1.1`. Forced replacement also covers migration from
@@ -340,7 +345,7 @@ folder. Other AArch64 routers may report `aarch64_cortex-a72`,
 `aarch64_cortex-a76`, or `aarch64_generic`; those are separate ABI folders
 with separately compiled codec binaries.
 
-Both the Release 1.1.0 installer and the current-`main` installer perform this
+Both the Release 1.1.1 installer and the current-`main` installer perform this
 FFmpeg installation after installing the maintenance-capable application. To
 install, update, or verify only the codec runtime independently, run:
 
@@ -472,8 +477,7 @@ OpenWrt SDK/Buildroot and signing infrastructure.
 To display the correct folder key on a router:
 
 ```sh
-. /etc/openwrt_release
-printf '%s\n' "$DISTRIB_ARCH"
+sed -n "s/^DISTRIB_ARCH='\([^']*\)'$/\1/p" /etc/openwrt_release
 ```
 
 ## Installing a Prebuilt Local Package
@@ -487,7 +491,7 @@ scp -O \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 apk add --allow-untrusted --force-reinstall /tmp/luci-app-videoplayer-1.1.1.apk
-apk add --allow-untrusted /tmp/luci-videoplayer-codec-runtime-6.1.4-r5.apk
+apk add --allow-untrusted --force-reinstall /tmp/luci-videoplayer-codec-runtime-6.1.4-r5.apk
 ```
 
 OpenWrt 24.10.8 on `aarch64_cortex-a53`:
@@ -499,7 +503,7 @@ scp -O \
   root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 opkg --force-downgrade --force-reinstall install /tmp/luci-app-videoplayer_1.1.1_all.ipk
-opkg install /tmp/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
+opkg --force-downgrade --force-reinstall install /tmp/luci-videoplayer-codec-runtime_6.1.4-r5_aarch64_cortex-a53.ipk
 ```
 
 Keep this order when replacing an existing installation: the current 1.1.1
@@ -810,6 +814,7 @@ openwrt-video-player/
 │   ├── install-main-apk.sh
 │   ├── install-to-router.sh
 │   ├── release-1.1.0-codecs.tsv
+│   ├── release-1.1.1-codecs.tsv
 │   ├── verify_codec_package.py
 │   ├── verify-dist.py
 │   └── verify_packages.py
